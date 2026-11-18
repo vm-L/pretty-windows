@@ -1,0 +1,493 @@
+/// RGB color representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    pub fn to_normalized(self) -> (f32, f32, f32) {
+        (
+            f32::from(self.r) / 255.0,
+            f32::from(self.g) / 255.0,
+            f32::from(self.b) / 255.0,
+        )
+    }
+}
+
+/// Converts sRGB (0..255) to HSL (`h` in `[0, 360)`, `s` and `l` in `[0, 1]`).
+pub fn rgb_to_hsl(rgb: Rgb) -> (f32, f32, f32) {
+    let (r, g, b) = rgb.to_normalized();
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = 0.5 * (max + min);
+    let delta = max - min;
+
+    if delta <= 1e-5 {
+        return (0.0, 0.0, l);
+    }
+
+    let s = if l < 0.5 {
+        delta / (max + min)
+    } else {
+        delta / (2.0 - max - min)
+    };
+
+    let mut h = if (max - r).abs() < 1e-6 {
+        (g - b) / delta + if g < b { 6.0 } else { 0.0 }
+    } else if (max - g).abs() < 1e-6 {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    h *= 60.0;
+    (h.rem_euclid(360.0), s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
+}
+
+/// Converts HSL (`h` in `[0, 360)`, `s` and `l` in `[0, 1]`) back to sRGB.
+pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Rgb {
+    let s = s.clamp(0.0, 1.0);
+    let l = l.clamp(0.0, 1.0);
+    if s <= 1e-5 {
+        let v = (l * 255.0).round() as u8;
+        return Rgb::new(v, v, v);
+    }
+
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let hk = h.rem_euclid(360.0) / 360.0;
+
+    let hue_to_rgb = |mut t: f32| -> f32 {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            p + (q - p) * 6.0 * t
+        } else if t < 0.5 {
+            q
+        } else if t < 2.0 / 3.0 {
+            p + (q - p) * (2.0 / 3.0 - t) * 6.0
+        } else {
+            p
+        }
+    };
+
+    Rgb::new(
+        (hue_to_rgb(hk + 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (hue_to_rgb(hk) * 255.0).round().clamp(0.0, 255.0) as u8,
+        (hue_to_rgb(hk - 1.0 / 3.0) * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Normalizes an accent color so spectrum bars stay vibrant and readable on dark or light taskbars.
+pub fn adjust_accent_for_theme(color: Rgb, light_taskbar: bool) -> Rgb {
+    let (h, s, l) = rgb_to_hsl(color);
+    if s < 0.08 {
+        let target_l = if light_taskbar { 0.37 } else { 0.76 };
+        return hsl_to_rgb(h, s, target_l);
+    }
+
+    let min_s = s.min(0.20);
+    let (target_s, target_l) = if light_taskbar {
+        ((s * 1.08).clamp(min_s, 0.82), l.clamp(0.32, 0.48))
+    } else {
+        ((s * 1.10).clamp(min_s, 0.84), l.clamp(0.58, 0.74))
+    };
+    hsl_to_rgb(h, target_s, target_l)
+}
+
+/// Extracts a perceptually faithful accent color from raw BGRA8 album artwork pixels.
+/// Preserves monochrome/grayscale and low-saturation covers instead of forcing a blue fallback.
+/// Falls back to `fallback` only when the image is empty or completely transparent.
+pub fn extract_accent_from_bgra(
+    bgra: &[u8],
+    width: u32,
+    height: u32,
+    light_taskbar: bool,
+    fallback: Rgb,
+) -> Rgb {
+    const BUCKETS: usize = 24;
+    let total_pixels = (width as usize).saturating_mul(height as usize);
+    if total_pixels == 0 || bgra.len() < total_pixels * 4 {
+        return adjust_accent_for_theme(fallback, light_taskbar);
+    }
+
+    let w_usize = width as usize;
+    let stride = (total_pixels / 4096).max(1);
+    let mut bucket_weight = [0.0f32; BUCKETS];
+    let mut bucket_r = [0.0f32; BUCKETS];
+    let mut bucket_g = [0.0f32; BUCKETS];
+    let mut bucket_b = [0.0f32; BUCKETS];
+
+    let mut opaque_count = 0usize;
+    let mut chromatic_count = 0usize;
+    let mut sum_nr = 0.0f32;
+    let mut sum_ng = 0.0f32;
+    let mut sum_nb = 0.0f32;
+    let mut sum_nw = 0.0f32;
+
+    let mut idx = 0usize;
+    while idx < total_pixels {
+        let off = idx * 4;
+        let b = bgra[off];
+        let g = bgra[off + 1];
+        let r = bgra[off + 2];
+        let a = bgra[off + 3];
+
+        if a >= 128 {
+            opaque_count += 1;
+            let px = idx % w_usize;
+            let py = idx / w_usize;
+            let u = ((px as f32) + 0.5) / (width as f32);
+            let v = ((py as f32) + 0.5) / (height as f32);
+            let spatial_w = if (0.15..=0.85).contains(&u) && (0.15..=0.85).contains(&v) {
+                1.0f32
+            } else {
+                0.65f32
+            };
+
+            let nr = f32::from(r) / 255.0;
+            let ng = f32::from(g) / 255.0;
+            let nb = f32::from(b) / 255.0;
+            let max_c = nr.max(ng).max(nb);
+            let min_c = nr.min(ng).min(nb);
+            let chroma = max_c - min_c;
+            let l = 0.5 * (max_c + min_c);
+
+            let tone_w = (0.15 + 0.85 * (1.0 - (2.0 * l - 1.0).powi(2)).max(0.0)) * spatial_w;
+            sum_nr += f32::from(r) * tone_w;
+            sum_ng += f32::from(g) * tone_w;
+            sum_nb += f32::from(b) * tone_w;
+            sum_nw += tone_w;
+
+            if chroma >= 0.11 && (0.08..=0.92).contains(&l) {
+                let (h, _, _) = rgb_to_hsl(Rgb::new(r, g, b));
+                let bucket = ((h / 360.0) * (BUCKETS as f32)).floor() as usize % BUCKETS;
+                let mid_l_bonus = (1.0 - (l - 0.5).abs() * 1.1).max(0.15);
+                let weight = chroma * chroma * mid_l_bonus * spatial_w;
+                bucket_weight[bucket] += weight;
+                bucket_r[bucket] += f32::from(r) * weight;
+                bucket_g[bucket] += f32::from(g) * weight;
+                bucket_b[bucket] += f32::from(b) * weight;
+                chromatic_count += 1;
+            }
+        }
+        idx += stride;
+    }
+
+    if opaque_count == 0 {
+        return adjust_accent_for_theme(fallback, light_taskbar);
+    }
+
+    let chromatic_ratio = (chromatic_count as f32) / (opaque_count as f32);
+    let mut best_bucket = None;
+    let mut best_score = 0.001f32;
+    for i in 0..BUCKETS {
+        let prev = (i + BUCKETS - 1) % BUCKETS;
+        let next = (i + 1) % BUCKETS;
+        let score = 0.25 * bucket_weight[prev] + bucket_weight[i] + 0.25 * bucket_weight[next];
+        if bucket_weight[i] > 0.0 && score > best_score {
+            best_score = score;
+            best_bucket = Some(i);
+        }
+    }
+
+    if chromatic_ratio < 0.04 || best_bucket.is_none() {
+        let neutral_rgb = Rgb::new(
+            (sum_nr / sum_nw.max(1e-4)).round().clamp(0.0, 255.0) as u8,
+            (sum_ng / sum_nw.max(1e-4)).round().clamp(0.0, 255.0) as u8,
+            (sum_nb / sum_nw.max(1e-4)).round().clamp(0.0, 255.0) as u8,
+        );
+        let (nh, ns, _) = rgb_to_hsl(neutral_rgb);
+        let target_l = if light_taskbar { 0.37 } else { 0.76 };
+        return hsl_to_rgb(nh, ns.min(0.12), target_l);
+    }
+
+    let best = best_bucket.unwrap();
+    let prev = (best + BUCKETS - 1) % BUCKETS;
+    let next = (best + 1) % BUCKETS;
+    let mut cluster_w = 0.0f32;
+    let mut cluster_r = 0.0f32;
+    let mut cluster_g = 0.0f32;
+    let mut cluster_b = 0.0f32;
+    for b_idx in [prev, best, next] {
+        cluster_w += bucket_weight[b_idx];
+        cluster_r += bucket_r[b_idx];
+        cluster_g += bucket_g[b_idx];
+        cluster_b += bucket_b[b_idx];
+    }
+
+    let mut dominant = Rgb::new(
+        (cluster_r / cluster_w).round().clamp(0.0, 255.0) as u8,
+        (cluster_g / cluster_w).round().clamp(0.0, 255.0) as u8,
+        (cluster_b / cluster_w).round().clamp(0.0, 255.0) as u8,
+    );
+    if chromatic_ratio < 0.16 {
+        let presence = (chromatic_ratio / 0.16).clamp(0.45, 1.0);
+        let (dh, ds, dl) = rgb_to_hsl(dominant);
+        dominant = hsl_to_rgb(dh, ds * presence, dl);
+    }
+
+    adjust_accent_for_theme(dominant, light_taskbar)
+}
+
+/// Applies a fast 3-pass separable box blur (approximating Gaussian blur) on BGRA8 pixels.
+pub fn gaussian_blur_bgra(bgra: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
+    if width == 0 || height == 0 || radius == 0 || bgra.len() < width * height * 4 {
+        return bgra.to_vec();
+    }
+
+    let mut src = bgra[..width * height * 4].to_vec();
+    let mut tmp = vec![0u8; src.len()];
+
+    for _ in 0..3 {
+        box_blur_h(&src, &mut tmp, width, height, radius);
+        box_blur_v(&tmp, &mut src, width, height, radius);
+    }
+    src
+}
+
+fn box_blur_h(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    let win = (radius * 2 + 1) as f32;
+    let inv_win = 1.0 / win;
+    let w_last = width - 1;
+
+    for y in 0..height {
+        let row = y * width * 4;
+        let first = row;
+        let last = row + w_last * 4;
+
+        let mut acc_b = f32::from(src[first]) * ((radius + 1) as f32);
+        let mut acc_g = f32::from(src[first + 1]) * ((radius + 1) as f32);
+        let mut acc_r = f32::from(src[first + 2]) * ((radius + 1) as f32);
+        let mut acc_a = f32::from(src[first + 3]) * ((radius + 1) as f32);
+
+        for x in 1..=radius {
+            let cx = x.min(w_last);
+            let p = row + cx * 4;
+            acc_b += f32::from(src[p]);
+            acc_g += f32::from(src[p + 1]);
+            acc_r += f32::from(src[p + 2]);
+            acc_a += f32::from(src[p + 3]);
+        }
+
+        for x in 0..width {
+            let out = row + x * 4;
+            dst[out] = (acc_b * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 1] = (acc_g * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 2] = (acc_r * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 3] = (acc_a * inv_win).round().clamp(0.0, 255.0) as u8;
+
+            let add_x = (x + radius + 1).min(w_last);
+            let sub_x = x.saturating_sub(radius);
+            let add_p = row + add_x * 4;
+            let sub_p = if x < radius { first } else { row + sub_x * 4 };
+            let _ = last;
+
+            acc_b += f32::from(src[add_p]) - f32::from(src[sub_p]);
+            acc_g += f32::from(src[add_p + 1]) - f32::from(src[sub_p + 1]);
+            acc_r += f32::from(src[add_p + 2]) - f32::from(src[sub_p + 2]);
+            acc_a += f32::from(src[add_p + 3]) - f32::from(src[sub_p + 3]);
+        }
+    }
+}
+
+fn box_blur_v(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
+    let win = (radius * 2 + 1) as f32;
+    let inv_win = 1.0 / win;
+    let h_last = height - 1;
+    let stride = width * 4;
+
+    for x in 0..width {
+        let col = x * 4;
+        let first = col;
+
+        let mut acc_b = f32::from(src[first]) * ((radius + 1) as f32);
+        let mut acc_g = f32::from(src[first + 1]) * ((radius + 1) as f32);
+        let mut acc_r = f32::from(src[first + 2]) * ((radius + 1) as f32);
+        let mut acc_a = f32::from(src[first + 3]) * ((radius + 1) as f32);
+
+        for y in 1..=radius {
+            let cy = y.min(h_last);
+            let p = cy * stride + col;
+            acc_b += f32::from(src[p]);
+            acc_g += f32::from(src[p + 1]);
+            acc_r += f32::from(src[p + 2]);
+            acc_a += f32::from(src[p + 3]);
+        }
+
+        for y in 0..height {
+            let out = y * stride + col;
+            dst[out] = (acc_b * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 1] = (acc_g * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 2] = (acc_r * inv_win).round().clamp(0.0, 255.0) as u8;
+            dst[out + 3] = (acc_a * inv_win).round().clamp(0.0, 255.0) as u8;
+
+            let add_y = (y + radius + 1).min(h_last);
+            let sub_y = y.saturating_sub(radius);
+            let add_p = add_y * stride + col;
+            let sub_p = if y < radius { first } else { sub_y * stride + col };
+
+            acc_b += f32::from(src[add_p]) - f32::from(src[sub_p]);
+            acc_g += f32::from(src[add_p + 1]) - f32::from(src[sub_p + 1]);
+            acc_r += f32::from(src[add_p + 2]) - f32::from(src[sub_p + 2]);
+            acc_a += f32::from(src[add_p + 3]) - f32::from(src[sub_p + 3]);
+        }
+    }
+}
+
+/// Adjusts saturation and brightness on straight BGRA pixels for vibrant liquid-glass backdrops.
+#[allow(dead_code)]
+pub fn boost_vibrance_bgra(bgra: &mut [u8], sat_mul: f32, luma_mul: f32) {
+    for px in bgra.chunks_exact_mut(4) {
+        let b = f32::from(px[0]);
+        let g = f32::from(px[1]);
+        let r = f32::from(px[2]);
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        px[0] = ((luma + (b - luma) * sat_mul) * luma_mul).round().clamp(0.0, 255.0) as u8;
+        px[1] = ((luma + (g - luma) * sat_mul) * luma_mul).round().clamp(0.0, 255.0) as u8;
+        px[2] = ((luma + (r - luma) * sat_mul) * luma_mul).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hsl_roundtrip() {
+        let samples = [
+            Rgb::new(235, 64, 52),
+            Rgb::new(45, 196, 120),
+            Rgb::new(66, 135, 245),
+            Rgb::new(180, 90, 220),
+        ];
+        for c in samples {
+            let (h, s, l) = rgb_to_hsl(c);
+            let back = hsl_to_rgb(h, s, l);
+            assert!((i16::from(c.r) - i16::from(back.r)).abs() <= 2);
+            assert!((i16::from(c.g) - i16::from(back.g)).abs() <= 2);
+            assert!((i16::from(c.b) - i16::from(back.b)).abs() <= 2);
+        }
+    }
+
+    #[test]
+    fn extract_accent_picks_dominant_hue_and_respects_theme() {
+        // 8x8 vivid crimson-orange image (BGRA)
+        let mut img = Vec::with_capacity(8 * 8 * 4);
+        for _ in 0..(8 * 8) {
+            img.extend_from_slice(&[35, 85, 230, 255]);
+        }
+        let fallback = Rgb::new(0, 120, 212);
+
+        let dark_theme_color = extract_accent_from_bgra(&img, 8, 8, false, fallback);
+        let (h_d, _, l_d) = rgb_to_hsl(dark_theme_color);
+        assert!(
+            !(35.0..=340.0).contains(&h_d),
+            "expected warm hue, got {h_d}"
+        );
+        assert!((0.54..=0.76).contains(&l_d), "expected dark-theme lightness, got {l_d}");
+
+        let light_theme_color = extract_accent_from_bgra(&img, 8, 8, true, fallback);
+        let (_, _, l_l) = rgb_to_hsl(light_theme_color);
+        assert!((0.30..=0.52).contains(&l_l), "expected light-theme lightness, got {l_l}");
+    }
+
+    #[test]
+    fn extract_accent_monochrome_and_shadow_noise_stay_neutral_gray() {
+        let blue_fallback = Rgb::new(0, 120, 212);
+
+        // 1. Pure monochrome gray square
+        let mut gray = Vec::with_capacity(8 * 8 * 4);
+        for _ in 0..64 {
+            gray.extend_from_slice(&[120, 120, 120, 255]);
+        }
+        for light in [false, true] {
+            let out = extract_accent_from_bgra(&gray, 8, 8, light, blue_fallback);
+            let (_, s, l) = rgb_to_hsl(out);
+            assert!(s <= 0.12, "pure gray must remain neutral, got s={s} ({out:?})");
+            if light {
+                assert!((0.30..=0.45).contains(&l));
+            } else {
+                assert!((0.68..=0.84).contains(&l));
+            }
+        }
+
+        // 2. B&W vinyl album cover simulation (ivory background + bluish dark-shadow JPEG noise + warm gray subject)
+        let mut vinyl = Vec::with_capacity(16 * 16 * 4);
+        for y in 0..16 {
+            for x in 0..16 {
+                let (r, g, b) = if (4..12).contains(&x) && (4..12).contains(&y) {
+                    (236u8, 235, 229)
+                } else if (x + y) % 3 == 0 {
+                    (122u8, 119, 112)
+                } else {
+                    (26u8, 31, 38)
+                };
+                vinyl.extend_from_slice(&[b, g, r, 255]);
+            }
+        }
+        for light in [false, true] {
+            let out = extract_accent_from_bgra(&vinyl, 16, 16, light, blue_fallback);
+            let (_, s, _) = rgb_to_hsl(out);
+            assert!(
+                s <= 0.12,
+                "monochrome cover with dark-shadow noise must not turn blue/chromatic: s={s} ({out:?})"
+            );
+        }
+
+        // 3. Empty cover still uses calibrated system accent fallback
+        let empty_out = extract_accent_from_bgra(&[], 0, 0, false, blue_fallback);
+        let (eh, _, _) = rgb_to_hsl(empty_out);
+        assert!((195.0..=225.0).contains(&eh), "expected blue fallback on empty image, got {eh}");
+    }
+
+    #[test]
+    fn extract_accent_muted_cover_is_not_over_saturated() {
+        // Muted khaki / warm sage cover (~s=0.19)
+        let mut muted = Vec::with_capacity(8 * 8 * 4);
+        for _ in 0..64 {
+            muted.extend_from_slice(&[115, 155, 160, 255]);
+        }
+        let fallback = Rgb::new(0, 120, 212);
+        for light in [false, true] {
+            let out = extract_accent_from_bgra(&muted, 8, 8, light, fallback);
+            let (h, s, _) = rgb_to_hsl(out);
+            assert!((35.0..=75.0).contains(&h), "expected warm sage/khaki hue, got {h}");
+            assert!(s < 0.30, "muted cover must stay restrained (s < 0.30), got {s}");
+        }
+    }
+
+    #[test]
+    fn gaussian_blur_preserves_uniform_color_and_diffuses_impulse() {
+        let w = 16usize;
+        let h = 16usize;
+        let uniform = [40u8, 120, 200, 255].repeat(w * h);
+        let blurred_uniform = gaussian_blur_bgra(&uniform, w, h, 3);
+        assert_eq!(blurred_uniform.len(), uniform.len());
+        assert_eq!(&blurred_uniform[0..4], &[40, 120, 200, 255]);
+
+        let mut impulse = vec![0u8; w * h * 4];
+        let center = (8 * w + 8) * 4;
+        impulse[center] = 255;
+        impulse[center + 1] = 255;
+        impulse[center + 2] = 255;
+        impulse[center + 3] = 255;
+        let blurred = gaussian_blur_bgra(&impulse, w, h, 2);
+        assert!(blurred[center] < 255 && blurred[center] > 0);
+        let neighbor = (8 * w + 9) * 4;
+        assert!(blurred[neighbor] > 0);
+    }
+}
