@@ -613,9 +613,15 @@ impl PopupInner {
         }
     }
 
+    fn primary_overlap_px(&self) -> f32 {
+        let s = self.scale();
+        (self.pill_overlap_px as f32).max(2.0 * s)
+    }
+
     fn primary_height_px(&self) -> f32 {
         let s = self.scale();
         (INNER_PAD_DIP * 2.0 + PRIMARY_ROW_H_DIP * 5.0 + ROW_GAP_DIP * 4.0) * s
+            + self.primary_overlap_px()
     }
 
     fn sub_natural_size_px(&self, cat: PrimaryCategory) -> (f32, f32) {
@@ -676,9 +682,8 @@ impl PopupInner {
     }
 
     fn max_popup_reach_px(&self) -> i32 {
-        let s = self.scale();
         let mut max_h = self.primary_height_px();
-        let overlap = (self.pill_overlap_px as f32).max(2.0 * s);
+        let overlap = self.primary_overlap_px();
         for &cat in &PrimaryCategory::ALL {
             let (_, sh) = self.sub_natural_size_px(cat);
             let reach = overlap + sh;
@@ -721,27 +726,20 @@ impl PopupInner {
         let row = self.category_row_rect(cat);
         let (sw, natural_sh) = self.sub_natural_size_px(cat);
 
-        let ideal_top = row.top - INNER_PAD_DIP * s;
-        let bottom_limit = (primary.bottom - (self.pill_overlap_px as f32).max(2.0 * s))
-            .max(primary.top + 58.0 * s);
-        let max_sh = if self.win_h > 10 {
-            (bottom_limit - pad).max(50.0 * s)
+        let overlap = self.primary_overlap_px();
+        let bottom_limit = (primary.bottom - overlap).max(primary.top + 58.0 * s);
+        let top_limit = if self.win_h > 10 {
+            pad
         } else {
-            natural_sh
+            primary.top - natural_sh
         };
-        let sh = natural_sh.min(max_sh);
-
-        let (top, bottom) = if ideal_top + sh <= bottom_limit {
-            (ideal_top, ideal_top + sh)
-        } else {
-            let b = bottom_limit;
-            let t = if self.win_h > 10 {
-                (b - sh).max(pad)
-            } else {
-                b - sh
-            };
-            (t, b)
-        };
+        let (top, bottom) = compute_submenu_vertical_span(
+            row.top,
+            INNER_PAD_DIP * s,
+            natural_sh,
+            top_limit,
+            bottom_limit,
+        );
         if self.open_left {
             RectF::new(primary.left - gap - sw, top, primary.left - gap, bottom)
         } else {
@@ -1991,7 +1989,7 @@ impl PopupInner {
     unsafe fn draw_unified_shadows(&self, primary_rect: RectF, sub_rect: Option<RectF>, s: f32) {
         let foot_r = FOOT_MENISCUS_DIP * s;
         let max_w = self.win_w as f32;
-        let taskbar_y = primary_rect.bottom - (self.pill_overlap_px as f32).max(2.0 * s);
+        let taskbar_y = primary_rect.bottom - self.primary_overlap_px();
         let shadow_layers = if self.light_glass {
             [(7.5 * s, 0.022), (4.5 * s, 0.036), (2.0 * s, 0.058)]
         } else {
@@ -3468,6 +3466,29 @@ impl PopupInner {
     }
 }
 
+/// Computes vertical `(top, bottom)` for a cascading submenu:
+/// 1. Prefers aligning first submenu item's top with `row_top` (`row_top - inner_pad`) downward.
+/// 2. When downward space above `bottom_limit` is insufficient, aligns the last submenu item's
+///    bottom with the primary menu's last item (`bottom_limit`) and expands upward.
+fn compute_submenu_vertical_span(
+    row_top: f32,
+    inner_pad: f32,
+    natural_sh: f32,
+    top_limit: f32,
+    bottom_limit: f32,
+) -> (f32, f32) {
+    let max_sh = (bottom_limit - top_limit).max(1.0);
+    let sh = natural_sh.min(max_sh);
+
+    let down_top = row_top - inner_pad;
+    if down_top >= top_limit && down_top + sh <= bottom_limit + 0.5 {
+        return (down_top, (down_top + sh).min(bottom_limit));
+    }
+
+    let up_top = (bottom_limit - sh).max(top_limit);
+    (up_top, (up_top + sh).min(bottom_limit))
+}
+
 /// Resolves the menu's dynamic UI accent color from the active source cover (matching spectrum bars),
 /// falling back to any available source cover or the system accent color.
 fn resolve_dynamic_menu_accent(
@@ -4131,5 +4152,37 @@ mod tests {
             resolve_dynamic_menu_accent(&plain_sources, Some("no_cover"), fallback, true),
             adjust_accent_for_theme(fallback, true)
         );
+    }
+
+    #[test]
+    fn submenu_vertical_span_prefers_downward_then_aligns_last_item_upward() {
+        let pad = 8.0f32;
+        let top_limit = 14.0f32;
+        let bottom_limit = 316.0f32; // primary last row (`设置`, top=274, bottom=308) + pad
+
+        // 1. Ample downward space: top aligns with parent row (`row_top - pad`)
+        let (t1, b1) = compute_submenu_vertical_span(122.0, pad, 110.0, top_limit, bottom_limit);
+        assert!((t1 - 114.0).abs() < 0.01);
+        assert!((b1 - 224.0).abs() < 0.01);
+
+        // 2. Middle row without enough downward space: last submenu item aligns with primary last item (`bottom_limit`)
+        let (t2, b2) = compute_submenu_vertical_span(236.0, pad, 140.0, top_limit, bottom_limit);
+        assert!((b2 - bottom_limit).abs() < 0.01);
+        assert!((t2 - 176.0).abs() < 0.01);
+        assert!(((b2 - pad) - 308.0).abs() < 0.01);
+
+        // 3. Bottom-most Settings row (`退出` 34px aligns flush with `设置` 34px at bottom_limit)
+        let (t3, b3) = compute_submenu_vertical_span(274.0, pad, 169.0, top_limit, bottom_limit);
+        assert!((b3 - bottom_limit).abs() < 0.01);
+        assert!((t3 - 147.0).abs() < 0.01);
+        let exit_bottom = b3 - pad;
+        let exit_top = exit_bottom - 34.0;
+        assert!((exit_bottom - 308.0).abs() < 0.01);
+        assert!((exit_top - 274.0).abs() < 0.01);
+
+        // 4. Extremely tall submenu exceeding upward headroom clamps cleanly within [top_limit, bottom_limit]
+        let (t4, b4) = compute_submenu_vertical_span(160.0, pad, 340.0, top_limit, bottom_limit);
+        assert!((t4 - top_limit).abs() < 0.01);
+        assert!((b4 - bottom_limit).abs() < 0.01);
     }
 }
