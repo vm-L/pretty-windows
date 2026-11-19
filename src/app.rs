@@ -660,10 +660,11 @@ impl AppState {
             self.clear_vol_hud();
             self.render_now();
         }
-        if self.popup.is_visible() {
-            self.popup.hide();
-            self.dirty = true;
-            self.render_now();
+        if self.popup.is_open() {
+            self.popup.hide_animated();
+            return;
+        }
+        if self.popup.is_closing_recently() {
             return;
         }
         if let Some(closed_at) = self.popup_closed_at.take() {
@@ -808,7 +809,7 @@ unsafe extern "system" fn main_wnd_proc(
             let wheel_delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             if wheel_delta != 0 {
                 if let Ok(mut state) = rc.try_borrow_mut() {
-                    if state.visible && !state.hidden_by_guard && !state.popup.is_visible() {
+                    if state.visible && !state.hidden_by_guard && !state.popup.is_open() {
                         state.apply_master_wheel(wheel_delta);
                     }
                 }

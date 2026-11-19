@@ -17,8 +17,9 @@ use crate::volume::{
 use std::collections::HashMap;
 use std::mem::{size_of, ManuallyDrop};
 use std::ptr::null_mut;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::core::{w, Interface};
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
@@ -56,10 +57,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindowVisible,
     KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-    WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
+    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 pub const WM_APP_SOURCE_SELECTED: u32 = WM_APP + 2;
@@ -75,7 +76,17 @@ const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const POPUP_CLASS_NAME: windows::core::PCWSTR = w!("MediaBarSourcePopupWnd");
 
 const TIMER_POPUP_FLOW_ID: usize = 1;
+const POPUP_ANIM_INTERVAL_MS: u32 = 10;
 const POPUP_FLOW_INTERVAL_MS: u32 = 33;
+const SILK_UPDATE_INTERVAL_MS: u64 = 32;
+const VOL_RELOAD_FRESH_MS: u64 = 2500;
+const CLOSE_ANIM_DUR_S: f32 = 0.130;
+const OPEN_SPRING_STIFFNESS: f32 = 440.0;
+const OPEN_SPRING_DAMPING: f32 = 30.5;
+const SUB_WIDTH_STIFFNESS: f32 = 500.0;
+const SUB_WIDTH_DAMPING: f32 = 32.0;
+const SUB_VERT_STIFFNESS: f32 = 460.0;
+const SUB_VERT_DAMPING: f32 = 31.5;
 const SILK_W: u32 = 64;
 const SILK_H: u32 = 48;
 
@@ -156,6 +167,65 @@ enum SliderTarget {
     App(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopupAnimPhase {
+    Opening,
+    Open,
+    Closing,
+}
+
+/// Critically/lightly damped 1D second-order spring preserving velocity across target changes.
+#[derive(Clone, Copy, Debug)]
+struct Spring1D {
+    pos: f32,
+    vel: f32,
+}
+
+impl Spring1D {
+    fn still(pos: f32) -> Self {
+        Self { pos, vel: 0.0 }
+    }
+
+    fn new(pos: f32, vel: f32) -> Self {
+        Self { pos, vel }
+    }
+
+    fn step(&mut self, target: f32, stiffness: f32, damping: f32, dt: f32) {
+        const SUB_DT: f32 = 0.004;
+        let mut rem = dt.clamp(0.0, 0.1);
+        while rem > 0.0 {
+            let h = rem.min(SUB_DT);
+            let acc = (target - self.pos) * stiffness - self.vel * damping;
+            self.vel += acc * h;
+            self.pos += self.vel * h;
+            rem -= h;
+        }
+    }
+
+    fn is_settled(&self, target: f32, pos_eps: f32, vel_eps: f32) -> bool {
+        (target - self.pos).abs() <= pos_eps && self.vel.abs() <= vel_eps
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SubSpringState {
+    top: Spring1D,
+    bottom: Spring1D,
+    width: Spring1D,
+    fade_elapsed: f32,
+    prev_category: Option<PrimaryCategory>,
+    is_budding: bool,
+}
+
+#[derive(Clone)]
+struct CachedTextFormats {
+    dpi: u32,
+    title_fmt: IDWriteTextFormat,
+    sub_fmt: IDWriteTextFormat,
+    badge_fmt: IDWriteTextFormat,
+    pct_fmt: IDWriteTextFormat,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct VolumeRowGeom {
     row_rect: RectF,
@@ -174,6 +244,8 @@ struct PopupInner {
     rt: ID2D1DCRenderTarget,
     surface: LayeredSurface,
     layer: ID2D1Layer,
+    content_layer: ID2D1Layer,
+    thumb_layer: ID2D1Layer,
     round_stroke: Option<ID2D1StrokeStyle>,
     dpi: u32,
     fallback_accent: Rgb,
@@ -207,6 +279,17 @@ struct PopupInner {
     ui_accent: (f32, f32, f32),
     halo_colors_ready: bool,
     last_flow_tick: Instant,
+    last_silk_tick: Option<Instant>,
+    last_color_tick: Instant,
+    last_vol_reload: Option<Instant>,
+    anim_phase: PopupAnimPhase,
+    open_spring: Spring1D,
+    open_elapsed: f32,
+    close_progress: f32,
+    close_started_at: Option<Instant>,
+    sub_anim: Option<SubSpringState>,
+    timer_interval_ms: u32,
+    cached_text_formats: Option<CachedTextFormats>,
     cover_bmps: HashMap<u64, ID2D1Bitmap>,
     arrow_cursor: HCURSOR,
 }
@@ -263,6 +346,8 @@ impl SourcePopup {
             };
             let rt = d2d_factory.CreateDCRenderTarget(&rt_props)?;
             let layer = rt.CreateLayer(None)?;
+            let content_layer = rt.CreateLayer(None)?;
+            let thumb_layer = rt.CreateLayer(None)?;
             let surface = LayeredSurface::new()?;
             let round_stroke = create_round_cap_stroke(&d2d_factory);
 
@@ -274,6 +359,8 @@ impl SourcePopup {
                 rt,
                 surface,
                 layer,
+                content_layer,
+                thumb_layer,
                 round_stroke,
                 dpi: 96,
                 fallback_accent: Rgb::new(0, 120, 212),
@@ -307,6 +394,17 @@ impl SourcePopup {
                 ui_accent: (0.0, 120.0 / 255.0, 212.0 / 255.0),
                 halo_colors_ready: false,
                 last_flow_tick: Instant::now(),
+                last_silk_tick: None,
+                last_color_tick: Instant::now(),
+                last_vol_reload: None,
+                anim_phase: PopupAnimPhase::Open,
+                open_spring: Spring1D::still(1.0),
+                open_elapsed: 1.0,
+                close_progress: 0.0,
+                close_started_at: None,
+                sub_anim: None,
+                timer_interval_ms: 0,
+                cached_text_formats: None,
                 cover_bmps: HashMap::new(),
                 arrow_cursor,
             });
@@ -323,6 +421,22 @@ impl SourcePopup {
 
     pub fn is_visible(&self) -> bool {
         unsafe { IsWindowVisible(self.hwnd).as_bool() }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.is_visible() && self.inner.anim_phase != PopupAnimPhase::Closing
+    }
+
+    pub fn is_closing_recently(&self) -> bool {
+        (self.is_visible() && self.inner.anim_phase == PopupAnimPhase::Closing)
+            || self
+                .inner
+                .close_started_at
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(240))
+    }
+
+    pub fn hide_animated(&mut self) {
+        self.inner.begin_close();
     }
 
     pub fn ensure_topmost(&self) {
@@ -385,6 +499,7 @@ impl SourcePopup {
         self.inner.fallback_accent = fallback_accent;
         if changed {
             self.inner.halo_colors_ready = false;
+            self.inner.last_silk_tick = None;
             if self.is_visible() {
                 let _ = self.inner.render();
             }
@@ -498,7 +613,14 @@ impl SourcePopup {
         self.inner.backdrop_bmp =
             capture_blurred_desktop_bitmap(&self.inner.rt, win_x, win_y, win_w, win_h);
         self.inner.halo_colors_ready = false;
-        self.inner.last_flow_tick = Instant::now();
+        self.inner.last_silk_tick = None;
+        self.inner.last_color_tick = Instant::now();
+        self.inner.anim_phase = PopupAnimPhase::Opening;
+        self.inner.open_spring = Spring1D::new(0.08, 1.6);
+        self.inner.open_elapsed = 0.0;
+        self.inner.close_progress = 0.0;
+        self.inner.close_started_at = None;
+        self.inner.sub_anim = None;
 
         let _ = self.inner.render();
 
@@ -514,13 +636,11 @@ impl SourcePopup {
             );
             let _ = ShowWindow(self.hwnd, SW_SHOW);
             let _ = SetForegroundWindow(self.hwnd);
-            SetTimer(
-                self.hwnd,
-                TIMER_POPUP_FLOW_ID,
-                POPUP_FLOW_INTERVAL_MS,
-                None,
-            );
         }
+        // Stamp clock after window presentation so first WM_TIMER does not absorb SetWindowPos/DWM latency.
+        self.inner.last_flow_tick = Instant::now();
+        self.inner.last_color_tick = self.inner.last_flow_tick;
+        self.inner.sync_timer_rate();
     }
 }
 
@@ -543,13 +663,172 @@ impl PopupInner {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_POPUP_FLOW_ID);
         }
+        self.timer_interval_ms = 0;
         self.backdrop_bmp = None;
         self.halo_colors_ready = false;
+        self.last_silk_tick = None;
+        self.last_vol_reload = None;
+        self.anim_phase = PopupAnimPhase::Open;
+        self.open_spring = Spring1D::still(1.0);
+        self.open_elapsed = 1.0;
+        self.close_progress = 0.0;
+        self.close_started_at = None;
+        self.sub_anim = None;
         self.active_category = None;
         self.hover_target = HoverTarget::None;
         self.dragging_slider = None;
         self.app_volumes.clear();
         self.master_vol_ctrl = None;
+    }
+
+    fn needs_fast_anim(&self) -> bool {
+        matches!(
+            self.anim_phase,
+            PopupAnimPhase::Opening | PopupAnimPhase::Closing
+        ) || self.sub_anim.is_some()
+    }
+
+    fn sync_timer_rate(&mut self) {
+        let desired = if self.needs_fast_anim() {
+            POPUP_ANIM_INTERVAL_MS
+        } else {
+            POPUP_FLOW_INTERVAL_MS
+        };
+        if self.timer_interval_ms != desired {
+            unsafe {
+                SetTimer(self.hwnd, TIMER_POPUP_FLOW_ID, desired, None);
+            }
+            self.timer_interval_ms = desired;
+        }
+    }
+
+    fn begin_close(&mut self) {
+        if self.anim_phase == PopupAnimPhase::Closing
+            || !unsafe { IsWindowVisible(self.hwnd).as_bool() }
+        {
+            return;
+        }
+        if self.dragging_slider.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
+        self.hover_target = HoverTarget::None;
+        self.anim_phase = PopupAnimPhase::Closing;
+        self.close_progress = 0.0;
+        self.close_started_at = Some(Instant::now());
+        self.last_flow_tick = Instant::now();
+        self.sync_timer_rate();
+        let _ = self.render();
+    }
+
+    fn finish_close(&mut self) {
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        self.reset_transient_state();
+        self.close_started_at = Some(Instant::now());
+        unsafe {
+            let _ = PostMessageW(self.main_hwnd, WM_APP_POPUP_CLOSED, WPARAM(0), LPARAM(0));
+        }
+    }
+
+    fn advance_animations(&mut self, dt: f32) -> bool {
+        match self.anim_phase {
+            PopupAnimPhase::Opening => {
+                self.open_elapsed += dt;
+                self.open_spring
+                    .step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, dt);
+                if (self.open_spring.is_settled(1.0, 0.0015, 0.015) && self.open_elapsed >= 0.22)
+                    || self.open_elapsed >= 0.55
+                {
+                    self.open_spring = Spring1D::still(1.0);
+                    self.anim_phase = PopupAnimPhase::Open;
+                }
+            }
+            PopupAnimPhase::Open => {}
+            PopupAnimPhase::Closing => {
+                self.close_progress = (self.close_progress + dt / CLOSE_ANIM_DUR_S).min(1.0);
+                if self.close_progress >= 1.0 {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(cat) = self.active_category {
+            if self.sub_anim.is_some() {
+                let target = self.sub_card_rect(cat);
+                let s = self.scale();
+                if let Some(ref mut sa) = self.sub_anim {
+                    sa.fade_elapsed += dt;
+                    sa.top
+                        .step(target.top, SUB_VERT_STIFFNESS, SUB_VERT_DAMPING, dt);
+                    sa.bottom
+                        .step(target.bottom, SUB_VERT_STIFFNESS, SUB_VERT_DAMPING, dt);
+                    sa.width
+                        .step(target.width(), SUB_WIDTH_STIFFNESS, SUB_WIDTH_DAMPING, dt);
+                    let pos_eps = 0.35 * s;
+                    let vel_eps = 4.0 * s;
+                    let converged = sa.top.is_settled(target.top, pos_eps, vel_eps)
+                        && sa.bottom.is_settled(target.bottom, pos_eps, vel_eps)
+                        && sa.width.is_settled(target.width(), pos_eps, vel_eps);
+                    if (converged && sa.fade_elapsed >= 0.155) || sa.fade_elapsed >= 0.55 {
+                        self.sub_anim = None;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn current_animated_sub_rect(&self) -> Option<RectF> {
+        let cat = self.active_category?;
+        let s = self.scale();
+        let target_primary = self.primary_card_rect();
+        let anim_primary = animated_primary_rect(
+            target_primary,
+            self.anim_phase,
+            self.open_spring.pos,
+            self.close_progress,
+            s,
+        );
+        let target_sub = self.sub_card_rect(cat);
+        let seam_x = if self.open_left {
+            anim_primary.left
+        } else {
+            anim_primary.right
+        };
+        let bottom_limit =
+            (target_primary.bottom - self.primary_overlap_px()).max(target_primary.top + 58.0 * s);
+        let base_sub = match self.sub_anim {
+            Some(sa) => clamp_sub_spring_rect(
+                sa.top.pos,
+                sa.bottom.pos,
+                sa.width.pos,
+                target_sub,
+                seam_x,
+                bottom_limit,
+                self.win_w as f32,
+                self.open_left,
+                s,
+            ),
+            None => target_sub,
+        };
+
+        if self.anim_phase == PopupAnimPhase::Closing {
+            Some(animated_closing_sub_rect(
+                base_sub,
+                anim_primary,
+                seam_x,
+                bottom_limit,
+                self.open_left,
+                self.close_progress,
+                s,
+            ))
+        } else {
+            Some(base_sub)
+        }
     }
 
     fn reload_volumes(&mut self) {
@@ -562,6 +841,7 @@ impl PopupInner {
             self.master_muted = false;
         }
         self.app_volumes = enumerate_app_volumes();
+        self.last_vol_reload = Some(Instant::now());
     }
 
     fn set_master_volume_ratio(&mut self, ratio: f32) {
@@ -970,10 +1250,65 @@ impl PopupInner {
             for (cat, r) in self.primary_row_rects() {
                 if r.contains(x, y) {
                     if self.active_category != Some(cat) {
+                        let s = self.scale();
+                        let prev_anim_sub = self.current_animated_sub_rect();
                         self.active_category = Some(cat);
-                        if cat == PrimaryCategory::VolumeControl {
+                        if cat == PrimaryCategory::VolumeControl
+                            && self
+                                .last_vol_reload
+                                .is_none_or(|t| t.elapsed() >= Duration::from_millis(VOL_RELOAD_FRESH_MS))
+                        {
                             self.reload_volumes();
                         }
+                        let target_sub = self.sub_card_rect(cat);
+                        let seam_x = if self.open_left {
+                            primary_rect.left
+                        } else {
+                            primary_rect.right
+                        };
+                        self.sub_anim = match (prev_cat, self.sub_anim) {
+                            (Some(pcat), Some(mut existing)) => {
+                                if let Some(prev_rect) = prev_anim_sub {
+                                    existing.top.pos = prev_rect.top;
+                                    existing.bottom.pos = prev_rect.bottom;
+                                    existing.width.pos = prev_rect.width();
+                                }
+                                existing.fade_elapsed = 0.0;
+                                existing.prev_category = Some(pcat);
+                                existing.is_budding = false;
+                                Some(existing)
+                            }
+                            (Some(pcat), None) => {
+                                let old_rect = prev_anim_sub.unwrap_or_else(|| self.sub_card_rect(pcat));
+                                Some(SubSpringState {
+                                    top: Spring1D::still(old_rect.top),
+                                    bottom: Spring1D::still(old_rect.bottom),
+                                    width: Spring1D::still(old_rect.width()),
+                                    fade_elapsed: 0.0,
+                                    prev_category: Some(pcat),
+                                    is_budding: false,
+                                })
+                            }
+                            (None, _) => {
+                                let bud =
+                                    sub_bud_start_rect(target_sub, r, seam_x, self.open_left, s);
+                                Some(SubSpringState {
+                                    top: Spring1D::new(
+                                        bud.top,
+                                        (target_sub.top - bud.top) * 1.2,
+                                    ),
+                                    bottom: Spring1D::new(
+                                        bud.bottom,
+                                        (target_sub.bottom - bud.bottom) * 1.2,
+                                    ),
+                                    width: Spring1D::new(bud.width(), target_sub.width() * 1.6),
+                                    fade_elapsed: 0.0,
+                                    prev_category: None,
+                                    is_budding: true,
+                                })
+                            }
+                        };
+                        self.sync_timer_rate();
                     }
                     next_hover = HoverTarget::Primary(cat);
                     break;
@@ -1123,11 +1458,48 @@ impl PopupInner {
         }
     }
 
-    fn update_silk_bitmap(&mut self, primary_rect: RectF, s: f32, dt_hint: f32) {
-        let expected_len = (SILK_W * SILK_H * 4) as usize;
-        if self.silk_buf.len() != expected_len {
-            self.silk_buf.resize(expected_len, 0);
+    fn ensure_text_formats(&mut self) -> windows::core::Result<CachedTextFormats> {
+        if let Some(ref cached) = self.cached_text_formats {
+            if cached.dpi == self.dpi {
+                return Ok(cached.clone());
+            }
         }
+        let s = self.scale();
+        let title_fmt = self.create_fmt(12.5 * s, true, false)?;
+        let sub_fmt = self.create_fmt(11.0 * s, false, false)?;
+        let badge_fmt = self.create_fmt(10.5 * s, true, false)?;
+        let pct_fmt = self.create_fmt(11.0 * s, true, true)?;
+        let trimming = DWRITE_TRIMMING {
+            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+            delimiter: 0,
+            delimiterCount: 0,
+        };
+        let title_trim: IDWriteInlineObject =
+            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&title_fmt)? };
+        let sub_trim: IDWriteInlineObject =
+            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&sub_fmt)? };
+        unsafe {
+            let _ = title_fmt.SetTrimming(&trimming, &title_trim);
+            let _ = sub_fmt.SetTrimming(&trimming, &sub_trim);
+        }
+        let cached = CachedTextFormats {
+            dpi: self.dpi,
+            title_fmt,
+            sub_fmt,
+            badge_fmt,
+            pct_fmt,
+        };
+        self.cached_text_formats = Some(cached.clone());
+        Ok(cached)
+    }
+
+    fn update_silk_bitmap(&mut self, primary_rect: RectF, s: f32) {
+        let now = Instant::now();
+        let dt_color = now
+            .duration_since(self.last_color_tick)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.last_color_tick = now;
 
         let cover = self
             .active_id
@@ -1145,21 +1517,37 @@ impl PopupInner {
         )
         .to_normalized();
 
-        if !self.halo_colors_ready {
+        let was_ready = self.halo_colors_ready;
+        if !was_ready {
             self.halo_colors = target;
             self.ui_accent = ui_target;
             self.halo_colors_ready = true;
         } else {
-            let k = (dt_hint * 4.5).clamp(0.02, 1.0);
+            let k = (dt_color * 4.5).clamp(0.02, 1.0);
             for (cur, tgt) in self.halo_colors.iter_mut().zip(target.iter()) {
                 cur.0 += (tgt.0 - cur.0) * k;
                 cur.1 += (tgt.1 - cur.1) * k;
                 cur.2 += (tgt.2 - cur.2) * k;
             }
-            let k_ui = (dt_hint * 6.0).clamp(0.02, 1.0);
+            let k_ui = (dt_color * 6.0).clamp(0.02, 1.0);
             self.ui_accent.0 += (ui_target.0 - self.ui_accent.0) * k_ui;
             self.ui_accent.1 += (ui_target.1 - self.ui_accent.1) * k_ui;
             self.ui_accent.2 += (ui_target.2 - self.ui_accent.2) * k_ui;
+        }
+
+        let need_rebuild = self.silk_bmp.is_none()
+            || !was_ready
+            || self
+                .last_silk_tick
+                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(SILK_UPDATE_INTERVAL_MS));
+        if !need_rebuild {
+            return;
+        }
+        self.last_silk_tick = Some(now);
+
+        let expected_len = (SILK_W * SILK_H * 4) as usize;
+        if self.silk_buf.len() != expected_len {
+            self.silk_buf.resize(expected_len, 0);
         }
 
         let scale_len = (220.0 * s).max(1.0);
@@ -1224,24 +1612,7 @@ impl PopupInner {
         }
 
         let s = self.scale();
-
-        let title_fmt = self.create_fmt(12.5 * s, true, false)?;
-        let sub_fmt = self.create_fmt(11.0 * s, false, false)?;
-        let badge_fmt = self.create_fmt(10.5 * s, true, false)?;
-        let pct_fmt = self.create_fmt(11.0 * s, true, true)?;
-        let trimming = DWRITE_TRIMMING {
-            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-            delimiter: 0,
-            delimiterCount: 0,
-        };
-        let title_trim: IDWriteInlineObject =
-            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&title_fmt)? };
-        let sub_trim: IDWriteInlineObject =
-            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&sub_fmt)? };
-        unsafe {
-            let _ = title_fmt.SetTrimming(&trimming, &title_trim);
-            let _ = sub_fmt.SetTrimming(&trimming, &sub_trim);
-        }
+        let fmts = self.ensure_text_formats()?;
 
         let bind_rect = RECT {
             left: 0,
@@ -1250,16 +1621,47 @@ impl PopupInner {
             bottom: self.surface.height(),
         };
 
-        let primary_rect = self.primary_card_rect();
-        self.update_silk_bitmap(primary_rect, s, 0.033);
+        let target_primary = self.primary_card_rect();
+        self.update_silk_bitmap(target_primary, s);
         let auto_accent = Rgb::new(
             (self.ui_accent.0 * 255.0).round().clamp(0.0, 255.0) as u8,
             (self.ui_accent.1 * 255.0).round().clamp(0.0, 255.0) as u8,
             (self.ui_accent.2 * 255.0).round().clamp(0.0, 255.0) as u8,
         );
+
+        let anim_primary = animated_primary_rect(
+            target_primary,
+            self.anim_phase,
+            self.open_spring.pos,
+            self.close_progress,
+            s,
+        );
         let primary_rows = self.primary_row_rects();
-        let sub_pair = self.active_category.map(|cat| (cat, self.sub_card_rect(cat)));
-        let sub_rect_opt = sub_pair.map(|(_, sr)| sr);
+        let anim_sub_opt = self.current_animated_sub_rect();
+
+        let (primary_alpha, close_dy) = match self.anim_phase {
+            PopupAnimPhase::Opening => {
+                let a = ease_out_cubic(((self.open_elapsed - 0.015) / 0.125).clamp(0.0, 1.0));
+                (a, 0.0)
+            }
+            PopupAnimPhase::Open => (1.0, 0.0),
+            PopupAnimPhase::Closing => {
+                let r = ease_retract(self.close_progress);
+                ((1.0 - 0.30 * r).clamp(0.0, 1.0), 5.0 * s * r)
+            }
+        };
+
+        let foot_r = FOOT_MENISCUS_DIP * s;
+        let left_bound = anim_sub_opt.map_or(anim_primary.left, |sr| anim_primary.left.min(sr.left));
+        let right_bound =
+            anim_sub_opt.map_or(anim_primary.right, |sr| anim_primary.right.max(sr.right));
+        let top_bound = anim_sub_opt.map_or(anim_primary.top, |sr| anim_primary.top.min(sr.top));
+        let union_bounds = RectF::new(
+            (left_bound - foot_r).max(0.0),
+            (top_bound - 1.0 * s).max(0.0),
+            (right_bound + foot_r).min(self.win_w as f32),
+            anim_primary.bottom,
+        );
 
         unsafe {
             self.rt.BindDC(self.surface.dc(), &bind_rect)?;
@@ -1272,164 +1674,370 @@ impl PopupInner {
             }));
 
             // 1. Unified ambient shadows (primary flat at taskbar/MediaBar bottom, submenu clamped above taskbar)
-            self.draw_unified_shadows(primary_rect, sub_rect_opt, s);
+            self.draw_unified_shadows(anim_primary, anim_sub_opt, s);
 
-            // 2. System-theme frosted liquid glass + restrained liquid silk ripples
-            self.draw_unified_glass_envelope(primary_rect, sub_rect_opt, s);
-
-            // 3. Primary row backgrounds & content
-            for (cat, rect) in primary_rows {
-                let expanded = self.active_category == Some(cat);
-                let hovered = self.hover_target == HoverTarget::Primary(cat);
-                self.draw_primary_row_bg(rect, hovered, expanded, auto_accent, s);
-                self.draw_primary_row_content(cat, rect, expanded, &title_fmt, s);
-            }
-
-            // 4. Clean feathered vertical seam divider & submenu content
-            if let Some((cat, sub_rect)) = sub_pair {
-                let seam_x = if self.open_left {
-                    primary_rect.left
-                } else {
-                    primary_rect.right
+            // 2. Single unified silhouette layer clipping glass interior, primary rows, divider & submenu content
+            if let Ok(unified_geo) =
+                self.build_unified_menu_geometry(anim_primary, anim_sub_opt, s, true)
+            {
+                let geom: ID2D1Geometry = unified_geo.cast().unwrap();
+                let outer_params = D2D1_LAYER_PARAMETERS {
+                    contentBounds: d2d_rect(union_bounds),
+                    geometricMask: ManuallyDrop::new(Some(geom)),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: identity_matrix(),
+                    opacity: 1.0,
+                    opacityBrush: ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
                 };
-                let seam_top = primary_rect.top.max(sub_rect.top) + 8.0 * s;
-                let seam_bottom = primary_rect.bottom.min(sub_rect.bottom) - 8.0 * s;
-                if seam_bottom > seam_top + 4.0 * s {
-                    let (sr, sg, sb, peak_a) = if self.light_glass {
-                        (0.0, 0.0, 0.0, 0.075)
-                    } else {
-                        (1.0, 1.0, 1.0, 0.10)
-                    };
-                    let seam_stops = [
-                        D2D1_GRADIENT_STOP {
-                            position: 0.0,
-                            color: D2D1_COLOR_F {
-                                r: sr,
-                                g: sg,
-                                b: sb,
-                                a: 0.0,
-                            },
-                        },
-                        D2D1_GRADIENT_STOP {
-                            position: 0.14,
-                            color: D2D1_COLOR_F {
-                                r: sr,
-                                g: sg,
-                                b: sb,
-                                a: peak_a,
-                            },
-                        },
-                        D2D1_GRADIENT_STOP {
-                            position: 0.86,
-                            color: D2D1_COLOR_F {
-                                r: sr,
-                                g: sg,
-                                b: sb,
-                                a: peak_a,
-                            },
-                        },
-                        D2D1_GRADIENT_STOP {
-                            position: 1.0,
-                            color: D2D1_COLOR_F {
-                                r: sr,
-                                g: sg,
-                                b: sb,
-                                a: 0.0,
-                            },
-                        },
-                    ];
-                    if let Ok(sc) = self.rt.CreateGradientStopCollection(
-                        &seam_stops,
-                        D2D1_GAMMA_2_2,
-                        D2D1_EXTEND_MODE_CLAMP,
-                    ) {
-                        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                            startPoint: D2D_POINT_2F {
-                                x: seam_x,
-                                y: seam_top,
-                            },
-                            endPoint: D2D_POINT_2F {
-                                x: seam_x,
-                                y: seam_bottom,
-                            },
+                self.rt.PushLayer(&outer_params, &self.layer);
+
+                // 2a. System-theme frosted liquid glass + restrained liquid silk ripples
+                self.draw_glass_interior(union_bounds);
+
+                // 2b. Primary row backgrounds & staggered content (skip content_layer when steady Open)
+                if primary_alpha > 0.005 {
+                    let use_layer = self.anim_phase != PopupAnimPhase::Open;
+                    if use_layer {
+                        let content_params = D2D1_LAYER_PARAMETERS {
+                            contentBounds: d2d_rect(anim_primary),
+                            geometricMask: ManuallyDrop::new(None),
+                            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                            maskTransform: identity_matrix(),
+                            opacity: primary_alpha,
+                            opacityBrush: ManuallyDrop::new(None),
+                            layerOptions: D2D1_LAYER_OPTIONS_NONE,
                         };
-                        if let Ok(seam_brush) = self.rt.CreateLinearGradientBrush(&props, None, &sc)
-                        {
-                            self.rt.DrawLine(
-                                D2D_POINT_2F {
+                        self.rt.PushLayer(&content_params, &self.content_layer);
+                    }
+                    for (idx, (cat, mut rect)) in primary_rows.into_iter().enumerate() {
+                        match self.anim_phase {
+                            PopupAnimPhase::Opening => {
+                                let dy = primary_row_stagger_dy(
+                                    idx,
+                                    self.open_elapsed,
+                                    self.open_spring.pos,
+                                    s,
+                                );
+                                rect.top += dy;
+                                rect.bottom += dy;
+                            }
+                            PopupAnimPhase::Open => {}
+                            PopupAnimPhase::Closing => {
+                                rect.top += close_dy;
+                                rect.bottom += close_dy;
+                            }
+                        }
+                        let expanded = self.active_category == Some(cat);
+                        let hovered = self.hover_target == HoverTarget::Primary(cat);
+                        self.draw_primary_row_bg(rect, hovered, expanded, auto_accent, s);
+                        self.draw_primary_row_content(cat, rect, expanded, &fmts.title_fmt, s);
+                    }
+                    if use_layer {
+                        self.rt.PopLayer();
+                    }
+                }
+
+                // 2c. Clean feathered vertical seam divider & animated submenu content
+                if let (Some(cat), Some(anim_sub)) = (self.active_category, anim_sub_opt) {
+                    let target_sub = self.sub_card_rect(cat);
+                    let (fade_in, dx_cur, dy_cur) = match self.sub_anim {
+                        Some(sa) if sa.is_budding => {
+                            let a =
+                                ease_out_cubic(((sa.fade_elapsed - 0.015) / 0.125).clamp(0.0, 1.0));
+                            let slide_t = ease_out_cubic((sa.fade_elapsed / 0.165).clamp(0.0, 1.0));
+                            let dir = if self.open_left { 1.0 } else { -1.0 };
+                            let dx = dir * 12.0 * s * (1.0 - slide_t);
+                            let dy = (anim_sub.top - target_sub.top) * 0.35;
+                            (a, dx, dy)
+                        }
+                        Some(sa) => {
+                            let a =
+                                ease_out_cubic(((sa.fade_elapsed - 0.018) / 0.120).clamp(0.0, 1.0));
+                            let dy = (anim_sub.top - target_sub.top) * 0.30;
+                            (a, 0.0, dy)
+                        }
+                        None => (1.0, 0.0, (anim_sub.top - target_sub.top) * 0.45),
+                    };
+
+                    let seam_x = if self.open_left {
+                        anim_primary.left
+                    } else {
+                        anim_primary.right
+                    };
+                    let seam_top = anim_primary.top.max(anim_sub.top) + 8.0 * s;
+                    let seam_bottom = anim_primary.bottom.min(anim_sub.bottom) - 8.0 * s;
+                    let seam_fade = if self.sub_anim.is_some_and(|sa| sa.is_budding) {
+                        fade_in.max(0.12)
+                    } else {
+                        1.0
+                    };
+                    if seam_bottom > seam_top + 4.0 * s {
+                        let (sr, sg, sb, base_a) = if self.light_glass {
+                            (0.0, 0.0, 0.0, 0.075)
+                        } else {
+                            (1.0, 1.0, 1.0, 0.10)
+                        };
+                        let peak_a = base_a * seam_fade;
+                        let seam_stops = [
+                            D2D1_GRADIENT_STOP {
+                                position: 0.0,
+                                color: D2D1_COLOR_F {
+                                    r: sr,
+                                    g: sg,
+                                    b: sb,
+                                    a: 0.0,
+                                },
+                            },
+                            D2D1_GRADIENT_STOP {
+                                position: 0.14,
+                                color: D2D1_COLOR_F {
+                                    r: sr,
+                                    g: sg,
+                                    b: sb,
+                                    a: peak_a,
+                                },
+                            },
+                            D2D1_GRADIENT_STOP {
+                                position: 0.86,
+                                color: D2D1_COLOR_F {
+                                    r: sr,
+                                    g: sg,
+                                    b: sb,
+                                    a: peak_a,
+                                },
+                            },
+                            D2D1_GRADIENT_STOP {
+                                position: 1.0,
+                                color: D2D1_COLOR_F {
+                                    r: sr,
+                                    g: sg,
+                                    b: sb,
+                                    a: 0.0,
+                                },
+                            },
+                        ];
+                        if let Ok(sc) = self.rt.CreateGradientStopCollection(
+                            &seam_stops,
+                            D2D1_GAMMA_2_2,
+                            D2D1_EXTEND_MODE_CLAMP,
+                        ) {
+                            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                                startPoint: D2D_POINT_2F {
                                     x: seam_x,
                                     y: seam_top,
                                 },
-                                D2D_POINT_2F {
+                                endPoint: D2D_POINT_2F {
                                     x: seam_x,
                                     y: seam_bottom,
                                 },
-                                &seam_brush,
-                                1.0 * s,
-                                None,
-                            );
+                            };
+                            if let Ok(seam_brush) =
+                                self.rt.CreateLinearGradientBrush(&props, None, &sc)
+                            {
+                                self.rt.DrawLine(
+                                    D2D_POINT_2F {
+                                        x: seam_x,
+                                        y: seam_top,
+                                    },
+                                    D2D_POINT_2F {
+                                        x: seam_x,
+                                        y: seam_bottom,
+                                    },
+                                    &seam_brush,
+                                    1.0 * s,
+                                    None,
+                                );
+                            }
+                        }
+                    }
+
+                    let close_factor = if self.anim_phase == PopupAnimPhase::Closing {
+                        (1.0 - 0.30 * ease_retract(self.close_progress)).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+
+                    if let Some(sa) = self.sub_anim {
+                        if let Some(prev_cat) = sa.prev_category {
+                            if sa.fade_elapsed < 0.080 {
+                                let fade_out =
+                                    (1.0 - ease_out_cubic((sa.fade_elapsed / 0.080).clamp(0.0, 1.0)))
+                                        * close_factor;
+                                if fade_out > 0.005 {
+                                    let prev_target = self.sub_card_rect(prev_cat);
+                                    let dy_prev = (anim_sub.top - prev_target.top) * 0.30;
+                                    let layer_params = D2D1_LAYER_PARAMETERS {
+                                        contentBounds: d2d_rect(anim_sub),
+                                        geometricMask: ManuallyDrop::new(None),
+                                        maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                        maskTransform: identity_matrix(),
+                                        opacity: fade_out,
+                                        opacityBrush: ManuallyDrop::new(None),
+                                        layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                                    };
+                                    self.rt.PushLayer(&layer_params, &self.content_layer);
+                                    self.rt.PushAxisAlignedClip(
+                                        &d2d_rect(anim_sub),
+                                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    );
+                                    if dy_prev.abs() > 0.05 {
+                                        self.rt.SetTransform(&Matrix3x2 {
+                                            M11: 1.0,
+                                            M12: 0.0,
+                                            M21: 0.0,
+                                            M22: 1.0,
+                                            M31: 0.0,
+                                            M32: dy_prev,
+                                        });
+                                    }
+                                    self.render_submenu_content(
+                                        prev_cat,
+                                        prev_target,
+                                        auto_accent,
+                                        &fmts.title_fmt,
+                                        &fmts.sub_fmt,
+                                        &fmts.badge_fmt,
+                                        &fmts.pct_fmt,
+                                        s,
+                                    );
+                                    if dy_prev.abs() > 0.05 {
+                                        self.rt.SetTransform(&identity_matrix());
+                                    }
+                                    self.rt.PopAxisAlignedClip();
+                                    self.rt.PopLayer();
+                                }
+                            }
+                        }
+                    }
+
+                    let cur_alpha = fade_in * close_factor;
+                    if cur_alpha > 0.005 {
+                        let need_layer =
+                            self.sub_anim.is_some() || self.anim_phase != PopupAnimPhase::Open;
+                        if need_layer {
+                            let layer_params = D2D1_LAYER_PARAMETERS {
+                                contentBounds: d2d_rect(anim_sub),
+                                geometricMask: ManuallyDrop::new(None),
+                                maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                maskTransform: identity_matrix(),
+                                opacity: cur_alpha,
+                                opacityBrush: ManuallyDrop::new(None),
+                                layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                            };
+                            self.rt.PushLayer(&layer_params, &self.content_layer);
+                        }
+                        self.rt.PushAxisAlignedClip(
+                            &d2d_rect(anim_sub),
+                            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                        );
+                        if dx_cur.abs() > 0.05 || dy_cur.abs() > 0.05 {
+                            self.rt.SetTransform(&Matrix3x2 {
+                                M11: 1.0,
+                                M12: 0.0,
+                                M21: 0.0,
+                                M22: 1.0,
+                                M31: dx_cur,
+                                M32: dy_cur,
+                            });
+                        }
+                        self.render_submenu_content(
+                            cat,
+                            target_sub,
+                            auto_accent,
+                            &fmts.title_fmt,
+                            &fmts.sub_fmt,
+                            &fmts.badge_fmt,
+                            &fmts.pct_fmt,
+                            s,
+                        );
+                        if dx_cur.abs() > 0.05 || dy_cur.abs() > 0.05 {
+                            self.rt.SetTransform(&identity_matrix());
+                        }
+                        self.rt.PopAxisAlignedClip();
+                        if need_layer {
+                            self.rt.PopLayer();
                         }
                     }
                 }
 
-                // 5. Render submenu content
-                match cat {
-                    PrimaryCategory::DisplayContent => {
-                        self.render_display_submenu(
-                            sub_rect,
-                            auto_accent,
-                            &title_fmt,
-                            &sub_fmt,
-                            &badge_fmt,
-                            s,
-                        );
-                    }
-                    PrimaryCategory::VolumeControl => {
-                        self.render_volume_submenu(
-                            sub_rect,
-                            auto_accent,
-                            &title_fmt,
-                            &sub_fmt,
-                            &pct_fmt,
-                            s,
-                        );
-                    }
-                    PrimaryCategory::PlaybackDevices => {
-                        self.render_devices_submenu(
-                            sub_rect,
-                            &self.playback_devices,
-                            true,
-                            auto_accent,
-                            &title_fmt,
-                            &sub_fmt,
-                            s,
-                        );
-                    }
-                    PrimaryCategory::RecordingDevices => {
-                        self.render_devices_submenu(
-                            sub_rect,
-                            &self.recording_devices,
-                            false,
-                            auto_accent,
-                            &title_fmt,
-                            &sub_fmt,
-                            s,
-                        );
-                    }
-                    PrimaryCategory::Settings => {
-                        self.render_settings_submenu(sub_rect, auto_accent, &title_fmt, s);
-                    }
-                }
+                self.rt.PopLayer();
+                let _ = ManuallyDrop::into_inner(outer_params.geometricMask);
             }
 
-            // 6. Open upper rim stroke (omits bottom edge so menu fuses seamlessly into MediaBar)
-            self.draw_unified_open_rim(primary_rect, sub_rect_opt, s);
+            // 3. Open upper rim stroke (omits bottom edge so menu fuses seamlessly into MediaBar)
+            self.draw_unified_open_rim(anim_primary, anim_sub_opt, s);
 
             self.rt.EndDraw(None, None)?;
         }
 
-        self.surface.commit(self.hwnd, self.win_x, self.win_y);
+        let win_alpha =
+            window_master_alpha(self.anim_phase, self.open_elapsed, self.close_progress);
+        let alpha_u8 = (win_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+        self.surface
+            .commit_with_alpha(self.hwnd, self.win_x, self.win_y, alpha_u8);
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn render_submenu_content(
+        &self,
+        cat: PrimaryCategory,
+        sub_rect: RectF,
+        auto_accent: Rgb,
+        title_fmt: &IDWriteTextFormat,
+        sub_fmt: &IDWriteTextFormat,
+        badge_fmt: &IDWriteTextFormat,
+        pct_fmt: &IDWriteTextFormat,
+        s: f32,
+    ) {
+        match cat {
+            PrimaryCategory::DisplayContent => {
+                self.render_display_submenu(
+                    sub_rect,
+                    auto_accent,
+                    title_fmt,
+                    sub_fmt,
+                    badge_fmt,
+                    s,
+                );
+            }
+            PrimaryCategory::VolumeControl => {
+                self.render_volume_submenu(
+                    sub_rect,
+                    auto_accent,
+                    title_fmt,
+                    sub_fmt,
+                    pct_fmt,
+                    s,
+                );
+            }
+            PrimaryCategory::PlaybackDevices => {
+                self.render_devices_submenu(
+                    sub_rect,
+                    &self.playback_devices,
+                    true,
+                    auto_accent,
+                    title_fmt,
+                    sub_fmt,
+                    s,
+                );
+            }
+            PrimaryCategory::RecordingDevices => {
+                self.render_devices_submenu(
+                    sub_rect,
+                    &self.recording_devices,
+                    false,
+                    auto_accent,
+                    title_fmt,
+                    sub_fmt,
+                    s,
+                );
+            }
+            PrimaryCategory::Settings => {
+                self.render_settings_submenu(sub_rect, auto_accent, title_fmt, s);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2049,38 +2657,7 @@ impl PopupInner {
         }
     }
 
-    unsafe fn draw_unified_glass_envelope(
-        &self,
-        primary_rect: RectF,
-        sub_rect: Option<RectF>,
-        s: f32,
-    ) {
-        let Ok(geo) = self.build_unified_menu_geometry(primary_rect, sub_rect, s, true) else {
-            return;
-        };
-        let geom: ID2D1Geometry = geo.cast().unwrap();
-        let foot_r = FOOT_MENISCUS_DIP * s;
-        let left_bound = sub_rect.map_or(primary_rect.left, |sr| primary_rect.left.min(sr.left));
-        let right_bound =
-            sub_rect.map_or(primary_rect.right, |sr| primary_rect.right.max(sr.right));
-        let top_bound = sub_rect.map_or(primary_rect.top, |sr| primary_rect.top.min(sr.top));
-        let union_bounds = RectF::new(
-            (left_bound - foot_r).max(0.0),
-            top_bound,
-            (right_bound + foot_r).min(self.win_w as f32),
-            primary_rect.bottom,
-        );
-        let layer_params = D2D1_LAYER_PARAMETERS {
-            contentBounds: d2d_rect(union_bounds),
-            geometricMask: ManuallyDrop::new(Some(geom)),
-            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-            maskTransform: identity_matrix(),
-            opacity: 1.0,
-            opacityBrush: ManuallyDrop::new(None),
-            layerOptions: D2D1_LAYER_OPTIONS_NONE,
-        };
-        self.rt.PushLayer(&layer_params, &self.layer);
-
+    unsafe fn draw_glass_interior(&self, union_bounds: RectF) {
         let full_win = D2D_RECT_F {
             left: 0.0,
             top: 0.0,
@@ -2198,8 +2775,6 @@ impl PopupInner {
                     .FillRectangle(&d2d_rect(union_bounds), &sheen_brush);
             }
         }
-
-        self.rt.PopLayer();
     }
 
     unsafe fn draw_unified_open_rim(
@@ -3352,7 +3927,7 @@ impl PopupInner {
                     opacityBrush: ManuallyDrop::new(None),
                     layerOptions: D2D1_LAYER_OPTIONS_NONE,
                 };
-                self.rt.PushLayer(&params, &self.layer);
+                self.rt.PushLayer(&params, &self.thumb_layer);
                 self.rt.DrawBitmap(
                     cover_bmp,
                     Some(&d2d_rect(thumb_rect)),
@@ -3361,6 +3936,7 @@ impl PopupInner {
                     None,
                 );
                 self.rt.PopLayer();
+                let _ = ManuallyDrop::into_inner(params.geometricMask);
             }
         } else {
             let tile_col = if self.light_glass {
@@ -3463,6 +4039,166 @@ impl PopupInner {
             &brush,
             D2D1_DRAW_TEXT_OPTIONS_CLIP,
         );
+    }
+}
+
+/// Cubic ease-out curve in `[0, 1]`.
+fn ease_out_cubic(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+/// Smooth ease-in-quad retract curve (`t^2 * (1.6 - 0.6*t)`) in `[0, 1]` for brisk collapse into the taskbar.
+fn ease_retract(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (1.6 - 0.6 * t)
+}
+
+/// Staggered bottom-to-top vertical micro-glide offset (`idx = 4` bottom row settles first, `0` top last).
+fn primary_row_stagger_dy(idx: usize, open_elapsed: f32, open_pos: f32, s: f32) -> f32 {
+    let order = 4usize.saturating_sub(idx) as f32;
+    let delay = order * 0.011;
+    let row_t = ((open_elapsed - delay) / 0.165).clamp(0.0, 1.0);
+    let settle_glide = (1.0 - ease_out_cubic(row_t)) * (7.0 + order * 1.4) * s;
+    let crest_breath = (1.0 - open_pos) * 0.35 * 14.0 * s;
+    settle_glide + crest_breath
+}
+
+/// Computes the primary card's animated envelope, keeping left, right, and bottom anchored on MediaBar.
+fn animated_primary_rect(
+    target: RectF,
+    phase: PopupAnimPhase,
+    open_pos: f32,
+    close_progress: f32,
+    s: f32,
+) -> RectF {
+    let target_h = target.height().max(1.0);
+    let min_h = (42.0 * s).min(target_h * 0.65);
+    match phase {
+        PopupAnimPhase::Opening => {
+            let h = (min_h + (target_h - min_h) * open_pos.max(0.0)).max(min_h);
+            RectF::new(
+                target.left,
+                (target.bottom - h).max(4.0 * s),
+                target.right,
+                target.bottom,
+            )
+        }
+        PopupAnimPhase::Open => target,
+        PopupAnimPhase::Closing => {
+            let r = ease_retract(close_progress);
+            let h = (target_h * (1.0 - 0.42 * r)).max(min_h);
+            RectF::new(
+                target.left,
+                (target.bottom - h).max(4.0 * s),
+                target.right,
+                target.bottom,
+            )
+        }
+    }
+}
+
+/// Computes the initial side-budding submenu droplet anchored at `seam_x` with safe minimum width.
+fn sub_bud_start_rect(
+    target_sub: RectF,
+    row: RectF,
+    seam_x: f32,
+    open_left: bool,
+    s: f32,
+) -> RectF {
+    let min_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s)
+        .min(target_sub.width());
+    let start_w = (target_sub.width() * 0.20).max(min_w).min(target_sub.width());
+    let row_cy = ((row.top + row.bottom) * 0.5).clamp(
+        target_sub.top + 20.0 * s,
+        (target_sub.bottom - 20.0 * s).max(target_sub.top + 20.0 * s),
+    );
+    let min_h = (44.0 * s).min(target_sub.height());
+    let start_h = (target_sub.height() * 0.36).max(min_h).min(target_sub.height());
+    let top = (row_cy - start_h * 0.5)
+        .clamp(target_sub.top, (target_sub.bottom - start_h).max(target_sub.top));
+    let bottom = top + start_h;
+    if open_left {
+        RectF::new(seam_x - start_w, top, seam_x, bottom)
+    } else {
+        RectF::new(seam_x, top, seam_x + start_w, bottom)
+    }
+}
+
+/// Clamps spring-driven submenu edges into geometry-safe bounds anchored at `seam_x`.
+#[allow(clippy::too_many_arguments)]
+fn clamp_sub_spring_rect(
+    spring_top: f32,
+    spring_bottom: f32,
+    spring_width: f32,
+    target_sub: RectF,
+    seam_x: f32,
+    bottom_limit: f32,
+    win_w: f32,
+    open_left: bool,
+    s: f32,
+) -> RectF {
+    let min_safe_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s)
+        .min(target_sub.width().max(40.0 * s));
+    let max_avail_w = if open_left {
+        (seam_x - 5.0 * s).max(min_safe_w)
+    } else {
+        (win_w - 5.0 * s - seam_x).max(min_safe_w)
+    };
+    let w = spring_width.clamp(min_safe_w, max_avail_w);
+
+    let min_h = (44.0 * s).min(target_sub.height().max(44.0 * s));
+    let min_top = 4.0 * s;
+    let max_bot = bottom_limit.max(min_top + min_h);
+    let mut bot = spring_bottom.clamp(min_top + min_h, max_bot);
+    let mut top = spring_top.clamp(min_top, max_bot - min_h);
+    if bot - top < min_h {
+        top = (bot - min_h).max(min_top);
+        bot = (top + min_h).min(max_bot);
+    }
+
+    if open_left {
+        RectF::new(seam_x - w, top, seam_x, bot)
+    } else {
+        RectF::new(seam_x, top, seam_x + w, bot)
+    }
+}
+
+/// Computes the submenu's closing collapse rectangle anchored to `seam_x` and clamped above `bottom_limit`.
+fn animated_closing_sub_rect(
+    sub: RectF,
+    anim_primary: RectF,
+    seam_x: f32,
+    bottom_limit: f32,
+    open_left: bool,
+    close_progress: f32,
+    s: f32,
+) -> RectF {
+    let r = ease_retract(close_progress);
+    let min_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s).min(sub.width());
+    let cur_w = (sub.width() * (1.0 - 0.22 * r)).max(min_w);
+    let drop = 12.0 * s * r;
+    let max_bot = bottom_limit.min(anim_primary.bottom - 2.0 * s);
+    let cur_bot = (sub.bottom + drop).min(max_bot).max(44.0 * s);
+    let min_h = (42.0 * s).min(sub.height());
+    let cur_h = (sub.height() * (1.0 - 0.20 * r))
+        .max(min_h)
+        .min((cur_bot - 4.0 * s).max(min_h));
+    let cur_top = (cur_bot - cur_h).max(4.0 * s);
+    if open_left {
+        RectF::new(seam_x - cur_w, cur_top, seam_x, cur_bot)
+    } else {
+        RectF::new(seam_x, cur_top, seam_x + cur_w, cur_bot)
+    }
+}
+
+fn window_master_alpha(phase: PopupAnimPhase, open_elapsed: f32, close_progress: f32) -> f32 {
+    match phase {
+        PopupAnimPhase::Opening => {
+            (0.18 + 0.82 * ease_out_cubic((open_elapsed / 0.075).clamp(0.0, 1.0))).clamp(0.0, 1.0)
+        }
+        PopupAnimPhase::Open => 1.0,
+        PopupAnimPhase::Closing => (1.0 - close_progress.clamp(0.0, 1.0)).powf(1.35),
     }
 }
 
@@ -3716,28 +4452,21 @@ unsafe extern "system" fn popup_wnd_proc(
     match msg {
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                if state.dragging_slider.is_some() {
-                    let _ = ReleaseCapture();
-                }
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                state.reset_transient_state();
-                let _ = PostMessageW(state.main_hwnd, WM_APP_POPUP_CLOSED, WPARAM(0), LPARAM(0));
+                state.begin_close();
             }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_ESCAPE.0 {
-                if state.dragging_slider.is_some() {
-                    let _ = ReleaseCapture();
-                }
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                state.reset_transient_state();
-                let _ = PostMessageW(state.main_hwnd, WM_APP_POPUP_CLOSED, WPARAM(0), LPARAM(0));
+                state.begin_close();
             }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            if state.dragging_slider.take().is_some() && IsWindowVisible(hwnd).as_bool() {
+            if state.dragging_slider.take().is_some()
+                && IsWindowVisible(hwnd).as_bool()
+                && state.anim_phase != PopupAnimPhase::Closing
+            {
                 let _ = state.render();
             }
             LRESULT(0)
@@ -3745,17 +4474,24 @@ unsafe extern "system" fn popup_wnd_proc(
         WM_TIMER => {
             if wparam.0 == TIMER_POPUP_FLOW_ID && IsWindowVisible(hwnd).as_bool() {
                 let now = Instant::now();
-                let dt = now
-                    .duration_since(state.last_flow_tick)
-                    .as_secs_f32()
-                    .clamp(0.001, 0.1);
+                let raw_dt = now.duration_since(state.last_flow_tick).as_secs_f32();
                 state.last_flow_tick = now;
-                state.flow_phase += f64::from(dt);
+                let dt_flow = raw_dt.clamp(0.001, 0.1);
+                let dt_anim = raw_dt.clamp(0.001, 0.028);
+                state.flow_phase += f64::from(dt_flow);
+                if state.advance_animations(dt_anim) {
+                    state.finish_close();
+                    return LRESULT(0);
+                }
+                state.sync_timer_rate();
                 let _ = state.render();
             }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            if state.anim_phase == PopupAnimPhase::Closing {
+                return LRESULT(0);
+            }
             if !state.tracking_leave {
                 let mut tme = TRACKMOUSEEVENT {
                     cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
@@ -3782,22 +4518,23 @@ unsafe extern "system" fn popup_wnd_proc(
         }
         WM_MOUSELEAVE_MSG => {
             state.tracking_leave = false;
-            if state.dragging_slider.is_none() && state.hover_target != HoverTarget::None {
+            if state.anim_phase != PopupAnimPhase::Closing
+                && state.dragging_slider.is_none()
+                && state.hover_target != HoverTarget::None
+            {
                 state.hover_target = HoverTarget::None;
                 let _ = state.render();
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
+            if state.anim_phase == PopupAnimPhase::Closing {
+                return LRESULT(0);
+            }
             let x = ((lparam.0 & 0xFFFF) as i16) as f32;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
             if !state.point_inside_cards(x, y) {
-                if state.dragging_slider.is_some() {
-                    let _ = ReleaseCapture();
-                }
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                state.reset_transient_state();
-                let _ = PostMessageW(state.main_hwnd, WM_APP_POPUP_CLOSED, WPARAM(0), LPARAM(0));
+                state.begin_close();
                 return LRESULT(0);
             }
             let _ = state.update_hover_at(x, y);
@@ -3819,6 +4556,9 @@ unsafe extern "system" fn popup_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            if state.anim_phase == PopupAnimPhase::Closing {
+                return LRESULT(0);
+            }
             let x = ((lparam.0 & 0xFFFF) as i16) as f32;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
             if state.dragging_slider.take().is_some() {
@@ -3934,6 +4674,9 @@ unsafe extern "system" fn popup_wnd_proc(
             LRESULT(0)
         }
         WM_MOUSEWHEEL => {
+            if state.anim_phase == PopupAnimPhase::Closing {
+                return LRESULT(0);
+            }
             let wheel_delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             if wheel_delta == 0 {
                 return LRESULT(0);
@@ -3976,7 +4719,13 @@ unsafe extern "system" fn popup_wnd_proc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
-        WM_NCHITTEST => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_NCHITTEST => {
+            if state.anim_phase == PopupAnimPhase::Closing {
+                LRESULT(HTTRANSPARENT as isize)
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
@@ -4184,5 +4933,138 @@ mod tests {
         let (t4, b4) = compute_submenu_vertical_span(160.0, pad, 340.0, top_limit, bottom_limit);
         assert!((t4 - top_limit).abs() < 0.01);
         assert!((b4 - bottom_limit).abs() < 0.01);
+    }
+
+    #[test]
+    fn popup_anim_curves_and_morph_stay_bounded_and_safe() {
+        // 1. Easing curves & window alpha boundaries
+        assert!((ease_out_cubic(0.0) - 0.0).abs() < 1e-5);
+        assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-5);
+        assert!((ease_retract(0.0) - 0.0).abs() < 1e-5);
+        assert!((ease_retract(1.0) - 1.0).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.0, 0.0) - 0.18).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.075, 0.0) - 1.0).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Open, 1.0, 0.0) - 1.0).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Closing, 1.0, 1.0) - 0.0).abs() < 1e-5);
+
+        // 2. Open spring convergence, liquid surface-tension swell [1.02..=1.06], & frame-rate independence
+        let mut s_10ms = Spring1D::new(0.08, 1.6);
+        let mut s_25ms = Spring1D::new(0.08, 1.6);
+        let mut peak_pos = s_10ms.pos;
+        let mut max_dt_diff = 0.0f32;
+        for step in 1..=30 {
+            let _ = step;
+            for _ in 0..5 {
+                s_10ms.step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, 0.010);
+                peak_pos = peak_pos.max(s_10ms.pos);
+            }
+            for _ in 0..2 {
+                s_25ms.step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, 0.025);
+            }
+            max_dt_diff = max_dt_diff.max((s_10ms.pos - s_25ms.pos).abs());
+        }
+        assert!(
+            (1.02..=1.06).contains(&peak_pos),
+            "expected liquid spring crest in [1.02, 1.06], got {peak_pos}"
+        );
+        assert!(
+            max_dt_diff < 0.01,
+            "expected sub-stepped spring frame-rate invariance (<0.01), got {max_dt_diff}"
+        );
+        assert!(
+            s_10ms.is_settled(1.0, 0.002, 0.02),
+            "open spring failed to settle: {s_10ms:?}"
+        );
+
+        // 3. Staggered bottom-to-top row micro-glide & clean zeroing at rest
+        let dy_top = primary_row_stagger_dy(0, 0.04, 0.55, 1.0);
+        let dy_bot = primary_row_stagger_dy(4, 0.04, 0.55, 1.0);
+        assert!(dy_top > dy_bot, "top row should trail bottom row during rise");
+        let dy_rest = primary_row_stagger_dy(0, 0.25, 1.0, 1.0);
+        assert!(dy_rest.abs() < 1e-4, "row stagger did not settle to zero: {dy_rest}");
+
+        // 4. Primary envelope stays strictly anchored to MediaBar bottom/sides with safe top >= 4 DIP & min height
+        let target_primary = RectF::new(14.0, 14.0, 162.0, 220.0);
+        for step in 0..=20 {
+            let p = (step as f32) / 20.0;
+            let op = animated_primary_rect(
+                target_primary,
+                PopupAnimPhase::Opening,
+                0.08 + 0.98 * p,
+                0.0,
+                1.0,
+            );
+            assert!((op.left - target_primary.left).abs() < 1e-4);
+            assert!((op.right - target_primary.right).abs() < 1e-4);
+            assert!((op.bottom - target_primary.bottom).abs() < 1e-4);
+            assert!(op.top >= 4.0);
+            assert!(op.height() >= 42.0);
+
+            let cl = animated_primary_rect(target_primary, PopupAnimPhase::Closing, 1.0, p, 1.0);
+            assert!((cl.left - target_primary.left).abs() < 1e-4);
+            assert!((cl.right - target_primary.right).abs() < 1e-4);
+            assert!((cl.bottom - target_primary.bottom).abs() < 1e-4);
+            assert!(cl.height() >= 42.0);
+        }
+
+        // 5. Submenu spring continuity on rapid target retargeting, lateral budding & closing bounds
+        let mut morph_w = Spring1D::still(172.0);
+        for _ in 0..5 {
+            morph_w.step(280.0, SUB_WIDTH_STIFFNESS, SUB_WIDTH_DAMPING, 0.010);
+        }
+        let vel_before_retarget = morph_w.vel;
+        assert!(vel_before_retarget > 100.0);
+        morph_w.step(264.0, SUB_WIDTH_STIFFNESS, SUB_WIDTH_DAMPING, 0.010);
+        assert!(
+            morph_w.vel > 0.0,
+            "spring velocity should remain continuous across retargeting"
+        );
+
+        let sub = RectF::new(162.0, 106.0, 438.0, 316.0);
+        let row = RectF::new(22.0, 122.0, 154.0, 156.0);
+        for open_left in [false, true] {
+            let seam_x = if open_left { 300.0 } else { 162.0 };
+            let target_s = if open_left {
+                RectF::new(24.0, 106.0, 300.0, 316.0)
+            } else {
+                sub
+            };
+            let bud = sub_bud_start_rect(target_s, row, seam_x, open_left, 1.0);
+            assert!(bud.width() >= 40.0, "bud width too narrow: {}", bud.width());
+            assert!(bud.height() >= 44.0);
+            if open_left {
+                assert!((bud.right - seam_x).abs() < 1e-4);
+            } else {
+                assert!((bud.left - seam_x).abs() < 1e-4);
+            }
+
+            let clamped = clamp_sub_spring_rect(
+                -10.0,
+                400.0,
+                295.0,
+                target_s,
+                seam_x,
+                316.0,
+                460.0,
+                open_left,
+                1.0,
+            );
+            assert!(clamped.width() >= 40.0);
+            assert!(clamped.top >= 4.0);
+            assert!(clamped.bottom <= 316.0);
+
+            let close_sub = animated_closing_sub_rect(
+                target_s,
+                RectF::new(162.0, 190.0, 310.0, 320.0),
+                seam_x,
+                316.0,
+                open_left,
+                0.7,
+                1.0,
+            );
+            assert!(close_sub.width() >= 40.0);
+            assert!(close_sub.height() >= 42.0);
+            assert!(close_sub.bottom <= 316.0);
+        }
     }
 }

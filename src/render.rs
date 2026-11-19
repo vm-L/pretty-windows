@@ -134,6 +134,10 @@ impl LayeredSurface {
     }
 
     pub fn commit(&self, hwnd: HWND, x: i32, y: i32) {
+        self.commit_with_alpha(hwnd, x, y, 255);
+    }
+
+    pub fn commit_with_alpha(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) {
         if self.bitmap.is_invalid() {
             return;
         }
@@ -147,7 +151,7 @@ impl LayeredSurface {
             let blend = BLENDFUNCTION {
                 BlendOp: AC_SRC_OVER as u8,
                 BlendFlags: 0,
-                SourceConstantAlpha: 255,
+                SourceConstantAlpha: alpha,
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
             let _ = UpdateLayeredWindow(
