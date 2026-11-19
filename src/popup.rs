@@ -80,13 +80,13 @@ const POPUP_ANIM_INTERVAL_MS: u32 = 10;
 const POPUP_FLOW_INTERVAL_MS: u32 = 33;
 const SILK_UPDATE_INTERVAL_MS: u64 = 32;
 const VOL_RELOAD_FRESH_MS: u64 = 2500;
-const CLOSE_ANIM_DUR_S: f32 = 0.130;
-const OPEN_SPRING_STIFFNESS: f32 = 440.0;
-const OPEN_SPRING_DAMPING: f32 = 30.5;
-const SUB_WIDTH_STIFFNESS: f32 = 500.0;
-const SUB_WIDTH_DAMPING: f32 = 32.0;
-const SUB_VERT_STIFFNESS: f32 = 460.0;
-const SUB_VERT_DAMPING: f32 = 31.5;
+const CLOSE_ANIM_DUR_S: f32 = 0.095;
+const OPEN_SPRING_STIFFNESS: f32 = 780.0;
+const OPEN_SPRING_DAMPING: f32 = 41.5;
+const SUB_WIDTH_STIFFNESS: f32 = 920.0;
+const SUB_WIDTH_DAMPING: f32 = 46.0;
+const SUB_VERT_STIFFNESS: f32 = 860.0;
+const SUB_VERT_DAMPING: f32 = 44.5;
 const SILK_W: u32 = 64;
 const SILK_H: u32 = 48;
 
@@ -191,7 +191,7 @@ impl Spring1D {
     }
 
     fn step(&mut self, target: f32, stiffness: f32, damping: f32, dt: f32) {
-        const SUB_DT: f32 = 0.004;
+        const SUB_DT: f32 = 0.003;
         let mut rem = dt.clamp(0.0, 0.1);
         while rem > 0.0 {
             let h = rem.min(SUB_DT);
@@ -616,7 +616,7 @@ impl SourcePopup {
         self.inner.last_silk_tick = None;
         self.inner.last_color_tick = Instant::now();
         self.inner.anim_phase = PopupAnimPhase::Opening;
-        self.inner.open_spring = Spring1D::new(0.08, 1.6);
+        self.inner.open_spring = Spring1D::new(0.14, 2.8);
         self.inner.open_elapsed = 0.0;
         self.inner.close_progress = 0.0;
         self.inner.close_started_at = None;
@@ -739,8 +739,8 @@ impl PopupInner {
                 self.open_elapsed += dt;
                 self.open_spring
                     .step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, dt);
-                if (self.open_spring.is_settled(1.0, 0.0015, 0.015) && self.open_elapsed >= 0.22)
-                    || self.open_elapsed >= 0.55
+                if (self.open_spring.is_settled(1.0, 0.0015, 0.015) && self.open_elapsed >= 0.145)
+                    || self.open_elapsed >= 0.38
                 {
                     self.open_spring = Spring1D::still(1.0);
                     self.anim_phase = PopupAnimPhase::Open;
@@ -772,7 +772,7 @@ impl PopupInner {
                     let converged = sa.top.is_settled(target.top, pos_eps, vel_eps)
                         && sa.bottom.is_settled(target.bottom, pos_eps, vel_eps)
                         && sa.width.is_settled(target.width(), pos_eps, vel_eps);
-                    if (converged && sa.fade_elapsed >= 0.155) || sa.fade_elapsed >= 0.55 {
+                    if (converged && sa.fade_elapsed >= 0.095) || sa.fade_elapsed >= 0.38 {
                         self.sub_anim = None;
                     }
                 }
@@ -1295,13 +1295,13 @@ impl PopupInner {
                                 Some(SubSpringState {
                                     top: Spring1D::new(
                                         bud.top,
-                                        (target_sub.top - bud.top) * 1.2,
+                                        (target_sub.top - bud.top) * 2.2,
                                     ),
                                     bottom: Spring1D::new(
                                         bud.bottom,
-                                        (target_sub.bottom - bud.bottom) * 1.2,
+                                        (target_sub.bottom - bud.bottom) * 2.2,
                                     ),
-                                    width: Spring1D::new(bud.width(), target_sub.width() * 1.6),
+                                    width: Spring1D::new(bud.width(), target_sub.width() * 2.6),
                                     fade_elapsed: 0.0,
                                     prev_category: None,
                                     is_budding: true,
@@ -1641,7 +1641,7 @@ impl PopupInner {
 
         let (primary_alpha, close_dy) = match self.anim_phase {
             PopupAnimPhase::Opening => {
-                let a = ease_out_cubic(((self.open_elapsed - 0.015) / 0.125).clamp(0.0, 1.0));
+                let a = ease_out_cubic(((self.open_elapsed - 0.008) / 0.080).clamp(0.0, 1.0));
                 (a, 0.0)
             }
             PopupAnimPhase::Open => (1.0, 0.0),
@@ -1744,17 +1744,17 @@ impl PopupInner {
                     let (fade_in, dx_cur, dy_cur) = match self.sub_anim {
                         Some(sa) if sa.is_budding => {
                             let a =
-                                ease_out_cubic(((sa.fade_elapsed - 0.015) / 0.125).clamp(0.0, 1.0));
-                            let slide_t = ease_out_cubic((sa.fade_elapsed / 0.165).clamp(0.0, 1.0));
+                                ease_out_cubic(((sa.fade_elapsed - 0.008) / 0.078).clamp(0.0, 1.0));
+                            let slide_t = ease_out_cubic((sa.fade_elapsed / 0.105).clamp(0.0, 1.0));
                             let dir = if self.open_left { 1.0 } else { -1.0 };
-                            let dx = dir * 12.0 * s * (1.0 - slide_t);
-                            let dy = (anim_sub.top - target_sub.top) * 0.35;
+                            let dx = dir * 10.0 * s * (1.0 - slide_t);
+                            let dy = (anim_sub.top - target_sub.top) * 0.25;
                             (a, dx, dy)
                         }
                         Some(sa) => {
                             let a =
-                                ease_out_cubic(((sa.fade_elapsed - 0.018) / 0.120).clamp(0.0, 1.0));
-                            let dy = (anim_sub.top - target_sub.top) * 0.30;
+                                ease_out_cubic(((sa.fade_elapsed - 0.010) / 0.070).clamp(0.0, 1.0));
+                            let dy = (anim_sub.top - target_sub.top) * 0.22;
                             (a, 0.0, dy)
                         }
                         None => (1.0, 0.0, (anim_sub.top - target_sub.top) * 0.45),
@@ -1860,9 +1860,9 @@ impl PopupInner {
 
                     if let Some(sa) = self.sub_anim {
                         if let Some(prev_cat) = sa.prev_category {
-                            if sa.fade_elapsed < 0.080 {
+                            if sa.fade_elapsed < 0.048 {
                                 let fade_out =
-                                    (1.0 - ease_out_cubic((sa.fade_elapsed / 0.080).clamp(0.0, 1.0)))
+                                    (1.0 - ease_out_cubic((sa.fade_elapsed / 0.048).clamp(0.0, 1.0)))
                                         * close_factor;
                                 if fade_out > 0.005 {
                                     let prev_target = self.sub_card_rect(prev_cat);
@@ -4048,19 +4048,19 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - u * u * u
 }
 
-/// Smooth ease-in-quad retract curve (`t^2 * (1.6 - 0.6*t)`) in `[0, 1]` for brisk collapse into the taskbar.
+/// Smooth responsive retract curve (`t * (0.45 + 0.55*t)`) in `[0, 1]` with immediate response and brisk collapse.
 fn ease_retract(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
-    t * t * (1.6 - 0.6 * t)
+    t * (0.45 + 0.55 * t)
 }
 
 /// Staggered bottom-to-top vertical micro-glide offset (`idx = 4` bottom row settles first, `0` top last).
 fn primary_row_stagger_dy(idx: usize, open_elapsed: f32, open_pos: f32, s: f32) -> f32 {
     let order = 4usize.saturating_sub(idx) as f32;
-    let delay = order * 0.011;
-    let row_t = ((open_elapsed - delay) / 0.165).clamp(0.0, 1.0);
-    let settle_glide = (1.0 - ease_out_cubic(row_t)) * (7.0 + order * 1.4) * s;
-    let crest_breath = (1.0 - open_pos) * 0.35 * 14.0 * s;
+    let delay = order * 0.007;
+    let row_t = ((open_elapsed - delay) / 0.105).clamp(0.0, 1.0);
+    let settle_glide = (1.0 - ease_out_cubic(row_t)) * (5.5 + order * 1.1) * s;
+    let crest_breath = (1.0 - open_pos) * 0.28 * 14.0 * s;
     settle_glide + crest_breath
 }
 
@@ -4108,13 +4108,13 @@ fn sub_bud_start_rect(
 ) -> RectF {
     let min_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s)
         .min(target_sub.width());
-    let start_w = (target_sub.width() * 0.20).max(min_w).min(target_sub.width());
+    let start_w = (target_sub.width() * 0.26).max(min_w).min(target_sub.width());
     let row_cy = ((row.top + row.bottom) * 0.5).clamp(
         target_sub.top + 20.0 * s,
         (target_sub.bottom - 20.0 * s).max(target_sub.top + 20.0 * s),
     );
     let min_h = (44.0 * s).min(target_sub.height());
-    let start_h = (target_sub.height() * 0.36).max(min_h).min(target_sub.height());
+    let start_h = (target_sub.height() * 0.42).max(min_h).min(target_sub.height());
     let top = (row_cy - start_h * 0.5)
         .clamp(target_sub.top, (target_sub.bottom - start_h).max(target_sub.top));
     let bottom = top + start_h;
@@ -4195,10 +4195,10 @@ fn animated_closing_sub_rect(
 fn window_master_alpha(phase: PopupAnimPhase, open_elapsed: f32, close_progress: f32) -> f32 {
     match phase {
         PopupAnimPhase::Opening => {
-            (0.18 + 0.82 * ease_out_cubic((open_elapsed / 0.075).clamp(0.0, 1.0))).clamp(0.0, 1.0)
+            (0.24 + 0.76 * ease_out_cubic((open_elapsed / 0.050).clamp(0.0, 1.0))).clamp(0.0, 1.0)
         }
         PopupAnimPhase::Open => 1.0,
-        PopupAnimPhase::Closing => (1.0 - close_progress.clamp(0.0, 1.0)).powf(1.35),
+        PopupAnimPhase::Closing => (1.0 - close_progress.clamp(0.0, 1.0)).powf(1.25),
     }
 }
 
@@ -4942,18 +4942,17 @@ mod tests {
         assert!((ease_out_cubic(1.0) - 1.0).abs() < 1e-5);
         assert!((ease_retract(0.0) - 0.0).abs() < 1e-5);
         assert!((ease_retract(1.0) - 1.0).abs() < 1e-5);
-        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.0, 0.0) - 0.18).abs() < 1e-5);
-        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.075, 0.0) - 1.0).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.0, 0.0) - 0.24).abs() < 1e-5);
+        assert!((window_master_alpha(PopupAnimPhase::Opening, 0.050, 0.0) - 1.0).abs() < 1e-5);
         assert!((window_master_alpha(PopupAnimPhase::Open, 1.0, 0.0) - 1.0).abs() < 1e-5);
         assert!((window_master_alpha(PopupAnimPhase::Closing, 1.0, 1.0) - 0.0).abs() < 1e-5);
 
         // 2. Open spring convergence, liquid surface-tension swell [1.02..=1.06], & frame-rate independence
-        let mut s_10ms = Spring1D::new(0.08, 1.6);
-        let mut s_25ms = Spring1D::new(0.08, 1.6);
+        let mut s_10ms = Spring1D::new(0.14, 2.8);
+        let mut s_25ms = Spring1D::new(0.14, 2.8);
         let mut peak_pos = s_10ms.pos;
         let mut max_dt_diff = 0.0f32;
-        for step in 1..=30 {
-            let _ = step;
+        for _step in 1..=5 {
             for _ in 0..5 {
                 s_10ms.step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, 0.010);
                 peak_pos = peak_pos.max(s_10ms.pos);
@@ -4972,15 +4971,22 @@ mod tests {
             "expected sub-stepped spring frame-rate invariance (<0.01), got {max_dt_diff}"
         );
         assert!(
-            s_10ms.is_settled(1.0, 0.002, 0.02),
-            "open spring failed to settle: {s_10ms:?}"
+            s_10ms.is_settled(1.0, 0.008, 0.20),
+            "open spring failed to approach settle within 250ms: {s_10ms:?}"
+        );
+        for _ in 0..15 {
+            s_10ms.step(1.0, OPEN_SPRING_STIFFNESS, OPEN_SPRING_DAMPING, 0.010);
+        }
+        assert!(
+            s_10ms.is_settled(1.0, 0.0015, 0.015),
+            "open spring failed full settle by 400ms: {s_10ms:?}"
         );
 
         // 3. Staggered bottom-to-top row micro-glide & clean zeroing at rest
-        let dy_top = primary_row_stagger_dy(0, 0.04, 0.55, 1.0);
-        let dy_bot = primary_row_stagger_dy(4, 0.04, 0.55, 1.0);
+        let dy_top = primary_row_stagger_dy(0, 0.025, 0.65, 1.0);
+        let dy_bot = primary_row_stagger_dy(4, 0.025, 0.65, 1.0);
         assert!(dy_top > dy_bot, "top row should trail bottom row during rise");
-        let dy_rest = primary_row_stagger_dy(0, 0.25, 1.0, 1.0);
+        let dy_rest = primary_row_stagger_dy(0, 0.16, 1.0, 1.0);
         assert!(dy_rest.abs() < 1e-4, "row stagger did not settle to zero: {dy_rest}");
 
         // 4. Primary envelope stays strictly anchored to MediaBar bottom/sides with safe top >= 4 DIP & min height
