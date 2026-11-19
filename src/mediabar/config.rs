@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 /// Persistent configuration stored next to the executable (`MediaBar.toml`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
+    /// Whether the MediaBar taskbar widget is currently enabled and shown.
+    pub enabled: bool,
     /// Whether the taskbar bar position is locked against accidental dragging.
     pub locked: bool,
     /// Horizontal offset in physical pixels relative to the default tray-left anchor.
@@ -14,6 +16,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            enabled: true,
             locked: true,
             offset_x: 0,
         }
@@ -35,6 +38,11 @@ impl Config {
             let key = key.trim();
             let value = value.trim();
             match key {
+                "enabled" => {
+                    if let Ok(parsed) = value.parse::<bool>() {
+                        cfg.enabled = parsed;
+                    }
+                }
                 "locked" => {
                     if let Ok(parsed) = value.parse::<bool>() {
                         cfg.locked = parsed;
@@ -54,8 +62,8 @@ impl Config {
     /// Serializes configuration to human-readable TOML.
     pub fn serialize(&self) -> String {
         format!(
-            "# MediaBar 配置文件\nlocked = {}\noffset_x = {}\n",
-            self.locked, self.offset_x
+            "# MediaBar 配置文件\nenabled = {}\nlocked = {}\noffset_x = {}\n",
+            self.enabled, self.locked, self.offset_x
         )
     }
 
@@ -68,6 +76,7 @@ impl Config {
     }
 
     /// Saves configuration to disk next to the executable.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
         fs::write(path, self.serialize())
     }
@@ -91,6 +100,7 @@ mod tests {
     #[test]
     fn defaults_and_roundtrip() {
         let cfg = Config {
+            enabled: false,
             locked: false,
             offset_x: -148,
         };
@@ -100,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_ignores_comments_and_invalid_values() {
+    fn parse_ignores_comments_invalid_values_and_defaults_missing_enabled() {
         let raw = r#"
             # comment line
             locked = invalid_bool
@@ -108,6 +118,7 @@ mod tests {
             offset_x = -24 # inline comment
         "#;
         let parsed = Config::parse(raw);
+        assert!(parsed.enabled);
         assert!(parsed.locked);
         assert_eq!(parsed.offset_x, -24);
     }

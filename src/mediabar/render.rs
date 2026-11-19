@@ -1,241 +1,42 @@
+use super::dsp::NUM_BARS;
+use super::layout::{BarLayout, HitZone, RectF};
+use super::marquee::MarqueeState;
+use super::smtc::MediaCover;
+use super::volume::format_volume_pct;
 use crate::color::Rgb;
-use crate::dsp::NUM_BARS;
-use crate::layout::{BarLayout, HitZone, RectF};
-use crate::marquee::MarqueeState;
-use crate::smtc::MediaCover;
-use crate::volume::format_volume_pct;
-use std::mem::{size_of, ManuallyDrop};
-use std::ptr::null_mut;
+use crate::ui::glass::{
+    create_round_cap_stroke, d2d_color_rgb, d2d_rect, identity_matrix, LayeredSurface,
+};
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use windows::core::{w, Interface};
-use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::{BOOL, HWND, POINT, RECT, SIZE};
+use windows::Win32::Foundation::{BOOL, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
     D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry,
-    ID2D1Layer, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE,
-    D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
+    ID2D1Bitmap, ID2D1Brush, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry, ID2D1Layer,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ARC_SEGMENT,
+    D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
+    D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES1, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_SWEEP_DIRECTION_CLOCKWISE,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FONT_STRETCH_NORMAL,
+    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ,
-};
+use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, LoadCursorW, UpdateLayeredWindow, HCURSOR, ICONINFO, IDC_HAND, ULW_ALPHA,
+    CreateIconIndirect, LoadCursorW, HCURSOR, ICONINFO, IDC_HAND,
 };
-
-/// Offscreen 32-bit premultiplied BGRA DIB surface that commits transparently via `UpdateLayeredWindow`.
-pub struct LayeredSurface {
-    mem_dc: HDC,
-    bitmap: HBITMAP,
-    old_obj: HGDIOBJ,
-    bits: *mut u8,
-    width: i32,
-    height: i32,
-}
-
-impl LayeredSurface {
-    pub fn new() -> windows::core::Result<Self> {
-        unsafe {
-            let screen_dc = GetDC(None);
-            let mem_dc = CreateCompatibleDC(screen_dc);
-            let _ = ReleaseDC(None, screen_dc);
-            if mem_dc.is_invalid() {
-                return Err(windows::core::Error::from_win32());
-            }
-            Ok(Self {
-                mem_dc,
-                bitmap: HBITMAP::default(),
-                old_obj: HGDIOBJ::default(),
-                bits: null_mut(),
-                width: 0,
-                height: 0,
-            })
-        }
-    }
-
-    pub fn ensure_size(&mut self, width: i32, height: i32) -> windows::core::Result<()> {
-        let w = width.max(1);
-        let h = height.max(1);
-        if self.width == w && self.height == h && !self.bitmap.is_invalid() {
-            return Ok(());
-        }
-
-        self.release_bitmap();
-
-        unsafe {
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: w,
-                    biHeight: -h, // top-down
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits = null_mut();
-            let bmp = CreateDIBSection(self.mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0)?;
-            let old = SelectObject(self.mem_dc, bmp);
-            self.bitmap = bmp;
-            self.old_obj = old;
-            self.bits = bits.cast::<u8>();
-            self.width = w;
-            self.height = h;
-        }
-        Ok(())
-    }
-
-    pub fn dc(&self) -> HDC {
-        self.mem_dc
-    }
-
-    pub fn width(&self) -> i32 {
-        self.width
-    }
-
-    pub fn height(&self) -> i32 {
-        self.height
-    }
-
-    pub fn bitmap_handle(&self) -> HBITMAP {
-        self.bitmap
-    }
-
-    #[allow(dead_code)]
-    pub unsafe fn pixels_mut(&mut self) -> Option<&mut [u8]> {
-        if self.bits.is_null() || self.width <= 0 || self.height <= 0 {
-            None
-        } else {
-            let len = (self.width as usize) * (self.height as usize) * 4;
-            Some(std::slice::from_raw_parts_mut(self.bits, len))
-        }
-    }
-
-    pub fn commit(&self, hwnd: HWND, x: i32, y: i32) {
-        self.commit_with_alpha(hwnd, x, y, 255);
-    }
-
-    pub fn commit_with_alpha(&self, hwnd: HWND, x: i32, y: i32, alpha: u8) {
-        if self.bitmap.is_invalid() {
-            return;
-        }
-        unsafe {
-            let pt_dst = POINT { x, y };
-            let size = SIZE {
-                cx: self.width,
-                cy: self.height,
-            };
-            let pt_src = POINT { x: 0, y: 0 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                BlendFlags: 0,
-                SourceConstantAlpha: alpha,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-            };
-            let _ = UpdateLayeredWindow(
-                hwnd,
-                None,
-                Some(&pt_dst),
-                Some(&size),
-                self.mem_dc,
-                Some(&pt_src),
-                windows::Win32::Foundation::COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-        }
-    }
-
-    fn release_bitmap(&mut self) {
-        unsafe {
-            if !self.old_obj.is_invalid() {
-                let _ = SelectObject(self.mem_dc, self.old_obj);
-                self.old_obj = HGDIOBJ::default();
-            }
-            if !self.bitmap.is_invalid() {
-                let _ = DeleteObject(self.bitmap);
-                self.bitmap = HBITMAP::default();
-            }
-            self.bits = null_mut();
-        }
-    }
-}
-
-impl Drop for LayeredSurface {
-    fn drop(&mut self) {
-        self.release_bitmap();
-        unsafe {
-            if !self.mem_dc.is_invalid() {
-                let _ = DeleteDC(self.mem_dc);
-            }
-        }
-    }
-}
-
-/// Helper converting `RectF` into Direct2D `D2D_RECT_F`.
-#[inline]
-pub fn d2d_rect(r: RectF) -> D2D_RECT_F {
-    D2D_RECT_F {
-        left: r.left,
-        top: r.top,
-        right: r.right,
-        bottom: r.bottom,
-    }
-}
-
-#[inline]
-pub fn d2d_color_rgb(rgb: Rgb, a: f32) -> D2D1_COLOR_F {
-    D2D1_COLOR_F {
-        r: f32::from(rgb.r) / 255.0,
-        g: f32::from(rgb.g) / 255.0,
-        b: f32::from(rgb.b) / 255.0,
-        a: a.clamp(0.0, 1.0),
-    }
-}
-
-#[inline]
-pub fn identity_matrix() -> Matrix3x2 {
-    Matrix3x2 {
-        M11: 1.0,
-        M12: 0.0,
-        M21: 0.0,
-        M22: 1.0,
-        M31: 0.0,
-        M32: 0.0,
-    }
-}
-
-pub fn create_round_cap_stroke(factory: &ID2D1Factory1) -> Option<ID2D1StrokeStyle> {
-    let props = D2D1_STROKE_STYLE_PROPERTIES1 {
-        startCap: D2D1_CAP_STYLE_ROUND,
-        endCap: D2D1_CAP_STYLE_ROUND,
-        dashCap: D2D1_CAP_STYLE_ROUND,
-        ..Default::default()
-    };
-    unsafe { factory.CreateStrokeStyle(&props, None).ok().map(Into::into) }
-}
 
 /// Draws a dynamic Win11-style vector speaker icon showing mute `×`, 1 wave, or 2 waves based on volume.
 #[allow(clippy::too_many_arguments)]
@@ -586,12 +387,11 @@ pub struct BarRenderer {
 }
 
 impl BarRenderer {
-    pub fn new() -> windows::core::Result<Self> {
+    pub fn new_with_factories(
+        d2d_factory: ID2D1Factory1,
+        dwrite_factory: IDWriteFactory,
+    ) -> windows::core::Result<Self> {
         unsafe {
-            let d2d_factory: ID2D1Factory1 =
-                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite_factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-
             let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: D2D1_PIXEL_FORMAT {

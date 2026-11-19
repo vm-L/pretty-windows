@@ -1,44 +1,51 @@
-use crate::arbitration::{PlaybackState, SessionArbitrator, SessionSummary};
-use crate::audio::{start_audio_worker, AudioHandle};
-use crate::color::{adjust_accent_for_theme, Rgb};
-use crate::config::{portable_config_path, Config};
-use crate::dsp::NUM_BARS;
-use crate::layout::{hit_test_mode, BarLayout, HitZone, BAR_WIDTH_DIP};
-use crate::marquee::MarqueeState;
-use crate::popup::{
-    SourcePopup, SETTING_EXIT, SETTING_RESET_POS, SETTING_TOGGLE_LOCK, WM_APP_AUDIO_OUTPUT_CHANGED,
+use super::arbitration::{PlaybackState, SessionArbitrator, SessionSummary};
+use super::audio::{start_audio_worker, AudioHandle};
+use super::config::{portable_config_path, Config};
+use super::dsp::NUM_BARS;
+use super::layout::{hit_test_mode, BarLayout, HitZone, BAR_WIDTH_DIP};
+use super::marquee::MarqueeState;
+use super::popup::{
+    SourcePopup, SETTING_CLOSE, SETTING_RESET_POS, SETTING_TOGGLE_LOCK, WM_APP_AUDIO_OUTPUT_CHANGED,
     WM_APP_POPUP_CLOSED, WM_APP_SETTING_ACTION, WM_APP_SOURCE_SELECTED,
 };
-use crate::process_util::activate_player_window;
-use crate::render::{BarRenderer, RenderFrame};
-use crate::smtc::{start_smtc_worker, SmtcCommand, SmtcHandle, SmtcSnapshot, WM_APP_SMTC_UPDATED};
-use crate::taskbar::{
-    compute_bar_rect, ensure_above_taskbar, is_autostart_enabled, is_fullscreen_active,
-    is_light_taskbar, query_taskbar_state, system_accent_color, TaskbarState,
+use super::process_util::activate_player_window;
+use super::render::{BarRenderer, RenderFrame};
+use super::smtc::{
+    start_smtc_worker, MediaCover, SmtcCommand, SmtcHandle, SmtcSnapshot, SourceItem,
+    WM_APP_SMTC_UPDATED,
 };
-use crate::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
+use super::taskbar::{
+    compute_bar_rect, ensure_above_taskbar, is_fullscreen_active, query_taskbar_state,
+    TaskbarState,
+};
+use super::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
+use crate::color::{adjust_accent_for_theme, Rgb};
+use crate::system::{exclude_from_peek, is_light_taskbar, system_accent_color};
+use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
 use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Direct2D::ID2D1Factory1;
+use windows::Win32::Graphics::DirectWrite::IDWriteFactory;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     VK_CONTROL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, PostQuitMessage,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos,
+    GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageW, SetCursor, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA, HCURSOR, HICON, HTCLIENT,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SW_HIDE, SW_SHOW,
-    WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HICON, HTCLIENT, HWND_TOPMOST, IDC_ARROW,
+    MA_NOACTIVATE, SC_MINIMIZE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
+    WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
     WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -51,8 +58,12 @@ const GUARD_INTERVAL_MS: u32 = 150;
 const ANIM_INTERVAL_MS: u32 = 16;
 const VOL_HUD_TIMEOUT: Duration = Duration::from_millis(1500);
 
+static REGISTER_MAIN_CLASS: Once = Once::new();
+
 struct AppState {
     hwnd: HWND,
+    host_hwnd: HWND,
+    close_request_msg: u32,
     taskbar_created_msg: u32,
     config_path: PathBuf,
     config: Config,
@@ -117,13 +128,21 @@ impl Drop for AppState {
 }
 
 impl AppState {
-    fn new(hwnd: HWND, taskbar_created_msg: u32) -> windows::core::Result<Self> {
+    fn new(
+        hwnd: HWND,
+        host_hwnd: HWND,
+        close_request_msg: u32,
+        taskbar_created_msg: u32,
+        d2d_factory: ID2D1Factory1,
+        dwrite_factory: IDWriteFactory,
+    ) -> windows::core::Result<Self> {
         let config_path = portable_config_path();
-        let config = Config::load_from_path(&config_path);
+        let mut config = Config::load_from_path(&config_path);
+        config.enabled = true;
         let light_taskbar = is_light_taskbar();
         let fallback_accent = system_accent_color();
 
-        let renderer = BarRenderer::new()?;
+        let renderer = BarRenderer::new_with_factories(d2d_factory, dwrite_factory)?;
         let popup = SourcePopup::new(
             hwnd,
             renderer.d2d_factory.clone(),
@@ -139,6 +158,8 @@ impl AppState {
 
         let mut app = Self {
             hwnd,
+            host_hwnd,
+            close_request_msg,
             taskbar_created_msg,
             config_path,
             config,
@@ -190,7 +211,7 @@ impl AppState {
         Ok(app)
     }
 
-    fn active_source(&self) -> Option<&crate::smtc::SourceItem> {
+    fn active_source(&self) -> Option<&SourceItem> {
         self.active_id
             .as_ref()
             .and_then(|id| self.snapshot.sources.iter().find(|s| &s.id == id))
@@ -262,16 +283,27 @@ impl AppState {
     }
 
     fn set_bar_visible(&mut self, show: bool) {
-        if self.visible == show {
-            return;
-        }
-        self.visible = show;
-        unsafe {
-            let _ = ShowWindow(self.hwnd, if show { SW_SHOW } else { SW_HIDE });
-        }
         if show {
+            let os_hidden = unsafe {
+                !IsWindowVisible(self.hwnd).as_bool() || IsIconic(self.hwnd).as_bool()
+            };
+            if self.visible && !os_hidden {
+                return;
+            }
+            self.visible = true;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
             self.dirty = true;
             self.render_now();
+        } else {
+            if !self.visible {
+                return;
+            }
+            self.visible = false;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
         }
     }
 
@@ -350,7 +382,7 @@ impl AppState {
         bool,
         String,
         String,
-        Option<Arc<crate::smtc::MediaCover>>,
+        Option<Arc<MediaCover>>,
         Rgb,
     ) {
         if let Some(src) = self.active_source() {
@@ -668,7 +700,7 @@ impl AppState {
             return;
         }
         if let Some(closed_at) = self.popup_closed_at.take() {
-            if closed_at.elapsed() < Duration::from_millis(240) {
+            if closed_at.elapsed() < Duration::from_millis(POPUP_REOPEN_DEBOUNCE_MS) {
                 return;
             }
         }
@@ -692,7 +724,6 @@ impl AppState {
             self.arbitrator.mode().clone(),
             self.active_id.clone(),
             self.config.locked,
-            is_autostart_enabled(),
             pill_overlap_px,
         );
         self.dirty = true;
@@ -705,50 +736,91 @@ impl AppState {
     }
 }
 
-pub fn run() -> windows::core::Result<()> {
-    unsafe {
-        let hinst = GetModuleHandleW(None)?;
-        let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+/// Live hosted instance of the MediaBar taskbar controller.
+pub struct MediaBarInstance {
+    hwnd: HWND,
+}
 
-        let arrow_cursor = LoadCursorW(None, IDC_ARROW)?;
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(main_wnd_proc),
-            hInstance: hinst.into(),
-            hCursor: arrow_cursor,
-            lpszClassName: MAIN_CLASS_NAME,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
+impl MediaBarInstance {
+    /// Creates and launches a MediaBar instance hosted by `host_hwnd` (does not own a message loop).
+    pub fn start(
+        host_hwnd: HWND,
+        close_request_msg: u32,
+        d2d_factory: ID2D1Factory1,
+        dwrite_factory: IDWriteFactory,
+    ) -> windows::core::Result<Self> {
+        unsafe {
+            let hinst = GetModuleHandleW(None)?;
+            let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
 
-        let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
-            MAIN_CLASS_NAME,
-            w!("MediaBar"),
-            WS_POPUP,
-            0,
-            0,
-            BAR_WIDTH_DIP as i32,
-            48,
-            None,
-            None,
-            hinst,
-            None,
-        )?;
+            let arrow_cursor = LoadCursorW(None, IDC_ARROW)?;
+            REGISTER_MAIN_CLASS.call_once(|| {
+                let wc = WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(main_wnd_proc),
+                    hInstance: hinst.into(),
+                    hCursor: arrow_cursor,
+                    lpszClassName: MAIN_CLASS_NAME,
+                    ..Default::default()
+                };
+                RegisterClassExW(&wc);
+            });
 
-        let app = Rc::new(RefCell::new(AppState::new(hwnd, taskbar_created_msg)?));
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(app) as isize);
+            let hwnd = CreateWindowExW(
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                MAIN_CLASS_NAME,
+                w!("MediaBar"),
+                WS_POPUP,
+                0,
+                0,
+                BAR_WIDTH_DIP as i32,
+                48,
+                None,
+                None,
+                hinst,
+                None,
+            )?;
+            exclude_from_peek(hwnd);
 
-        SetTimer(hwnd, TIMER_GUARD_ID, GUARD_INTERVAL_MS, None);
-        let _ = PostMessageW(hwnd, WM_APP_SMTC_UPDATED, WPARAM(0), LPARAM(0));
+            let app = Rc::new(RefCell::new(AppState::new(
+                hwnd,
+                host_hwnd,
+                close_request_msg,
+                taskbar_created_msg,
+                d2d_factory,
+                dwrite_factory,
+            )?));
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(app) as isize);
+            crate::system::register_taskbar_overlay(hwnd);
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            SetTimer(hwnd, TIMER_GUARD_ID, GUARD_INTERVAL_MS, None);
+            let _ = PostMessageW(hwnd, WM_APP_SMTC_UPDATED, WPARAM(0), LPARAM(0));
+
+            Ok(Self { hwnd })
         }
     }
-    Ok(())
+
+    /// Stops and destroys the MediaBar window and its worker threads.
+    pub fn stop(&mut self) {
+        if !self.hwnd.is_invalid() && unsafe { IsWindow(self.hwnd).as_bool() } {
+            unsafe {
+                let _ = DestroyWindow(self.hwnd);
+            }
+        }
+        self.hwnd = HWND::default();
+    }
+
+    /// Returns `true` if the MediaBar window is currently alive.
+    #[allow(dead_code)]
+    pub fn is_running(&self) -> bool {
+        !self.hwnd.is_invalid() && unsafe { IsWindow(self.hwnd).as_bool() }
+    }
+}
+
+impl Drop for MediaBarInstance {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 unsafe extern "system" fn main_wnd_proc(
@@ -763,6 +835,7 @@ unsafe extern "system" fn main_wnd_proc(
     }
 
     if msg == WM_DESTROY {
+        crate::system::unregister_taskbar_overlay(hwnd);
         let rc = Rc::from_raw(raw_ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let _ = KillTimer(hwnd, TIMER_GUARD_ID);
@@ -772,7 +845,6 @@ unsafe extern "system" fn main_wnd_proc(
             state.audio.shutdown();
             state.smtc.send(SmtcCommand::Shutdown);
         }
-        PostQuitMessage(0);
         return LRESULT(0);
     }
 
@@ -786,6 +858,7 @@ unsafe extern "system" fn main_wnd_proc(
         .unwrap_or(0);
 
     if taskbar_created_msg != 0 && msg == taskbar_created_msg {
+        crate::system::refresh_taskbar_overlay_hooks();
         if let Ok(mut state) = rc.try_borrow_mut() {
             state.sync_taskbar_geometry(true);
         }
@@ -793,6 +866,12 @@ unsafe extern "system" fn main_wnd_proc(
     }
 
     match msg {
+        WM_SYSCOMMAND => {
+            if (wparam.0 & 0xFFF0) as u32 == SC_MINIMIZE {
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_SETCURSOR => {
             if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
@@ -865,8 +944,15 @@ unsafe extern "system" fn main_wnd_proc(
                         state.sync_taskbar_geometry(true);
                     }
                 }
-                SETTING_EXIT => {
-                    let _ = DestroyWindow(hwnd);
+                SETTING_CLOSE => {
+                    if let Ok(state) = rc.try_borrow() {
+                        let _ = PostMessageW(
+                            state.host_hwnd,
+                            state.close_request_msg,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
                 }
                 _ => {}
             }

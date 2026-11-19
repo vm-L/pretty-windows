@@ -1,0 +1,23 @@
+[package]
+name = "pretty-windows-tap"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Windows 11 XAML Diagnostics TAP helper for Pretty Windows"
+
+[lib]
+name = "PrettyWindowsTap"
+crate-type = ["cdylib"]
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "=0.58.0"
+windows = { version = "=0.58.0", features = [
+    "System",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }

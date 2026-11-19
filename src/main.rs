@@ -1,29 +1,12 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
-mod arbitration;
 mod color;
-mod config;
-mod dsp;
-mod layout;
-mod marquee;
-mod volume;
-
-#[cfg(windows)]
-mod app;
-#[cfg(windows)]
-mod audio;
-#[cfg(windows)]
-mod audio_devices;
-#[cfg(windows)]
-mod popup;
-#[cfg(windows)]
-mod process_util;
-#[cfg(windows)]
-mod render;
-#[cfg(windows)]
-mod smtc;
-#[cfg(windows)]
+mod mediabar;
+mod monitorbar;
+mod system;
 mod taskbar;
+mod tray;
+mod ui;
 
 #[cfg(windows)]
 fn main() {
@@ -40,7 +23,7 @@ fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
-        let Ok(mutex) = CreateMutexW(None, false, w!("Local\\MediaBar_SingleInstance_Mutex"))
+        let Ok(mutex) = CreateMutexW(None, false, w!("Local\\PrettyWindows_SingleInstance_Mutex"))
         else {
             return;
         };
@@ -50,7 +33,7 @@ fn main() {
         }
 
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        let _ = app::run();
+        let _ = tray::run();
         CoUninitialize();
         let _ = CloseHandle(mutex);
     }
@@ -58,5 +41,5 @@ fn main() {
 
 #[cfg(not(windows))]
 fn main() {
-    eprintln!("MediaBar is a Windows 11 application.");
+    eprintln!("Pretty Windows is a Windows 11 application.");
 }

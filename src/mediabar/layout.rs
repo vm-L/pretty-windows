@@ -1,4 +1,5 @@
-use crate::dsp::NUM_BARS;
+use super::dsp::NUM_BARS;
+pub use crate::ui::RectF;
 
 /// Base logical width of MediaBar in DIPs (at 96 DPI).
 pub const BAR_WIDTH_DIP: f32 = 256.0;
@@ -15,40 +16,6 @@ pub enum HitZone {
     VolumeMuteButton,
     VolumeSlider,
     None,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RectF {
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
-}
-
-impl RectF {
-    pub const fn new(left: f32, top: f32, right: f32, bottom: f32) -> Self {
-        Self {
-            left,
-            top,
-            right,
-            bottom,
-        }
-    }
-
-    #[inline]
-    pub fn width(self) -> f32 {
-        (self.right - self.left).max(0.0)
-    }
-
-    #[inline]
-    pub fn height(self) -> f32 {
-        (self.bottom - self.top).max(0.0)
-    }
-
-    #[inline]
-    pub fn contains(self, x: f32, y: f32) -> bool {
-        x >= self.left && x <= self.right && y >= self.top && y <= self.bottom
-    }
 }
 
 /// Complete physical-pixel layout snapshot for a given height, DPI scale, and hover interpolation `t`.

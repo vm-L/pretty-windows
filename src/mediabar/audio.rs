@@ -1,4 +1,4 @@
-use crate::dsp::{SpectrumAnalyzer, NUM_BARS};
+use super::dsp::{SpectrumAnalyzer, NUM_BARS};
 use std::mem::size_of;
 use std::ptr::{copy_nonoverlapping, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

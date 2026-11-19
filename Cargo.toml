@@ -1,22 +1,31 @@
+[workspace]
+members = [".", "tap"]
+resolver = "2"
+
 [package]
-name = "MediaBar"
+name = "PrettyWindows"
 version = "0.1.0"
 edition = "2021"
-description = "Windows 11 transparent taskbar media controller with SMTC support and process-isolated audio spectrum"
+description = "Lightweight Windows 11 desktop customization toolkit with Liquid Glass UI and modular widgets"
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "=0.58.0"
 windows = { version = "=0.58.0", features = [
     "implement",
+    "Devices_Bluetooth",
+    "Devices_Enumeration",
+    "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
     "Foundation_Numerics",
     "Media",
     "Media_Control",
+    "Networking_Connectivity",
     "Storage",
     "Storage_Streams",
     "UI",
     "UI_ViewManagement",
+    "Win32_Devices_Bluetooth",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
@@ -27,14 +36,25 @@ windows = { version = "=0.58.0", features = [
     "Win32_Graphics_Imaging",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_Storage_Packaging_Appx",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
     "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
     "Win32_System_Registry",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",

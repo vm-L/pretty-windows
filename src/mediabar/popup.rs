@@ -1,22 +1,30 @@
-use crate::arbitration::{PlaybackState, SelectionMode};
-use crate::audio_devices::{
+use super::arbitration::{PlaybackState, SelectionMode};
+use super::audio_devices::{
     enumerate_audio_endpoints, set_default_audio_endpoint, AudioEndpointItem,
 };
-use crate::color::{adjust_accent_for_theme, gaussian_blur_bgra, hsl_to_rgb, rgb_to_hsl, Rgb};
-use crate::layout::RectF;
-use crate::render::{
-    create_round_cap_stroke, d2d_color_rgb, d2d_rect, draw_speaker_glyph, draw_volume_slider,
-    identity_matrix, LayeredSurface,
-};
-use crate::smtc::{MediaCover, SourceItem};
-use crate::taskbar::set_autostart_enabled;
-use crate::volume::{
+use super::layout::RectF;
+use super::render::{draw_speaker_glyph, draw_volume_slider};
+use super::smtc::{MediaCover, SourceItem};
+use super::volume::{
     enumerate_app_volumes, format_volume_pct, slider_ratio_from_x, step_volume_by_wheel,
     AppVolumeEntry, MasterVolumeControl,
 };
+use crate::color::{adjust_accent_for_theme, Rgb};
+use crate::ui::glass::{
+    capture_blurred_desktop_bitmap, create_round_cap_stroke, create_text_format, d2d_color_rgb,
+    d2d_rect, danger_text_color, draw_divider, draw_glass_interior, draw_music_note_icon,
+    draw_row_highlight, draw_text_in_rect, identity_matrix, muted_text_color, primary_text_color,
+    update_silk_bitmap, LayeredSurface,
+};
+use crate::ui::{
+    compute_halo_pair, ease_out_cubic, ease_retract, row_stagger_dy, window_master_alpha,
+    PopupAnimPhase, Spring1D, CLOSE_ANIM_DUR_S, DIVIDER_H_DIP, INNER_PAD_DIP,
+    OPEN_SPRING_DAMPING, OPEN_SPRING_STIFFNESS, PANEL_RADIUS_DIP, POPUP_ANIM_INTERVAL_MS,
+    POPUP_FLOW_INTERVAL_MS, POPUP_REOPEN_DEBOUNCE_MS, ROW_GAP_DIP, ROW_H_DIP, SHADOW_PAD_DIP,
+    SILK_H, SILK_W,
+};
 use std::collections::HashMap;
 use std::mem::{size_of, ManuallyDrop};
-use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 use windows::core::{w, Interface};
 use windows::Foundation::Numerics::Matrix3x2;
@@ -30,25 +38,16 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry, ID2D1Layer,
     ID2D1PathGeometry1, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
     D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-    D2D1_BITMAP_PROPERTIES, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+    D2D1_BITMAP_PROPERTIES, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2,
+    D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
 };
-use windows::Win32::Graphics::DirectWrite::{
-    IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL,
-    DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-    DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
-};
-use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetMonitorInfoW,
-    MonitorFromRect, ReleaseDC, ScreenToClient, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
-};
+use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromRect, ScreenToClient, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
@@ -70,33 +69,22 @@ pub const WM_APP_AUDIO_OUTPUT_CHANGED: u32 = WM_APP + 5;
 
 pub const SETTING_TOGGLE_LOCK: usize = 1;
 pub const SETTING_RESET_POS: usize = 2;
-pub const SETTING_EXIT: usize = 3;
+pub const SETTING_CLOSE: usize = 3;
 
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const POPUP_CLASS_NAME: windows::core::PCWSTR = w!("MediaBarSourcePopupWnd");
 
 const TIMER_POPUP_FLOW_ID: usize = 1;
-const POPUP_ANIM_INTERVAL_MS: u32 = 10;
-const POPUP_FLOW_INTERVAL_MS: u32 = 33;
-const SILK_UPDATE_INTERVAL_MS: u64 = 32;
 const VOL_RELOAD_FRESH_MS: u64 = 2500;
-const CLOSE_ANIM_DUR_S: f32 = 0.095;
-const OPEN_SPRING_STIFFNESS: f32 = 780.0;
-const OPEN_SPRING_DAMPING: f32 = 41.5;
 const SUB_WIDTH_STIFFNESS: f32 = 920.0;
 const SUB_WIDTH_DAMPING: f32 = 46.0;
 const SUB_VERT_STIFFNESS: f32 = 860.0;
 const SUB_VERT_DAMPING: f32 = 44.5;
-const SILK_W: u32 = 64;
-const SILK_H: u32 = 48;
 
-const SHADOW_PAD_DIP: f32 = 14.0;
 const FOOT_MENISCUS_DIP: f32 = 10.0;
 const STEP_MENISCUS_DIP: f32 = 13.5;
-const INNER_PAD_DIP: f32 = 8.0;
-const PANEL_RADIUS_DIP: f32 = 13.0;
 const PRIMARY_WIDTH_DIP: f32 = 148.0;
-const PRIMARY_ROW_H_DIP: f32 = 34.0;
+const PRIMARY_ROW_H_DIP: f32 = ROW_H_DIP;
 const SUBMENU_GAP_DIP: f32 = 0.0;
 
 const SOURCES_SUB_WIDTH_DIP: f32 = 280.0;
@@ -104,13 +92,11 @@ const VOLUME_SUB_WIDTH_DIP: f32 = 276.0;
 const DEVICES_SUB_WIDTH_DIP: f32 = 264.0;
 const SETTINGS_SUB_WIDTH_DIP: f32 = 172.0;
 
-const AUTO_ROW_H_DIP: f32 = 34.0;
+const AUTO_ROW_H_DIP: f32 = ROW_H_DIP;
 const SOURCE_ROW_H_DIP: f32 = 46.0;
 const VOLUME_ROW_H_DIP: f32 = 44.0;
 const DEVICE_ROW_H_DIP: f32 = 42.0;
-const SETTING_ROW_H_DIP: f32 = 34.0;
-const ROW_GAP_DIP: f32 = 4.0;
-const DIVIDER_H_DIP: f32 = 9.0;
+const SETTING_ROW_H_DIP: f32 = ROW_H_DIP;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrimaryCategory {
@@ -156,55 +142,14 @@ enum HoverTarget {
     SubPlayback(usize),
     SubRecording(usize),
     SubSettingLock,
-    SubSettingAutostart,
     SubSettingResetPos,
-    SubSettingExit,
+    SubSettingClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SliderTarget {
     Master,
     App(usize),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PopupAnimPhase {
-    Opening,
-    Open,
-    Closing,
-}
-
-/// Critically/lightly damped 1D second-order spring preserving velocity across target changes.
-#[derive(Clone, Copy, Debug)]
-struct Spring1D {
-    pos: f32,
-    vel: f32,
-}
-
-impl Spring1D {
-    fn still(pos: f32) -> Self {
-        Self { pos, vel: 0.0 }
-    }
-
-    fn new(pos: f32, vel: f32) -> Self {
-        Self { pos, vel }
-    }
-
-    fn step(&mut self, target: f32, stiffness: f32, damping: f32, dt: f32) {
-        const SUB_DT: f32 = 0.003;
-        let mut rem = dt.clamp(0.0, 0.1);
-        while rem > 0.0 {
-            let h = rem.min(SUB_DT);
-            let acc = (target - self.pos) * stiffness - self.vel * damping;
-            self.vel += acc * h;
-            self.pos += self.vel * h;
-            rem -= h;
-        }
-    }
-
-    fn is_settled(&self, target: f32, pos_eps: f32, vel_eps: f32) -> bool {
-        (target - self.pos).abs() <= pos_eps && self.vel.abs() <= vel_eps
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -260,7 +205,6 @@ struct PopupInner {
     playback_devices: Vec<AudioEndpointItem>,
     recording_devices: Vec<AudioEndpointItem>,
     locked: bool,
-    autostart: bool,
     active_category: Option<PrimaryCategory>,
     hover_target: HoverTarget,
     open_left: bool,
@@ -375,7 +319,6 @@ impl SourcePopup {
                 playback_devices: Vec::new(),
                 recording_devices: Vec::new(),
                 locked: true,
-                autostart: false,
                 active_category: None,
                 hover_target: HoverTarget::None,
                 open_left: false,
@@ -432,7 +375,7 @@ impl SourcePopup {
             || self
                 .inner
                 .close_started_at
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(240))
+                .is_some_and(|t| t.elapsed() < Duration::from_millis(POPUP_REOPEN_DEBOUNCE_MS))
     }
 
     pub fn hide_animated(&mut self) {
@@ -518,7 +461,6 @@ impl SourcePopup {
         mode: SelectionMode,
         active_id: Option<String>,
         locked: bool,
-        autostart: bool,
         pill_overlap_px: i32,
     ) {
         self.inner.dpi = dpi.max(96);
@@ -528,7 +470,6 @@ impl SourcePopup {
         self.inner.mode = mode;
         self.inner.active_id = active_id;
         self.inner.locked = locked;
-        self.inner.autostart = autostart;
         self.inner.pill_overlap_px = pill_overlap_px.max(0);
         self.inner.playback_devices = enumerate_audio_endpoints(false);
         self.inner.recording_devices = enumerate_audio_endpoints(true);
@@ -952,10 +893,7 @@ impl PopupInner {
                 INNER_PAD_DIP * 2.0 + rows_h
             }
             PrimaryCategory::Settings => {
-                INNER_PAD_DIP * 2.0
-                    + SETTING_ROW_H_DIP * 4.0
-                    + ROW_GAP_DIP * 2.0
-                    + DIVIDER_H_DIP
+                INNER_PAD_DIP * 2.0 + SETTING_ROW_H_DIP * 3.0 + ROW_GAP_DIP + DIVIDER_H_DIP
             }
         };
         (w_dip * s, h_dip * s)
@@ -1175,7 +1113,7 @@ impl PopupInner {
         rects
     }
 
-    fn settings_row_rects(&self, card: RectF) -> [RectF; 4] {
+    fn settings_row_rects(&self, card: RectF) -> [RectF; 3] {
         let s = self.scale();
         let pad = INNER_PAD_DIP * s;
         let x0 = card.left + pad;
@@ -1186,12 +1124,10 @@ impl PopupInner {
 
         let r_lock = RectF::new(x0, y, x1, y + rh);
         y += rh + gap;
-        let r_auto = RectF::new(x0, y, x1, y + rh);
-        y = r_auto.bottom + DIVIDER_H_DIP * s;
         let r_reset = RectF::new(x0, y, x1, y + rh);
-        y += rh + gap;
-        let r_exit = RectF::new(x0, y, x1, y + rh);
-        [r_lock, r_auto, r_reset, r_exit]
+        y = r_reset.bottom + DIVIDER_H_DIP * s;
+        let r_close = RectF::new(x0, y, x1, y + rh);
+        [r_lock, r_reset, r_close]
     }
 
     fn point_inside_cards(&self, x: f32, y: f32) -> bool {
@@ -1374,15 +1310,13 @@ impl PopupInner {
                             .unwrap_or(HoverTarget::None)
                     }
                     PrimaryCategory::Settings => {
-                        let [r_lock, r_auto, r_reset, r_exit] = self.settings_row_rects(sub_rect);
+                        let [r_lock, r_reset, r_close] = self.settings_row_rects(sub_rect);
                         if r_lock.contains(x, y) {
                             HoverTarget::SubSettingLock
-                        } else if r_auto.contains(x, y) {
-                            HoverTarget::SubSettingAutostart
                         } else if r_reset.contains(x, y) {
                             HoverTarget::SubSettingResetPos
-                        } else if r_exit.contains(x, y) {
-                            HoverTarget::SubSettingExit
+                        } else if r_close.contains(x, y) {
+                            HoverTarget::SubSettingClose
                         } else {
                             HoverTarget::None
                         }
@@ -1465,23 +1399,10 @@ impl PopupInner {
             }
         }
         let s = self.scale();
-        let title_fmt = self.create_fmt(12.5 * s, true, false)?;
-        let sub_fmt = self.create_fmt(11.0 * s, false, false)?;
-        let badge_fmt = self.create_fmt(10.5 * s, true, false)?;
-        let pct_fmt = self.create_fmt(11.0 * s, true, true)?;
-        let trimming = DWRITE_TRIMMING {
-            granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-            delimiter: 0,
-            delimiterCount: 0,
-        };
-        let title_trim: IDWriteInlineObject =
-            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&title_fmt)? };
-        let sub_trim: IDWriteInlineObject =
-            unsafe { self.dwrite_factory.CreateEllipsisTrimmingSign(&sub_fmt)? };
-        unsafe {
-            let _ = title_fmt.SetTrimming(&trimming, &title_trim);
-            let _ = sub_fmt.SetTrimming(&trimming, &sub_trim);
-        }
+        let title_fmt = create_text_format(&self.dwrite_factory, 12.5 * s, true, false, true)?;
+        let sub_fmt = create_text_format(&self.dwrite_factory, 11.0 * s, false, false, true)?;
+        let badge_fmt = create_text_format(&self.dwrite_factory, 10.5 * s, true, false, false)?;
+        let pct_fmt = create_text_format(&self.dwrite_factory, 11.0 * s, true, true, false)?;
         let cached = CachedTextFormats {
             dpi: self.dpi,
             title_fmt,
@@ -1535,68 +1456,21 @@ impl PopupInner {
             self.ui_accent.2 += (ui_target.2 - self.ui_accent.2) * k_ui;
         }
 
-        let need_rebuild = self.silk_bmp.is_none()
-            || !was_ready
-            || self
-                .last_silk_tick
-                .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(SILK_UPDATE_INTERVAL_MS));
-        if !need_rebuild {
-            return;
-        }
-        self.last_silk_tick = Some(now);
-
-        let expected_len = (SILK_W * SILK_H * 4) as usize;
-        if self.silk_buf.len() != expected_len {
-            self.silk_buf.resize(expected_len, 0);
-        }
-
-        let scale_len = (220.0 * s).max(1.0);
-        let phase = (self.flow_phase % 10_000.0) as f32;
-        let win_w = self.win_w.max(1) as f32;
-        let win_h = self.win_h.max(1) as f32;
-
-        for gy in 0..SILK_H {
-            let py = (((gy as f32) + 0.5) / (SILK_H as f32)) * win_h;
-            let y = (primary_rect.bottom - py) / scale_len;
-            for gx in 0..SILK_W {
-                let px = (((gx as f32) + 0.5) / (SILK_W as f32)) * win_w;
-                let x = (px - primary_rect.left) / scale_len;
-                let (r, g, b, a) =
-                    sample_liquid_silk_field(x, y, phase, &self.halo_colors, self.light_glass);
-                let idx = ((gy * SILK_W + gx) * 4) as usize;
-                self.silk_buf[idx] = (b * a * 255.0).round().clamp(0.0, 255.0) as u8;
-                self.silk_buf[idx + 1] = (g * a * 255.0).round().clamp(0.0, 255.0) as u8;
-                self.silk_buf[idx + 2] = (r * a * 255.0).round().clamp(0.0, 255.0) as u8;
-                self.silk_buf[idx + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-            }
-        }
-
-        unsafe {
-            if let Some(ref bmp) = self.silk_bmp {
-                let _ = bmp.CopyFromMemory(None, self.silk_buf.as_ptr().cast(), SILK_W * 4);
-            } else {
-                let props = D2D1_BITMAP_PROPERTIES {
-                    pixelFormat: D2D1_PIXEL_FORMAT {
-                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                    },
-                    dpiX: 96.0,
-                    dpiY: 96.0,
-                };
-                self.silk_bmp = self
-                    .rt
-                    .CreateBitmap(
-                        D2D_SIZE_U {
-                            width: SILK_W,
-                            height: SILK_H,
-                        },
-                        Some(self.silk_buf.as_ptr().cast()),
-                        SILK_W * 4,
-                        &props,
-                    )
-                    .ok();
-            }
-        }
+        update_silk_bitmap(
+            &self.rt,
+            &mut self.silk_bmp,
+            &mut self.silk_buf,
+            &mut self.last_silk_tick,
+            !was_ready,
+            self.win_w,
+            self.win_h,
+            primary_rect.left,
+            primary_rect.bottom,
+            s,
+            self.flow_phase,
+            &self.halo_colors,
+            self.light_glass,
+        );
     }
 
     fn render(&mut self) -> windows::core::Result<()> {
@@ -1693,7 +1567,15 @@ impl PopupInner {
                 self.rt.PushLayer(&outer_params, &self.layer);
 
                 // 2a. System-theme frosted liquid glass + restrained liquid silk ripples
-                self.draw_glass_interior(union_bounds);
+                draw_glass_interior(
+                    &self.rt,
+                    union_bounds,
+                    self.win_w,
+                    self.win_h,
+                    self.backdrop_bmp.as_ref(),
+                    self.silk_bmp.as_ref(),
+                    self.light_glass,
+                );
 
                 // 2b. Primary row backgrounds & staggered content (skip content_layer when steady Open)
                 if primary_alpha > 0.005 {
@@ -1713,8 +1595,9 @@ impl PopupInner {
                     for (idx, (cat, mut rect)) in primary_rows.into_iter().enumerate() {
                         match self.anim_phase {
                             PopupAnimPhase::Opening => {
-                                let dy = primary_row_stagger_dy(
+                                let dy = row_stagger_dy(
                                     idx,
+                                    5,
                                     self.open_elapsed,
                                     self.open_spring.pos,
                                     s,
@@ -2657,126 +2540,6 @@ impl PopupInner {
         }
     }
 
-    unsafe fn draw_glass_interior(&self, union_bounds: RectF) {
-        let full_win = D2D_RECT_F {
-            left: 0.0,
-            top: 0.0,
-            right: self.win_w as f32,
-            bottom: self.win_h as f32,
-        };
-
-        // 1. Soft frosted desktop refraction base (or fallback solid surface if capture failed)
-        if let Some(ref bg_bmp) = self.backdrop_bmp {
-            self.rt.DrawBitmap(
-                bg_bmp,
-                Some(&full_win),
-                0.88,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                None,
-            );
-        } else {
-            let fallback_bg = if self.light_glass {
-                D2D1_COLOR_F {
-                    r: 246.0 / 255.0,
-                    g: 246.0 / 255.0,
-                    b: 248.0 / 255.0,
-                    a: 0.90,
-                }
-            } else {
-                D2D1_COLOR_F {
-                    r: 26.0 / 255.0,
-                    g: 26.0 / 255.0,
-                    b: 28.0 / 255.0,
-                    a: 0.88,
-                }
-            };
-            if let Ok(fb_brush) = self.rt.CreateSolidColorBrush(&fallback_bg, None) {
-                self.rt.FillRectangle(&d2d_rect(union_bounds), &fb_brush);
-            }
-        }
-
-        // 2. System-theme neutral dark/light liquid glass base (preserves backdrop tone without cold blue cast)
-        let glass_base = if self.light_glass {
-            D2D1_COLOR_F {
-                r: 246.0 / 255.0,
-                g: 246.0 / 255.0,
-                b: 248.0 / 255.0,
-                a: 0.74,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 24.0 / 255.0,
-                g: 24.0 / 255.0,
-                b: 26.0 / 255.0,
-                a: 0.72,
-            }
-        };
-        if let Ok(base_brush) = self.rt.CreateSolidColorBrush(&glass_base, None) {
-            self.rt.FillRectangle(&d2d_rect(union_bounds), &base_brush);
-        }
-
-        // 3. Restrained cover-theme liquid silk wisps (smooth organic ribbons, mostly clear glass)
-        if let Some(ref silk) = self.silk_bmp {
-            self.rt.DrawBitmap(
-                silk,
-                Some(&full_win),
-                1.0,
-                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                None,
-            );
-        }
-
-        // 4. Diagonal liquid glass specular sheen
-        let sheen_stops = [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: if self.light_glass { 0.26 } else { 0.14 },
-                },
-            },
-            D2D1_GRADIENT_STOP {
-                position: 0.45,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: if self.light_glass { 0.03 } else { 0.02 },
-                },
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: if self.light_glass { 0.10 } else { 0.06 },
-                },
-            },
-        ];
-        if let Ok(sc) =
-            self.rt
-                .CreateGradientStopCollection(&sheen_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-        {
-            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                startPoint: D2D_POINT_2F {
-                    x: union_bounds.left,
-                    y: union_bounds.top,
-                },
-                endPoint: D2D_POINT_2F {
-                    x: union_bounds.right,
-                    y: union_bounds.bottom,
-                },
-            };
-            if let Ok(sheen_brush) = self.rt.CreateLinearGradientBrush(&props, None, &sc) {
-                self.rt
-                    .FillRectangle(&d2d_rect(union_bounds), &sheen_brush);
-            }
-        }
-    }
-
     unsafe fn draw_unified_open_rim(
         &self,
         primary_rect: RectF,
@@ -2970,7 +2733,7 @@ impl PopupInner {
         title_fmt: &IDWriteTextFormat,
         s: f32,
     ) {
-        let mut fg = self.primary_text_color();
+        let mut fg = primary_text_color(self.light_glass);
         if !expanded {
             fg.a *= 0.90;
         }
@@ -2980,7 +2743,7 @@ impl PopupInner {
 
         if let Ok(brush) = self.rt.CreateSolidColorBrush(&fg, None) {
             self.draw_category_icon(cat, icon_cx, icon_cy, s, &brush);
-            let mut arrow_col = self.muted_text_color();
+            let mut arrow_col = muted_text_color(self.light_glass);
             if expanded {
                 arrow_col.a = 0.92;
             }
@@ -2995,7 +2758,7 @@ impl PopupInner {
             rect.right - 22.0 * s,
             rect.bottom,
         );
-        self.draw_text_in_rect(cat.label(), label_rect, title_fmt, fg);
+        draw_text_in_rect(&self.dwrite_factory, &self.rt, cat.label(), label_rect, title_fmt, fg);
     }
 
     unsafe fn draw_category_icon(
@@ -3008,68 +2771,7 @@ impl PopupInner {
     ) {
         match cat {
             PrimaryCategory::DisplayContent => {
-                // Beamed eighth notes
-                self.rt.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F {
-                            x: cx - 2.6 * s,
-                            y: cy + 3.0 * s,
-                        },
-                        radiusX: 1.9 * s,
-                        radiusY: 1.5 * s,
-                    },
-                    brush,
-                );
-                self.rt.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F {
-                            x: cx + 2.8 * s,
-                            y: cy + 2.1 * s,
-                        },
-                        radiusX: 1.9 * s,
-                        radiusY: 1.5 * s,
-                    },
-                    brush,
-                );
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx - 1.1 * s,
-                        y: cy + 2.8 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx - 1.1 * s,
-                        y: cy - 4.2 * s,
-                    },
-                    brush,
-                    1.3 * s,
-                    None,
-                );
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx + 4.3 * s,
-                        y: cy + 1.9 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx + 4.3 * s,
-                        y: cy - 5.2 * s,
-                    },
-                    brush,
-                    1.3 * s,
-                    None,
-                );
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx - 1.5 * s,
-                        y: cy - 4.2 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx + 4.7 * s,
-                        y: cy - 5.2 * s,
-                    },
-                    brush,
-                    1.8 * s,
-                    None,
-                );
+                draw_music_note_icon(&self.rt, cx, cy, s, brush);
             }
             PrimaryCategory::VolumeControl => {
                 // Speaker cone with double sound wave arcs
@@ -3321,14 +3023,16 @@ impl PopupInner {
     ) {
         let (auto_rect, source_rects) = self.display_row_rects(card);
         let is_auto = matches!(self.mode, SelectionMode::Auto);
-        self.draw_row_highlight(
+        draw_row_highlight(
+            &self.rt,
             auto_rect,
             self.hover_target == HoverTarget::SubAuto,
             is_auto,
             auto_accent,
             s,
+            self.light_glass,
         );
-        let mut auto_col = self.primary_text_color();
+        let mut auto_col = primary_text_color(self.light_glass);
         if !is_auto {
             auto_col.a *= 0.85;
         }
@@ -3338,9 +3042,9 @@ impl PopupInner {
             auto_rect.right - 12.0 * s,
             auto_rect.bottom,
         );
-        self.draw_text_in_rect("自动", auto_label_r, title_fmt, auto_col);
+        draw_text_in_rect(&self.dwrite_factory, &self.rt, "自动", auto_label_r, title_fmt, auto_col);
 
-        self.draw_divider(auto_rect, s);
+        draw_divider(&self.rt, auto_rect, s, self.light_glass);
 
         if self.sources.is_empty() {
             let empty_y = auto_rect.bottom + DIVIDER_H_DIP * s;
@@ -3350,11 +3054,13 @@ impl PopupInner {
                 auto_rect.right - 4.0 * s,
                 empty_y + 34.0 * s,
             );
-            self.draw_text_in_rect(
+            draw_text_in_rect(
+                &self.dwrite_factory,
+                &self.rt,
                 "暂无其他活跃媒体会话",
                 empty_rect,
                 sub_fmt,
-                self.muted_text_color(),
+                muted_text_color(self.light_glass),
             );
             return;
         }
@@ -3373,7 +3079,15 @@ impl PopupInner {
                     }
                 })
                 .unwrap_or(auto_accent);
-            self.draw_row_highlight(*row_rect, hovered, selected, row_accent, s);
+            draw_row_highlight(
+                &self.rt,
+                *row_rect,
+                hovered,
+                selected,
+                row_accent,
+                s,
+                self.light_glass,
+            );
             self.draw_source_row(*row_rect, src, selected, title_fmt, sub_fmt, badge_fmt, s);
         }
     }
@@ -3396,7 +3110,15 @@ impl PopupInner {
                 | HoverTarget::SubVolMasterSlider
                 | HoverTarget::SubVolMasterRow
         );
-        self.draw_row_highlight(master_geom.row_rect, master_hovered, false, accent, s);
+        draw_row_highlight(
+            &self.rt,
+            master_geom.row_rect,
+            master_hovered,
+            false,
+            accent,
+            s,
+            self.light_glass,
+        );
         self.draw_volume_row_content(
             master_geom,
             "总音量",
@@ -3412,7 +3134,7 @@ impl PopupInner {
             s,
         );
 
-        self.draw_divider(master_geom.row_rect, s);
+        draw_divider(&self.rt, master_geom.row_rect, s, self.light_glass);
 
         if self.app_volumes.is_empty() {
             let empty_y = master_geom.row_rect.bottom + DIVIDER_H_DIP * s;
@@ -3422,11 +3144,13 @@ impl PopupInner {
                 master_geom.row_rect.right - 6.0 * s,
                 empty_y + 34.0 * s,
             );
-            self.draw_text_in_rect(
+            draw_text_in_rect(
+                &self.dwrite_factory,
+                &self.rt,
                 "暂无正在使用音频的应用",
                 empty_rect,
                 sub_fmt,
-                self.muted_text_color(),
+                muted_text_color(self.light_glass),
             );
             return;
         }
@@ -3439,7 +3163,15 @@ impl PopupInner {
                     | HoverTarget::SubVolAppRow(i)
                     if i == idx
             );
-            self.draw_row_highlight(geom.row_rect, hovered, false, accent, s);
+            draw_row_highlight(
+                &self.rt,
+                geom.row_rect,
+                hovered,
+                false,
+                accent,
+                s,
+                self.light_glass,
+            );
             self.draw_volume_row_content(
                 *geom,
                 &app.name,
@@ -3498,7 +3230,7 @@ impl PopupInner {
             }
         }
 
-        let mut label_col = self.primary_text_color();
+        let mut label_col = primary_text_color(self.light_glass);
         if !is_active {
             label_col.a *= 0.78;
         }
@@ -3547,14 +3279,28 @@ impl PopupInner {
             );
         }
 
-        self.draw_text_in_rect(label, geom.label_rect, title_fmt, label_col);
+        draw_text_in_rect(
+            &self.dwrite_factory,
+            &self.rt,
+            label,
+            geom.label_rect,
+            title_fmt,
+            label_col,
+        );
 
-        let mut pct_col = self.muted_text_color();
+        let mut pct_col = muted_text_color(self.light_glass);
         if muted {
             pct_col.a *= 0.68;
         }
         let pct_str = format_volume_pct(volume);
-        self.draw_text_in_rect(&pct_str, geom.pct_rect, pct_fmt, pct_col);
+        draw_text_in_rect(
+            &self.dwrite_factory,
+            &self.rt,
+            &pct_str,
+            geom.pct_rect,
+            pct_fmt,
+            pct_col,
+        );
 
         draw_volume_slider(
             &self.rt,
@@ -3592,7 +3338,14 @@ impl PopupInner {
             } else {
                 "未检测到可用录音设备"
             };
-            self.draw_text_in_rect(msg, empty_r, sub_fmt, self.muted_text_color());
+            draw_text_in_rect(
+                &self.dwrite_factory,
+                &self.rt,
+                msg,
+                empty_r,
+                sub_fmt,
+                muted_text_color(self.light_glass),
+            );
             return;
         }
 
@@ -3603,24 +3356,48 @@ impl PopupInner {
             } else {
                 self.hover_target == HoverTarget::SubRecording(idx)
             };
-            self.draw_row_highlight(*row_rect, hovered, dev.is_default, accent, s);
+            draw_row_highlight(
+                &self.rt,
+                *row_rect,
+                hovered,
+                dev.is_default,
+                accent,
+                s,
+                self.light_glass,
+            );
 
             let text_left = row_rect.left + 12.0 * s;
             let text_right = row_rect.right - 10.0 * s;
             let mid_y = (row_rect.top + row_rect.bottom) * 0.5;
             if dev.sub_name.is_empty() {
                 let single_r = RectF::new(text_left, row_rect.top, text_right, row_rect.bottom);
-                self.draw_text_in_rect(
+                draw_text_in_rect(
+                    &self.dwrite_factory,
+                    &self.rt,
                     &dev.main_name,
                     single_r,
                     title_fmt,
-                    self.primary_text_color(),
+                    primary_text_color(self.light_glass),
                 );
             } else {
                 let top_r = RectF::new(text_left, mid_y - 16.0 * s, text_right, mid_y + 1.0 * s);
                 let bot_r = RectF::new(text_left, mid_y + 0.5 * s, text_right, mid_y + 15.5 * s);
-                self.draw_text_in_rect(&dev.main_name, top_r, title_fmt, self.primary_text_color());
-                self.draw_text_in_rect(&dev.sub_name, bot_r, sub_fmt, self.muted_text_color());
+                draw_text_in_rect(
+                    &self.dwrite_factory,
+                    &self.rt,
+                    &dev.main_name,
+                    top_r,
+                    title_fmt,
+                    primary_text_color(self.light_glass),
+                );
+                draw_text_in_rect(
+                    &self.dwrite_factory,
+                    &self.rt,
+                    &dev.sub_name,
+                    bot_r,
+                    sub_fmt,
+                    muted_text_color(self.light_glass),
+                );
             }
         }
     }
@@ -3632,60 +3409,60 @@ impl PopupInner {
         title_fmt: &IDWriteTextFormat,
         s: f32,
     ) {
-        let [r_lock, r_auto, r_reset, r_exit] = self.settings_row_rects(card);
+        let [r_lock, r_reset, r_close] = self.settings_row_rects(card);
 
-        self.draw_row_highlight(
+        draw_row_highlight(
+            &self.rt,
             r_lock,
             self.hover_target == HoverTarget::SubSettingLock,
             self.locked,
             accent,
             s,
+            self.light_glass,
         );
-        self.draw_setting_label(r_lock, "锁定位置", self.primary_text_color(), title_fmt, s);
-
-        self.draw_row_highlight(
-            r_auto,
-            self.hover_target == HoverTarget::SubSettingAutostart,
-            self.autostart,
-            accent,
+        self.draw_setting_label(
+            r_lock,
+            "锁定位置",
+            primary_text_color(self.light_glass),
+            title_fmt,
             s,
         );
-        self.draw_setting_label(r_auto, "开机自启", self.primary_text_color(), title_fmt, s);
 
-        self.draw_divider(r_auto, s);
-
-        self.draw_row_highlight(
+        draw_row_highlight(
+            &self.rt,
             r_reset,
             self.hover_target == HoverTarget::SubSettingResetPos,
             false,
             accent,
             s,
+            self.light_glass,
         );
-        self.draw_setting_label(r_reset, "重置位置", self.primary_text_color(), title_fmt, s);
+        self.draw_setting_label(
+            r_reset,
+            "重置位置",
+            primary_text_color(self.light_glass),
+            title_fmt,
+            s,
+        );
 
-        self.draw_row_highlight(
-            r_exit,
-            self.hover_target == HoverTarget::SubSettingExit,
+        draw_divider(&self.rt, r_reset, s, self.light_glass);
+
+        draw_row_highlight(
+            &self.rt,
+            r_close,
+            self.hover_target == HoverTarget::SubSettingClose,
             false,
             accent,
             s,
+            self.light_glass,
         );
-        let exit_col = if self.light_glass {
-            D2D1_COLOR_F {
-                r: 0.78,
-                g: 0.16,
-                b: 0.18,
-                a: 0.94,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 1.0,
-                g: 0.48,
-                b: 0.48,
-                a: 0.95,
-            }
-        };
-        self.draw_setting_label(r_exit, "退出", exit_col, title_fmt, s);
+        self.draw_setting_label(
+            r_close,
+            "关闭",
+            danger_text_color(self.light_glass),
+            title_fmt,
+            s,
+        );
     }
 
     unsafe fn draw_setting_label(
@@ -3702,187 +3479,7 @@ impl PopupInner {
             rect.right - 10.0 * s,
             rect.bottom,
         );
-        self.draw_text_in_rect(label, label_r, fmt, color);
-    }
-
-    unsafe fn draw_divider(&self, upper_row: RectF, s: f32) {
-        let div_y = upper_row.bottom + (DIVIDER_H_DIP * s) * 0.5;
-        let div_col = if self.light_glass {
-            D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.10,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.14,
-            }
-        };
-        if let Ok(div_brush) = self.rt.CreateSolidColorBrush(&div_col, None) {
-            self.rt.DrawLine(
-                D2D_POINT_2F {
-                    x: upper_row.left + 6.0 * s,
-                    y: div_y,
-                },
-                D2D_POINT_2F {
-                    x: upper_row.right - 6.0 * s,
-                    y: div_y,
-                },
-                &div_brush,
-                1.0 * s,
-                None,
-            );
-        }
-    }
-
-    fn create_fmt(
-        &self,
-        size: f32,
-        semibold: bool,
-        trailing: bool,
-    ) -> windows::core::Result<IDWriteTextFormat> {
-        unsafe {
-            let fmt = self.dwrite_factory.CreateTextFormat(
-                w!("Segoe UI Variable Text"),
-                None,
-                if semibold {
-                    DWRITE_FONT_WEIGHT_SEMI_BOLD
-                } else {
-                    DWRITE_FONT_WEIGHT_NORMAL
-                },
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size,
-                w!("zh-CN"),
-            )?;
-            let _ = fmt.SetTextAlignment(if trailing {
-                DWRITE_TEXT_ALIGNMENT_TRAILING
-            } else {
-                DWRITE_TEXT_ALIGNMENT_LEADING
-            });
-            let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            let _ = fmt.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-            Ok(fmt)
-        }
-    }
-
-    fn primary_text_color(&self) -> D2D1_COLOR_F {
-        if self.light_glass {
-            D2D1_COLOR_F {
-                r: 0.07,
-                g: 0.085,
-                b: 0.12,
-                a: 0.92,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.95,
-            }
-        }
-    }
-
-    fn muted_text_color(&self) -> D2D1_COLOR_F {
-        if self.light_glass {
-            D2D1_COLOR_F {
-                r: 0.20,
-                g: 0.21,
-                b: 0.23,
-                a: 0.68,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 0.94,
-                g: 0.94,
-                b: 0.95,
-                a: 0.72,
-            }
-        }
-    }
-
-    unsafe fn draw_row_highlight(
-        &self,
-        rect: RectF,
-        hovered: bool,
-        selected: bool,
-        accent: Rgb,
-        s: f32,
-    ) {
-        if !hovered && !selected {
-            return;
-        }
-        let rr = D2D1_ROUNDED_RECT {
-            rect: d2d_rect(rect),
-            radiusX: 8.5 * s,
-            radiusY: 8.5 * s,
-        };
-
-        if selected {
-            let fill_alpha = if self.light_glass {
-                if hovered {
-                    0.26
-                } else {
-                    0.20
-                }
-            } else if hovered {
-                0.34
-            } else {
-                0.26
-            };
-            let fill = d2d_color_rgb(accent, fill_alpha);
-            if let Ok(b) = self.rt.CreateSolidColorBrush(&fill, None) {
-                self.rt.FillRoundedRectangle(&rr, &b);
-            }
-            let border_alpha = if self.light_glass { 0.48 } else { 0.58 };
-            let border = d2d_color_rgb(accent, border_alpha);
-            if let Ok(bb) = self.rt.CreateSolidColorBrush(&border, None) {
-                self.rt.DrawRoundedRectangle(&rr, &bb, 1.1 * s, None);
-            }
-
-            let bar_w = 3.0 * s;
-            let bar_h = (16.0 * s).min(rect.height() - 10.0 * s);
-            let bar_left = rect.left + 3.0 * s;
-            let bar_top = (rect.top + rect.bottom - bar_h) * 0.5;
-            let bar_rr = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: bar_left,
-                    top: bar_top,
-                    right: bar_left + bar_w,
-                    bottom: bar_top + bar_h,
-                },
-                radiusX: bar_w * 0.5,
-                radiusY: bar_w * 0.5,
-            };
-            let bar_col = d2d_color_rgb(accent, 0.98);
-            if let Ok(ab) = self.rt.CreateSolidColorBrush(&bar_col, None) {
-                self.rt.FillRoundedRectangle(&bar_rr, &ab);
-            }
-        } else {
-            let fill = if self.light_glass {
-                D2D1_COLOR_F {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.06,
-                }
-            } else {
-                D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.10,
-                }
-            };
-            if let Ok(b) = self.rt.CreateSolidColorBrush(&fill, None) {
-                self.rt.FillRoundedRectangle(&rr, &b);
-            }
-        }
+        draw_text_in_rect(&self.dwrite_factory, &self.rt, label, label_r, fmt, color);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3957,7 +3554,10 @@ impl PopupInner {
             if let Ok(tb) = self.rt.CreateSolidColorBrush(&tile_col, None) {
                 self.rt.FillRoundedRectangle(&thumb_rr, &tb);
             }
-            if let Ok(nb) = self.rt.CreateSolidColorBrush(&self.primary_text_color(), None) {
+            if let Ok(nb) = self
+                .rt
+                .CreateSolidColorBrush(&primary_text_color(self.light_glass), None)
+            {
                 self.rt.FillEllipse(
                     &D2D1_ELLIPSE {
                         point: D2D_POINT_2F {
@@ -3979,13 +3579,27 @@ impl PopupInner {
         let title_r = RectF::new(text_left, mid_y - 16.0 * s, text_right, mid_y + 1.0 * s);
         let sub_r = RectF::new(text_left, mid_y + 0.5 * s, text_right, mid_y + 15.5 * s);
 
-        self.draw_text_in_rect(&src.title, title_r, title_fmt, self.primary_text_color());
+        draw_text_in_rect(
+            &self.dwrite_factory,
+            &self.rt,
+            &src.title,
+            title_r,
+            title_fmt,
+            primary_text_color(self.light_glass),
+        );
         let subtitle = if src.artist.is_empty() {
             src.app_name.clone()
         } else {
             format!("{} · {}", src.artist, src.app_name)
         };
-        self.draw_text_in_rect(&subtitle, sub_r, sub_fmt, self.muted_text_color());
+        draw_text_in_rect(
+            &self.dwrite_factory,
+            &self.rt,
+            &subtitle,
+            sub_r,
+            sub_fmt,
+            muted_text_color(self.light_glass),
+        );
 
         let is_playing = src.status == PlaybackState::Playing;
         let accent = src
@@ -4002,66 +3616,21 @@ impl PopupInner {
         let badge_col = if is_playing {
             d2d_color_rgb(accent, 0.98)
         } else if selected {
-            self.primary_text_color()
+            primary_text_color(self.light_glass)
         } else {
-            self.muted_text_color()
+            muted_text_color(self.light_glass)
         };
         let badge_text = if is_playing { "播放中" } else { "已暂停" };
         let badge_r = RectF::new(rect.right - status_w, rect.top, rect.right - 8.0 * s, rect.bottom);
-        self.draw_text_in_rect(badge_text, badge_r, badge_fmt, badge_col);
-    }
-
-    unsafe fn draw_text_in_rect(
-        &self,
-        text: &str,
-        rect: RectF,
-        fmt: &IDWriteTextFormat,
-        color: D2D1_COLOR_F,
-    ) {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        let Ok(layout) = self.dwrite_factory.CreateTextLayout(
-            &wide,
-            fmt,
-            rect.width().max(1.0),
-            rect.height().max(12.0),
-        ) else {
-            return;
-        };
-        let Ok(brush) = self.rt.CreateSolidColorBrush(&color, None) else {
-            return;
-        };
-        self.rt.DrawTextLayout(
-            D2D_POINT_2F {
-                x: rect.left,
-                y: rect.top,
-            },
-            &layout,
-            &brush,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+        draw_text_in_rect(
+            &self.dwrite_factory,
+            &self.rt,
+            badge_text,
+            badge_r,
+            badge_fmt,
+            badge_col,
         );
     }
-}
-
-/// Cubic ease-out curve in `[0, 1]`.
-fn ease_out_cubic(t: f32) -> f32 {
-    let u = 1.0 - t.clamp(0.0, 1.0);
-    1.0 - u * u * u
-}
-
-/// Smooth responsive retract curve (`t * (0.45 + 0.55*t)`) in `[0, 1]` with immediate response and brisk collapse.
-fn ease_retract(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * (0.45 + 0.55 * t)
-}
-
-/// Staggered bottom-to-top vertical micro-glide offset (`idx = 4` bottom row settles first, `0` top last).
-fn primary_row_stagger_dy(idx: usize, open_elapsed: f32, open_pos: f32, s: f32) -> f32 {
-    let order = 4usize.saturating_sub(idx) as f32;
-    let delay = order * 0.007;
-    let row_t = ((open_elapsed - delay) / 0.105).clamp(0.0, 1.0);
-    let settle_glide = (1.0 - ease_out_cubic(row_t)) * (5.5 + order * 1.1) * s;
-    let crest_breath = (1.0 - open_pos) * 0.28 * 14.0 * s;
-    settle_glide + crest_breath
 }
 
 /// Computes the primary card's animated envelope, keeping left, right, and bottom anchored on MediaBar.
@@ -4192,16 +3761,6 @@ fn animated_closing_sub_rect(
     }
 }
 
-fn window_master_alpha(phase: PopupAnimPhase, open_elapsed: f32, close_progress: f32) -> f32 {
-    match phase {
-        PopupAnimPhase::Opening => {
-            (0.24 + 0.76 * ease_out_cubic((open_elapsed / 0.050).clamp(0.0, 1.0))).clamp(0.0, 1.0)
-        }
-        PopupAnimPhase::Open => 1.0,
-        PopupAnimPhase::Closing => (1.0 - close_progress.clamp(0.0, 1.0)).powf(1.25),
-    }
-}
-
 /// Computes vertical `(top, bottom)` for a cascading submenu:
 /// 1. Prefers aligning first submenu item's top with `row_top` (`row_top - inner_pad`) downward.
 /// 2. When downward space above `bottom_limit` is insufficient, aligns the last submenu item's
@@ -4258,183 +3817,7 @@ fn compute_cover_halo_pair(
         || adjust_accent_for_theme(fallback, false),
         |cov| cov.accent_dark,
     );
-    let (h, s, l) = rgb_to_hsl(base_rgb);
-    if s < 0.12 {
-        let s0 = s.min(0.10);
-        let (l0, l1) = if light_theme { (0.66, 0.60) } else { (0.76, 0.82) };
-        let c0 = hsl_to_rgb(h, s0, l0);
-        let c1 = hsl_to_rgb(h, s0, l1);
-        return [c0, c1];
-    }
-
-    let s0 = (s * 0.92).clamp(0.12, 0.72);
-    let l0 = if light_theme {
-        l.clamp(0.60, 0.72)
-    } else {
-        l.clamp(0.55, 0.68)
-    };
-    let c0 = hsl_to_rgb(h, s0, l0);
-
-    let shift = 24.0 * ((s - 0.12) / 0.35).clamp(0.25, 1.0);
-    let h1 = (h + shift).rem_euclid(360.0);
-    let s1 = (s0 * 0.90).clamp(0.10, 0.66);
-    let l1 = (l0 + 0.04).clamp(0.57, 0.75);
-    let c1 = hsl_to_rgb(h1, s1, l1);
-    [c0, c1]
-}
-
-/// Evaluates two restrained, domain-warped liquid silk light ribbons with wide clear-glass negative space.
-fn sample_liquid_silk_field(
-    x: f32,
-    y: f32,
-    phase: f32,
-    colors: &[(f32, f32, f32); 2],
-    light_glass: bool,
-) -> (f32, f32, f32, f32) {
-    let wx = x
-        + 0.28 * (2.1 * y + 0.29 * phase).sin()
-        + 0.14 * (3.3 * y - 0.19 * phase + 1.3).cos();
-    let wy = y
-        + 0.26 * (1.9 * x - 0.23 * phase + 0.7).cos()
-        + 0.13 * (3.1 * x + 0.31 * phase + 2.4).sin();
-
-    let ang1 = 0.68 + 0.26 * (0.14 * phase).sin();
-    let (s1, c1_ang) = ang1.sin_cos();
-    let u1 = wx * c1_ang + wy * s1 - 0.19 * phase;
-    let v1 = -wx * s1 + wy * c1_ang;
-    let crest1 = (0.5 + 0.5 * (u1 * 5.0).sin()).powi(5);
-    let along1 = 0.45 + 0.55 * (0.5 + 0.5 * (v1 * 2.4 + 0.34 * phase).sin());
-    let breathe1 = 0.82 + 0.18 * (0.37 * phase + 0.5).sin();
-    let w1 = crest1 * along1 * breathe1;
-
-    let ang2 = -0.82 + 0.22 * (0.11 * phase + 1.8).cos();
-    let (s2, c2_ang) = ang2.sin_cos();
-    let u2 = wx * c2_ang + wy * s2 + 0.15 * phase + 1.9;
-    let v2 = -wx * s2 + wy * c2_ang;
-    let crest2 = (0.5 + 0.5 * (u2 * 4.4).sin()).powi(6);
-    let along2 = 0.40 + 0.60 * (0.5 + 0.5 * (v2 * 2.1 - 0.27 * phase + 2.2).cos());
-    let breathe2 = 0.80 + 0.20 * (0.29 * phase + 2.1).cos();
-    let w2 = crest2 * along2 * breathe2 * 0.68;
-
-    let w_sum = w1 + w2;
-    if w_sum <= 1e-4 {
-        return (0.0, 0.0, 0.0, 0.0);
-    }
-    let (c0, c1) = (colors[0], colors[1]);
-    let r = ((c0.0 * w1 + c1.0 * w2) / w_sum).clamp(0.0, 1.0);
-    let g = ((c0.1 * w1 + c1.1 * w2) / w_sum).clamp(0.0, 1.0);
-    let b = ((c0.2 * w1 + c1.2 * w2) / w_sum).clamp(0.0, 1.0);
-
-    let peak_a = if light_glass { 0.095 } else { 0.125 };
-    let raw_t = w_sum.min(1.2);
-    let alpha = (peak_a * (raw_t / (1.0 + 0.30 * raw_t))).clamp(0.0, peak_a);
-    (r, g, b, alpha)
-}
-
-/// Captures the desktop region directly behind the popup and applies soft frosted blur.
-fn capture_blurred_desktop_bitmap(
-    rt: &ID2D1DCRenderTarget,
-    screen_x: i32,
-    screen_y: i32,
-    w: i32,
-    h: i32,
-) -> Option<ID2D1Bitmap> {
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-
-    unsafe {
-        let screen_dc = GetDC(None);
-        if screen_dc.is_invalid() {
-            return None;
-        }
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        if mem_dc.is_invalid() {
-            let _ = ReleaseDC(None, screen_dc);
-            return None;
-        }
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits_ptr = null_mut();
-        let Ok(bmp) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
-            let _ = DeleteDC(mem_dc);
-            let _ = ReleaseDC(None, screen_dc);
-            return None;
-        };
-        let old = SelectObject(mem_dc, bmp);
-        let _ = BitBlt(mem_dc, 0, 0, w, h, screen_dc, screen_x, screen_y, SRCCOPY);
-        let _ = ReleaseDC(None, screen_dc);
-
-        let result = if !bits_ptr.is_null() {
-            let raw = std::slice::from_raw_parts(bits_ptr.cast::<u8>(), (w as usize) * (h as usize) * 4);
-            let dw = (w as usize / 4).max(1);
-            let dh = (h as usize / 4).max(1);
-            let mut down = Vec::with_capacity(dw * dh * 4);
-            for by in 0..dh {
-                let y0 = (by * 4).min((h as usize) - 1);
-                let y1 = ((by + 1) * 4).min(h as usize).max(y0 + 1);
-                for bx in 0..dw {
-                    let x0 = (bx * 4).min((w as usize) - 1);
-                    let x1 = ((bx + 1) * 4).min(w as usize).max(x0 + 1);
-                    let mut sum_b = 0u32;
-                    let mut sum_g = 0u32;
-                    let mut sum_r = 0u32;
-                    let mut count = 0u32;
-                    for sy in y0..y1 {
-                        for sx in x0..x1 {
-                            let idx = (sy * (w as usize) + sx) * 4;
-                            sum_b += u32::from(raw[idx]);
-                            sum_g += u32::from(raw[idx + 1]);
-                            sum_r += u32::from(raw[idx + 2]);
-                            count += 1;
-                        }
-                    }
-                    let count = count.max(1);
-                    down.push((sum_b / count) as u8);
-                    down.push((sum_g / count) as u8);
-                    down.push((sum_r / count) as u8);
-                    down.push(255);
-                }
-            }
-            let blurred = gaussian_blur_bgra(&down, dw, dh, 6);
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            rt.CreateBitmap(
-                D2D_SIZE_U {
-                    width: dw as u32,
-                    height: dh as u32,
-                },
-                Some(blurred.as_ptr().cast()),
-                (dw * 4) as u32,
-                &props,
-            )
-            .ok()
-        } else {
-            None
-        };
-
-        let _ = SelectObject(mem_dc, old);
-        let _ = DeleteObject(bmp);
-        let _ = DeleteDC(mem_dc);
-        result
-    }
+    compute_halo_pair(base_rgb, light_theme)
 }
 
 unsafe extern "system" fn popup_wnd_proc(
@@ -4579,7 +3962,7 @@ unsafe extern "system" fn popup_wnd_proc(
                         WPARAM(usize::MAX),
                         LPARAM(0),
                     );
-                    let _ = state.render();
+                    state.begin_close();
                 }
                 HoverTarget::SubSource(idx) => {
                     if let Some(src) = state.sources.get(idx) {
@@ -4592,7 +3975,7 @@ unsafe extern "system" fn popup_wnd_proc(
                             WPARAM(idx),
                             LPARAM(0),
                         );
-                        let _ = state.render();
+                        state.begin_close();
                     }
                 }
                 HoverTarget::SubVolMasterMute => {
@@ -4616,7 +3999,7 @@ unsafe extern "system" fn popup_wnd_proc(
                                 WPARAM(0),
                                 LPARAM(0),
                             );
-                            let _ = state.render();
+                            state.begin_close();
                         }
                     }
                 }
@@ -4624,7 +4007,7 @@ unsafe extern "system" fn popup_wnd_proc(
                     if let Some(dev_id) = state.recording_devices.get(idx).map(|d| d.id.clone()) {
                         if set_default_audio_endpoint(&dev_id) {
                             state.recording_devices = enumerate_audio_endpoints(true);
-                            let _ = state.render();
+                            state.begin_close();
                         }
                     }
                 }
@@ -4636,14 +4019,7 @@ unsafe extern "system" fn popup_wnd_proc(
                         WPARAM(SETTING_TOGGLE_LOCK),
                         LPARAM(0),
                     );
-                    let _ = state.render();
-                }
-                HoverTarget::SubSettingAutostart => {
-                    let next = !state.autostart;
-                    if set_autostart_enabled(next) {
-                        state.autostart = next;
-                        let _ = state.render();
-                    }
+                    state.begin_close();
                 }
                 HoverTarget::SubSettingResetPos => {
                     let _ = PostMessageW(
@@ -4652,15 +4028,15 @@ unsafe extern "system" fn popup_wnd_proc(
                         WPARAM(SETTING_RESET_POS),
                         LPARAM(0),
                     );
-                    let _ = state.render();
+                    state.begin_close();
                 }
-                HoverTarget::SubSettingExit => {
+                HoverTarget::SubSettingClose => {
                     let _ = ShowWindow(hwnd, SW_HIDE);
                     state.reset_transient_state();
                     let _ = PostMessageW(
                         state.main_hwnd,
                         WM_APP_SETTING_ACTION,
-                        WPARAM(SETTING_EXIT),
+                        WPARAM(SETTING_CLOSE),
                         LPARAM(0),
                     );
                 }
@@ -4733,6 +4109,8 @@ unsafe extern "system" fn popup_wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::rgb_to_hsl;
+    use crate::ui::sample_liquid_silk_field;
 
     #[test]
     fn cover_halo_pair_preserves_clean_accent_for_dark_and_light_themes() {
@@ -4920,14 +4298,15 @@ mod tests {
         assert!((t2 - 176.0).abs() < 0.01);
         assert!(((b2 - pad) - 308.0).abs() < 0.01);
 
-        // 3. Bottom-most Settings row (`退出` 34px aligns flush with `设置` 34px at bottom_limit)
-        let (t3, b3) = compute_submenu_vertical_span(274.0, pad, 169.0, top_limit, bottom_limit);
+        // 3. Bottom-most Settings row (`关闭` 34px aligns flush with `设置` 34px at bottom_limit)
+        let settings_h = INNER_PAD_DIP * 2.0 + SETTING_ROW_H_DIP * 3.0 + ROW_GAP_DIP + DIVIDER_H_DIP;
+        let (t3, b3) = compute_submenu_vertical_span(274.0, pad, settings_h, top_limit, bottom_limit);
         assert!((b3 - bottom_limit).abs() < 0.01);
-        assert!((t3 - 147.0).abs() < 0.01);
-        let exit_bottom = b3 - pad;
-        let exit_top = exit_bottom - 34.0;
-        assert!((exit_bottom - 308.0).abs() < 0.01);
-        assert!((exit_top - 274.0).abs() < 0.01);
+        assert!((t3 - 185.0).abs() < 0.01);
+        let close_bottom = b3 - pad;
+        let close_top = close_bottom - 34.0;
+        assert!((close_bottom - 308.0).abs() < 0.01);
+        assert!((close_top - 274.0).abs() < 0.01);
 
         // 4. Extremely tall submenu exceeding upward headroom clamps cleanly within [top_limit, bottom_limit]
         let (t4, b4) = compute_submenu_vertical_span(160.0, pad, 340.0, top_limit, bottom_limit);
@@ -4983,10 +4362,10 @@ mod tests {
         );
 
         // 3. Staggered bottom-to-top row micro-glide & clean zeroing at rest
-        let dy_top = primary_row_stagger_dy(0, 0.025, 0.65, 1.0);
-        let dy_bot = primary_row_stagger_dy(4, 0.025, 0.65, 1.0);
+        let dy_top = row_stagger_dy(0, 5, 0.025, 0.65, 1.0);
+        let dy_bot = row_stagger_dy(4, 5, 0.025, 0.65, 1.0);
         assert!(dy_top > dy_bot, "top row should trail bottom row during rise");
-        let dy_rest = primary_row_stagger_dy(0, 0.16, 1.0, 1.0);
+        let dy_rest = row_stagger_dy(0, 5, 0.16, 1.0, 1.0);
         assert!(dy_rest.abs() < 1e-4, "row stagger did not settle to zero: {dy_rest}");
 
         // 4. Primary envelope stays strictly anchored to MediaBar bottom/sides with safe top >= 4 DIP & min height

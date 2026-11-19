@@ -1,6 +1,6 @@
-use crate::arbitration::PlaybackState;
+use super::arbitration::PlaybackState;
+use super::process_util::{friendly_app_name, resolve_pid_for_source};
 use crate::color::{extract_accent_from_bgra, Rgb};
-use crate::process_util::{friendly_app_name, resolve_pid_for_source};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};

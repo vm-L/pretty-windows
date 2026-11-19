@@ -99,7 +99,7 @@ pub fn merge_session_records<T>(records: Vec<SessionRecord<T>>) -> Vec<GroupedAp
 #[cfg(windows)]
 mod win {
     use super::*;
-    use crate::process_util::snapshot_process_lookup;
+    use super::super::process_util::snapshot_process_lookup;
     use windows::core::{Interface, GUID, PWSTR};
     use windows::Win32::Foundation::S_OK;
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
