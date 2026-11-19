@@ -5,8 +5,9 @@ use super::dsp::NUM_BARS;
 use super::layout::{hit_test_mode, BarLayout, HitZone, BAR_WIDTH_DIP};
 use super::marquee::MarqueeState;
 use super::popup::{
-    SourcePopup, SETTING_CLOSE, SETTING_RESET_POS, SETTING_TOGGLE_LOCK, WM_APP_AUDIO_OUTPUT_CHANGED,
-    WM_APP_POPUP_CLOSED, WM_APP_SETTING_ACTION, WM_APP_SOURCE_SELECTED,
+    SourcePopup, SETTING_CLOSE, SETTING_RESET_POS, SETTING_TOGGLE_AUTO_COLOR, SETTING_TOGGLE_LOCK,
+    WM_APP_AUDIO_OUTPUT_CHANGED, WM_APP_POPUP_CLOSED, WM_APP_SETTING_ACTION,
+    WM_APP_SOURCE_SELECTED,
 };
 use super::process_util::activate_player_window;
 use super::render::{BarRenderer, RenderFrame};
@@ -19,8 +20,9 @@ use super::taskbar::{
     TaskbarState,
 };
 use super::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
-use crate::color::{adjust_accent_for_theme, Rgb};
-use crate::system::{exclude_from_peek, is_light_taskbar, system_accent_color};
+use crate::color::{derive_background_accent, Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::system::{exclude_from_peek, is_light_taskbar, set_mediabar_shared_accent};
+use crate::ui::glass::sample_screen_region_rgb;
 use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
 use std::cell::RefCell;
 use std::mem::size_of;
@@ -34,8 +36,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1Factory1;
 use windows::Win32::Graphics::DirectWrite::IDWriteFactory;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_CONTROL,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos,
@@ -68,7 +69,7 @@ struct AppState {
     config_path: PathBuf,
     config: Config,
     light_taskbar: bool,
-    fallback_accent: Rgb,
+    backdrop_rgb: Rgb,
     taskbar: Option<TaskbarState>,
     win_x: i32,
     win_y: i32,
@@ -140,7 +141,15 @@ impl AppState {
         let mut config = Config::load_from_path(&config_path);
         config.enabled = true;
         let light_taskbar = is_light_taskbar();
-        let fallback_accent = system_accent_color();
+        let taskbar = query_taskbar_state();
+        let backdrop_rgb = taskbar
+            .and_then(|tb| {
+                let sample_h = (tb.taskbar_rect.bottom - tb.taskbar_rect.top).clamp(8, 32);
+                let sample_w = 64.min((tb.taskbar_rect.right - tb.taskbar_rect.left).max(8));
+                let sample_x = tb.taskbar_rect.left + ((tb.taskbar_rect.right - tb.taskbar_rect.left - sample_w) / 2).max(0);
+                sample_screen_region_rgb(sample_x, tb.taskbar_rect.top, sample_w, sample_h)
+            })
+            .unwrap_or(NEUTRAL_BACKDROP_FALLBACK);
 
         let renderer = BarRenderer::new_with_factories(d2d_factory, dwrite_factory)?;
         let popup = SourcePopup::new(
@@ -149,9 +158,8 @@ impl AppState {
             renderer.dwrite_factory.clone(),
         )?;
 
-        let smtc = start_smtc_worker(hwnd, fallback_accent);
+        let smtc = start_smtc_worker(hwnd, NEUTRAL_BACKDROP_FALLBACK);
         let audio = start_audio_worker();
-        let taskbar = query_taskbar_state();
         let init_dpi = taskbar.map(|t| t.dpi).unwrap_or(96);
         let arrow_cursor = unsafe { LoadCursorW(None, IDC_ARROW)? };
         let (grab_cursor, grab_cursor_owned) = renderer.create_grabbing_cursor(init_dpi)?;
@@ -164,7 +172,7 @@ impl AppState {
             config_path,
             config,
             light_taskbar,
-            fallback_accent,
+            backdrop_rgb,
             taskbar,
             win_x: 0,
             win_y: 0,
@@ -207,8 +215,38 @@ impl AppState {
             grab_cursor_owned,
         };
 
+        app.sync_shared_accent();
         app.sync_taskbar_geometry(true);
         Ok(app)
+    }
+
+    fn sync_shared_accent(&self) {
+        let shared = if self.config.auto_color {
+            self.active_source()
+                .and_then(|s| s.cover.as_ref())
+                .or_else(|| self.snapshot.sources.iter().find_map(|s| s.cover.as_ref()))
+                .map(|c| (c.accent_light, c.accent_dark))
+        } else {
+            None
+        };
+        set_mediabar_shared_accent(shared);
+    }
+
+    fn refresh_backdrop_sample(&mut self) {
+        let Some(tb) = self.taskbar else {
+            return;
+        };
+        // Sample taskbar strip just above or to the left of MediaBar so we measure the taskbar/wallpaper itself.
+        let sample_w = 48i32;
+        let sample_h = 20i32.min((tb.taskbar_rect.bottom - tb.taskbar_rect.top).max(8));
+        let sample_x = (self.win_x - sample_w - 8).max(tb.taskbar_rect.left + 8);
+        let sample_y = tb.taskbar_rect.top + 4;
+        if let Some(bg) = sample_screen_region_rgb(sample_x, sample_y, sample_w, sample_h) {
+            if bg != self.backdrop_rgb {
+                self.backdrop_rgb = bg;
+                self.dirty = true;
+            }
+        }
     }
 
     fn active_source(&self) -> Option<&SourceItem> {
@@ -270,6 +308,7 @@ impl AppState {
                     SWP_NOACTIVATE,
                 );
             }
+            self.refresh_backdrop_sample();
             self.dirty = true;
         } else {
             ensure_above_taskbar(self.hwnd, tb.taskbar_hwnd);
@@ -330,6 +369,7 @@ impl AppState {
             .unwrap_or((false, None));
 
         self.audio.set_target(is_playing, active_pid);
+        self.sync_shared_accent();
         if self.popup.is_visible() {
             self.popup.update_live_sources(
                 self.snapshot.sources.clone(),
@@ -385,18 +425,22 @@ impl AppState {
         Option<Arc<MediaCover>>,
         Rgb,
     ) {
+        let fallback_bg_accent = derive_background_accent(self.backdrop_rgb, self.light_taskbar);
         if let Some(src) = self.active_source() {
-            let accent = src
-                .cover
-                .as_ref()
-                .map(|c| {
-                    if self.light_taskbar {
-                        c.accent_light
-                    } else {
-                        c.accent_dark
-                    }
-                })
-                .unwrap_or_else(|| adjust_accent_for_theme(self.fallback_accent, self.light_taskbar));
+            let accent = if self.config.auto_color {
+                src.cover
+                    .as_ref()
+                    .map(|c| {
+                        if self.light_taskbar {
+                            c.accent_light
+                        } else {
+                            c.accent_dark
+                        }
+                    })
+                    .unwrap_or(fallback_bg_accent)
+            } else {
+                fallback_bg_accent
+            };
             (
                 false,
                 src.status == PlaybackState::Playing,
@@ -412,7 +456,7 @@ impl AppState {
                 String::new(),
                 String::new(),
                 None,
-                adjust_accent_for_theme(self.fallback_accent, self.light_taskbar),
+                fallback_bg_accent,
             )
         }
     }
@@ -654,13 +698,17 @@ impl AppState {
             let local_x = (pt.x - self.win_x) as f32;
             let local_y = (pt.y - self.win_y) as f32;
             let layout = self.current_layout();
-            let next_zone = hit_test_mode(
-                &layout,
-                local_x,
-                local_y,
-                self.hover_t > 0.35,
-                self.vol_hud_active,
-            );
+            let next_zone = if self.config.locked {
+                hit_test_mode(
+                    &layout,
+                    local_x,
+                    local_y,
+                    self.hover_t > 0.35,
+                    self.vol_hud_active,
+                )
+            } else {
+                HitZone::None
+            };
             let mut changed = false;
             if (self.target_hover_t - 1.0).abs() > 0.01 {
                 self.target_hover_t = 1.0;
@@ -719,11 +767,12 @@ impl AppState {
             click_screen_x,
             self.dpi,
             self.light_taskbar,
-            self.fallback_accent,
+            self.backdrop_rgb,
             self.snapshot.sources.clone(),
             self.arbitrator.mode().clone(),
             self.active_id.clone(),
             self.config.locked,
+            self.config.auto_color,
             pill_overlap_px,
         );
         self.dirty = true;
@@ -836,6 +885,7 @@ unsafe extern "system" fn main_wnd_proc(
 
     if msg == WM_DESTROY {
         crate::system::unregister_taskbar_overlay(hwnd);
+        set_mediabar_shared_accent(None);
         let rc = Rc::from_raw(raw_ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         let _ = KillTimer(hwnd, TIMER_GUARD_ID);
@@ -877,7 +927,13 @@ unsafe extern "system" fn main_wnd_proc(
             if (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
                 let cursor = rc
                     .try_borrow()
-                    .map(|s| if s.is_dragging { s.grab_cursor } else { s.arrow_cursor })
+                    .map(|s| {
+                        if s.is_dragging || !s.config.locked {
+                            s.grab_cursor
+                        } else {
+                            s.arrow_cursor
+                        }
+                    })
                     .unwrap_or_else(|_| LoadCursorW(None, IDC_ARROW).unwrap_or_default());
                 SetCursor(cursor);
                 return LRESULT(1);
@@ -926,9 +982,27 @@ unsafe extern "system" fn main_wnd_proc(
         }
         WM_APP_SETTING_ACTION => {
             match wparam.0 {
+                SETTING_TOGGLE_AUTO_COLOR => {
+                    if let Ok(mut state) = rc.try_borrow_mut() {
+                        state.config.auto_color = !state.config.auto_color;
+                        state.save_config();
+                        state.sync_shared_accent();
+                        let auto_color = state.config.auto_color;
+                        state.popup.set_auto_color(auto_color);
+                        state.dirty = true;
+                        state.render_now();
+                    }
+                }
                 SETTING_TOGGLE_LOCK => {
                     if let Ok(mut state) = rc.try_borrow_mut() {
                         state.config.locked = !state.config.locked;
+                        if !state.config.locked {
+                            state.hover_zone = HitZone::None;
+                            state.pressed_zone = HitZone::None;
+                            if state.vol_hud_active {
+                                state.clear_vol_hud();
+                            }
+                        }
                         state.save_config();
                         state.dirty = true;
                         state.render_now();
@@ -969,10 +1043,10 @@ unsafe extern "system" fn main_wnd_proc(
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE | WM_DPICHANGED => {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 let light = is_light_taskbar();
-                let accent = system_accent_color();
                 state.light_taskbar = light;
-                state.fallback_accent = accent;
-                state.popup.set_system_theme(light, accent);
+                state.refresh_backdrop_sample();
+                let bg = state.backdrop_rgb;
+                state.popup.set_system_theme(light, bg);
                 state.dirty = true;
                 state.sync_taskbar_geometry(true);
                 if msg == WM_DPICHANGED {
@@ -994,9 +1068,10 @@ unsafe extern "system" fn main_wnd_proc(
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     let light = is_light_taskbar();
                     if light != state.light_taskbar {
-                        let accent = state.fallback_accent;
                         state.light_taskbar = light;
-                        state.popup.set_system_theme(light, accent);
+                        state.refresh_backdrop_sample();
+                        let bg = state.backdrop_rgb;
+                        state.popup.set_system_theme(light, bg);
                         state.dirty = true;
                     }
                     state.sync_taskbar_geometry(false);
@@ -1017,7 +1092,11 @@ unsafe extern "system" fn main_wnd_proc(
                     state.is_mouse_down = false;
                     state.is_dragging = false;
                     state.pressed_zone = HitZone::None;
-                    SetCursor(state.arrow_cursor);
+                    SetCursor(if state.config.locked {
+                        state.arrow_cursor
+                    } else {
+                        state.grab_cursor
+                    });
                     state.dirty = true;
                     state.render_now();
                 }
@@ -1048,8 +1127,7 @@ unsafe extern "system" fn main_wnd_proc(
                 }
 
                 if state.is_mouse_down {
-                    let ctrl_held = (GetKeyState(i32::from(VK_CONTROL.0)) as u16 & 0x8000) != 0;
-                    let can_drag = !state.config.locked || ctrl_held;
+                    let can_drag = !state.config.locked;
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let dx = pt.x - state.drag_start_screen_x;
@@ -1064,13 +1142,17 @@ unsafe extern "system" fn main_wnd_proc(
                 }
 
                 let layout = state.current_layout();
-                let next_zone = hit_test_mode(
-                    &layout,
-                    x,
-                    y,
-                    state.hover_t > 0.35,
-                    state.vol_hud_active,
-                );
+                let next_zone = if state.config.locked {
+                    hit_test_mode(
+                        &layout,
+                        x,
+                        y,
+                        state.hover_t > 0.35,
+                        state.vol_hud_active,
+                    )
+                } else {
+                    HitZone::None
+                };
                 let mut changed = false;
                 if (state.target_hover_t - 1.0).abs() > 0.01 {
                     state.target_hover_t = 1.0;
@@ -1107,6 +1189,19 @@ unsafe extern "system" fn main_wnd_proc(
         }
         WM_LBUTTONDOWN => {
             if let Ok(mut state) = rc.try_borrow_mut() {
+                if !state.config.locked {
+                    let mut pt = POINT::default();
+                    let _ = GetCursorPos(&mut pt);
+                    state.is_mouse_down = true;
+                    state.is_dragging = false;
+                    state.drag_start_screen_x = pt.x;
+                    state.drag_start_offset_x = state.config.offset_x;
+                    state.pressed_zone = HitZone::None;
+                    let _ = SetCapture(hwnd);
+                    SetCursor(state.grab_cursor);
+                    return LRESULT(0);
+                }
+
                 let x = ((lparam.0 & 0xFFFF) as i16) as f32;
                 let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
                 let layout = state.current_layout();
@@ -1180,11 +1275,15 @@ unsafe extern "system" fn main_wnd_proc(
                     state.pressed_zone = HitZone::None;
 
                     if was_dragging {
-                        SetCursor(state.arrow_cursor);
+                        SetCursor(if state.config.locked {
+                            state.arrow_cursor
+                        } else {
+                            state.grab_cursor
+                        });
                         state.save_config();
                         state.dirty = true;
                         state.render_now();
-                    } else {
+                    } else if state.config.locked {
                         let layout = state.current_layout();
                         let zone = hit_test_mode(
                             &layout,

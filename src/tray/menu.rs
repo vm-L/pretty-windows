@@ -2,10 +2,11 @@ use super::layout::{
     animated_tray_card_rect, compute_tray_cascading_placement, TrayMenuHover, TrayMenuItem,
     TrayMenuLayout,
 };
-use crate::color::{adjust_accent_for_theme, Rgb};
+use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::system::resolve_unified_accent;
 use crate::taskbar::TaskbarStyle;
 use crate::ui::glass::{
-    capture_blurred_desktop_bitmap, create_round_cap_stroke, create_text_format, d2d_rect,
+    capture_blurred_desktop_backdrop, create_round_cap_stroke, create_text_format, d2d_rect,
     danger_text_color, draw_divider, draw_geometry_rim, draw_glass_interior, draw_music_note_icon,
     draw_row_highlight, draw_text_in_rect, identity_matrix, primary_text_color, update_silk_bitmap,
     LayeredSurface,
@@ -75,7 +76,7 @@ struct TrayMenuInner {
     round_stroke: Option<ID2D1StrokeStyle>,
     dpi: u32,
     light_glass: bool,
-    fallback_accent: Rgb,
+    backdrop_rgb: Rgb,
     mediabar_visible: bool,
     monitorbar_visible: bool,
     taskbar_style: TaskbarStyle,
@@ -179,10 +180,10 @@ impl TrayMenu {
                 round_stroke,
                 dpi: 96,
                 light_glass: false,
-                fallback_accent: Rgb::new(0, 120, 212),
+                backdrop_rgb: NEUTRAL_BACKDROP_FALLBACK,
                 mediabar_visible: true,
                 monitorbar_visible: true,
-                taskbar_style: TaskbarStyle::Default,
+                taskbar_style: TaskbarStyle::default(),
                 autostart: false,
                 hover: None,
                 tracking_leave: false,
@@ -199,8 +200,8 @@ impl TrayMenu {
                 silk_bmp: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
                 flow_phase: 0.0,
-                halo_colors: [(0.35, 0.58, 0.90); 2],
-                ui_accent: (0.0, 120.0 / 255.0, 212.0 / 255.0),
+                halo_colors: [(0.76, 0.76, 0.78); 2],
+                ui_accent: (0.76, 0.76, 0.78),
                 halo_colors_ready: false,
                 last_flow_tick: Instant::now(),
                 last_silk_tick: None,
@@ -284,11 +285,9 @@ impl TrayMenu {
         }
     }
 
-    pub fn set_system_theme(&mut self, light_glass: bool, fallback_accent: Rgb) {
-        let changed = self.inner.light_glass != light_glass
-            || self.inner.fallback_accent != fallback_accent;
+    pub fn set_system_theme(&mut self, light_glass: bool, _fallback_accent: Rgb) {
+        let changed = self.inner.light_glass != light_glass;
         self.inner.light_glass = light_glass;
-        self.inner.fallback_accent = fallback_accent;
         if changed {
             self.inner.halo_colors_ready = false;
             self.inner.last_silk_tick = None;
@@ -304,7 +303,7 @@ impl TrayMenu {
         anchor_pt: POINT,
         dpi: u32,
         light_glass: bool,
-        fallback_accent: Rgb,
+        _fallback_accent: Rgb,
         mediabar_visible: bool,
         monitorbar_visible: bool,
         taskbar_style: TaskbarStyle,
@@ -312,7 +311,7 @@ impl TrayMenu {
     ) {
         self.inner.dpi = dpi.max(96);
         self.inner.light_glass = light_glass;
-        self.inner.fallback_accent = fallback_accent;
+        self.inner.backdrop_rgb = NEUTRAL_BACKDROP_FALLBACK;
         self.inner.mediabar_visible = mediabar_visible;
         self.inner.monitorbar_visible = monitorbar_visible;
         self.inner.taskbar_style = taskbar_style;
@@ -358,13 +357,17 @@ impl TrayMenu {
         self.inner.sub_open_left = sub_open_left;
         self.inner.open_down = open_down;
 
-        self.inner.backdrop_bmp = capture_blurred_desktop_bitmap(
+        let (bmp, sampled_bg) = capture_blurred_desktop_backdrop(
             &self.inner.rt,
             win_x,
             win_y,
             layout.win_w,
             layout.win_h,
         );
+        self.inner.backdrop_bmp = bmp;
+        if let Some(bg) = sampled_bg {
+            self.inner.backdrop_rgb = bg;
+        }
         self.inner.halo_colors_ready = false;
         self.inner.last_silk_tick = None;
         self.inner.last_color_tick = Instant::now();
@@ -554,11 +557,10 @@ impl TrayMenuInner {
             .clamp(0.001, 0.05);
         self.last_color_tick = now;
 
-        let base_dark = adjust_accent_for_theme(self.fallback_accent, false);
+        let (ui_rgb, base_dark) = resolve_unified_accent(self.backdrop_rgb, self.light_glass);
         let pair = compute_halo_pair(base_dark, self.light_glass);
         let target = [pair[0].to_normalized(), pair[1].to_normalized()];
-        let ui_target =
-            adjust_accent_for_theme(self.fallback_accent, self.light_glass).to_normalized();
+        let ui_target = ui_rgb.to_normalized();
 
         let was_ready = self.halo_colors_ready;
         if !was_ready {
@@ -974,8 +976,8 @@ impl TrayMenuInner {
                         }
 
                         let label = match item {
-                            TrayMenuItem::MediaBar => "MediaBar",
-                            TrayMenuItem::MonitorBar => "MonitorBar",
+                            TrayMenuItem::MediaBar => "媒体控制",
+                            TrayMenuItem::MonitorBar => "系统监控",
                             TrayMenuItem::TaskbarStyle => "任务栏风格",
                             TrayMenuItem::Autostart => "开机自启",
                             TrayMenuItem::Exit => "退出",

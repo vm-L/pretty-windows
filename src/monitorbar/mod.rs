@@ -1,5 +1,6 @@
 //! MonitorBar: right-aligned taskbar performance monitor widget with interactive controls.
 
+pub mod brightness;
 pub mod config;
 pub mod layout;
 pub mod metrics;
@@ -39,3 +40,5 @@ pub(crate) const WM_APP_MONITOR_RESET_POS: u32 = WM_APP + 45;
 pub(crate) const WM_APP_MONITOR_PICK_CUSTOM_APP: u32 = WM_APP + 46;
 #[cfg(windows)]
 pub(crate) const WM_APP_MONITOR_CLOSE_SELF: u32 = WM_APP + 47;
+#[cfg(windows)]
+pub(crate) const WM_APP_MONITOR_BRIGHTNESS_UPDATED: u32 = WM_APP + 48;

@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, HCURSOR, IDC_SIZEWE};
+use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
 
 /// Inputs required to render one frame of the MonitorBar layered window.
 pub struct MonitorRenderInput<'a> {
@@ -371,9 +371,9 @@ impl MonitorRenderer {
     pub fn commit_to_window(&self, hwnd: HWND, x: i32, y: i32) {
         self.surface.commit(hwnd, x, y);
     }
-}
 
-/// Returns the system horizontal resize/move cursor used while dragging MonitorBar along the taskbar.
-pub fn grabbing_cursor() -> HCURSOR {
-    unsafe { LoadCursorW(None, IDC_SIZEWE).unwrap_or_default() }
+    /// Creates a DPI-aware grabbing hand cursor for unlocked MonitorBar dragging.
+    pub fn create_grabbing_cursor(&self, dpi: u32) -> windows::core::Result<(HCURSOR, bool)> {
+        crate::ui::glass::create_grabbing_cursor(&self.rt, dpi)
+    }
 }

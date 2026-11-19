@@ -10,7 +10,7 @@ use crate::ui::glass::{
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use windows::core::{w, Interface};
-use windows::Win32::Foundation::{BOOL, HWND, RECT};
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
@@ -33,10 +33,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{CreateBitmap, DeleteObject};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, LoadCursorW, HCURSOR, ICONINFO, IDC_HAND,
-};
+use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
 
 /// Draws a dynamic Win11-style vector speaker icon showing mute `×`, 1 wave, or 2 waves based on volume.
 #[allow(clippy::too_many_arguments)]
@@ -194,137 +191,16 @@ pub unsafe fn draw_volume_slider(
     accent: Rgb,
     scale: f32,
 ) {
-    let rad = track.height() * 0.5;
-    let groove_col = if light_taskbar {
-        D2D1_COLOR_F {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.14,
-        }
-    } else {
-        D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.20,
-        }
-    };
-    let groove_rr = D2D1_ROUNDED_RECT {
-        rect: d2d_rect(track),
-        radiusX: rad,
-        radiusY: rad,
-    };
-    if let Ok(gb) = rt.CreateSolidColorBrush(&groove_col, None) {
-        rt.FillRoundedRectangle(&groove_rr, &gb);
-    }
-
-    let lv = level.clamp(0.0, 1.0);
-    let fill_w = track.width() * lv;
-    if fill_w > 0.5 {
-        let fill_rect = RectF::new(
-            track.left,
-            track.top,
-            (track.left + fill_w).min(track.right),
-            track.bottom,
-        );
-        let fill_rr = D2D1_ROUNDED_RECT {
-            rect: d2d_rect(fill_rect),
-            radiusX: rad,
-            radiusY: rad,
-        };
-        let fill_alpha = if muted { 0.36 } else { 0.96 };
-        if let Ok(fb) = rt.CreateSolidColorBrush(&d2d_color_rgb(accent, fill_alpha), None) {
-            rt.FillRoundedRectangle(&fill_rr, &fb);
-        }
-    }
-
-    let knob_x = track.left + fill_w;
-    let knob_y = (track.top + track.bottom) * 0.5;
-    let outer_r = if hovered_or_dragging {
-        6.2 * scale
-    } else {
-        5.0 * scale
-    };
-
-    // Subtle dark outer halo for crisp legibility on bright wallpapers or accents
-    let halo_col = D2D1_COLOR_F {
-        r: 0.0,
-        g: 0.0,
-        b: 0.0,
-        a: if light_taskbar { 0.18 } else { 0.26 },
-    };
-    if let Ok(hb) = rt.CreateSolidColorBrush(&halo_col, None) {
-        rt.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: D2D_POINT_2F {
-                    x: knob_x,
-                    y: knob_y,
-                },
-                radiusX: outer_r + 0.9 * scale,
-                radiusY: outer_r + 0.9 * scale,
-            },
-            &hb,
-        );
-    }
-
-    let knob_col = D2D1_COLOR_F {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: if muted { 0.86 } else { 0.99 },
-    };
-    if let Ok(kb) = rt.CreateSolidColorBrush(&knob_col, None) {
-        rt.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: D2D_POINT_2F {
-                    x: knob_x,
-                    y: knob_y,
-                },
-                radiusX: outer_r,
-                radiusY: outer_r,
-            },
-            &kb,
-        );
-    }
-
-    let inner_r = if hovered_or_dragging {
-        outer_r * 0.48
-    } else {
-        outer_r * 0.40
-    };
-    let core_col = if muted {
-        if light_taskbar {
-            D2D1_COLOR_F {
-                r: 0.48,
-                g: 0.48,
-                b: 0.52,
-                a: 0.90,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 0.62,
-                g: 0.64,
-                b: 0.68,
-                a: 0.92,
-            }
-        }
-    } else {
-        d2d_color_rgb(accent, 0.98)
-    };
-    if let Ok(cb) = rt.CreateSolidColorBrush(&core_col, None) {
-        rt.FillEllipse(
-            &D2D1_ELLIPSE {
-                point: D2D_POINT_2F {
-                    x: knob_x,
-                    y: knob_y,
-                },
-                radiusX: inner_r,
-                radiusY: inner_r,
-            },
-            &cb,
-        );
-    }
+    crate::ui::glass::draw_glass_slider(
+        rt,
+        track,
+        level,
+        muted,
+        hovered_or_dragging,
+        light_taskbar,
+        accent,
+        scale,
+    );
 }
 
 struct CachedText {
@@ -1837,183 +1713,6 @@ impl BarRenderer {
     /// Renders a DPI-aware anti-aliased grabbing hand cursor (`HCURSOR`) with dark outline and white fill.
     /// Returns `(cursor, is_owned_icon)` where `is_owned_icon` indicates `DestroyIcon` cleanup is required.
     pub fn create_grabbing_cursor(&self, dpi: u32) -> windows::core::Result<(HCURSOR, bool)> {
-        let scale = (dpi.max(96) as f32) / 96.0;
-        let size = ((24.0 * scale).round() as i32).clamp(24, 64);
-        let u = (size as f32) / 24.0;
-
-        let mut surf = LayeredSurface::new()?;
-        surf.ensure_size(size, size)?;
-        let bind_rect = RECT {
-            left: 0,
-            top: 0,
-            right: size,
-            bottom: size,
-        };
-
-        unsafe {
-            self.rt.BindDC(surf.dc(), &bind_rect)?;
-            self.rt.BeginDraw();
-            self.rt.Clear(Some(&D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            }));
-
-            let outline_col = D2D1_COLOR_F {
-                r: 0.06,
-                g: 0.06,
-                b: 0.08,
-                a: 0.94,
-            };
-            let fill_col = D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 1.0,
-            };
-
-            if let (Ok(outline_brush), Ok(fill_brush)) = (
-                self.rt.CreateSolidColorBrush(&outline_col, None),
-                self.rt.CreateSolidColorBrush(&fill_col, None),
-            ) {
-                let fingers: [(f32, f32, f32, f32); 4] = [
-                    (7.0, 5.8, 10.1, 12.2),
-                    (10.0, 4.7, 13.1, 12.2),
-                    (13.0, 5.1, 16.1, 12.2),
-                    (16.0, 6.4, 19.0, 12.6),
-                ];
-                let palm = (7.0f32, 9.6f32, 19.0f32, 19.4f32);
-                let thumb = (3.8f32, 10.6f32, 8.2f32, 16.4f32);
-                let pad = 1.15 * u;
-
-                // Dark outline pass
-                for &(l, t, r, b) in &fingers {
-                    self.rt.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: l * u - pad,
-                                top: t * u - pad,
-                                right: r * u + pad,
-                                bottom: b * u + pad,
-                            },
-                            radiusX: 1.55 * u + pad,
-                            radiusY: 1.55 * u + pad,
-                        },
-                        &outline_brush,
-                    );
-                }
-                self.rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: thumb.0 * u - pad,
-                            top: thumb.1 * u - pad,
-                            right: thumb.2 * u + pad,
-                            bottom: thumb.3 * u + pad,
-                        },
-                        radiusX: 2.0 * u + pad,
-                        radiusY: 2.0 * u + pad,
-                    },
-                    &outline_brush,
-                );
-                self.rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: palm.0 * u - pad,
-                            top: palm.1 * u - pad,
-                            right: palm.2 * u + pad,
-                            bottom: palm.3 * u + pad,
-                        },
-                        radiusX: 3.8 * u + pad,
-                        radiusY: 3.8 * u + pad,
-                    },
-                    &outline_brush,
-                );
-
-                // White fill pass
-                for &(l, t, r, b) in &fingers {
-                    self.rt.FillRoundedRectangle(
-                        &D2D1_ROUNDED_RECT {
-                            rect: D2D_RECT_F {
-                                left: l * u,
-                                top: t * u,
-                                right: r * u,
-                                bottom: b * u,
-                            },
-                            radiusX: 1.55 * u,
-                            radiusY: 1.55 * u,
-                        },
-                        &fill_brush,
-                    );
-                }
-                self.rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: thumb.0 * u,
-                            top: thumb.1 * u,
-                            right: thumb.2 * u,
-                            bottom: thumb.3 * u,
-                        },
-                        radiusX: 2.0 * u,
-                        radiusY: 2.0 * u,
-                    },
-                    &fill_brush,
-                );
-                self.rt.FillRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: palm.0 * u,
-                            top: palm.1 * u,
-                            right: palm.2 * u,
-                            bottom: palm.3 * u,
-                        },
-                        radiusX: 3.8 * u,
-                        radiusY: 3.8 * u,
-                    },
-                    &fill_brush,
-                );
-
-                // Subtle knuckle dividers
-                for x in [10.05f32, 13.05, 16.05] {
-                    self.rt.DrawLine(
-                        D2D_POINT_2F {
-                            x: x * u,
-                            y: 6.2 * u,
-                        },
-                        D2D_POINT_2F {
-                            x: x * u,
-                            y: 11.4 * u,
-                        },
-                        &outline_brush,
-                        0.95 * u,
-                        None,
-                    );
-                }
-            }
-
-            self.rt.EndDraw(None, None)?;
-
-            let row_words = (size as usize).div_ceil(16);
-            let mask_bytes = vec![0u8; row_words * 2 * (size as usize)];
-            let mask_bmp = CreateBitmap(size, size, 1, 1, Some(mask_bytes.as_ptr().cast()));
-            if mask_bmp.is_invalid() {
-                return Ok((LoadCursorW(None, IDC_HAND)?, false));
-            }
-
-            let info = ICONINFO {
-                fIcon: BOOL(0),
-                xHotspot: (size / 2) as u32,
-                yHotspot: (size / 2) as u32,
-                hbmMask: mask_bmp,
-                hbmColor: surf.bitmap_handle(),
-            };
-            let icon_res = CreateIconIndirect(&info);
-            let _ = DeleteObject(mask_bmp);
-
-            match icon_res {
-                Ok(hicon) if !hicon.is_invalid() => Ok((HCURSOR(hicon.0), true)),
-                _ => Ok((LoadCursorW(None, IDC_HAND)?, false)),
-            }
-        }
+        crate::ui::glass::create_grabbing_cursor(&self.rt, dpi)
     }
 }

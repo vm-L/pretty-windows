@@ -1,23 +1,24 @@
 //! MonitorBar Win32 window host, taskbar synchronization, drag/click interaction, and lifecycle management.
 
 use super::actions::{execute_left_click_non_menu, pick_custom_app_file};
+use super::brightness::BrightnessHandle;
 use super::config::{load_or_create, save_config, LeftClickAction, MonitorConfig};
 use super::layout::MonitorLayout;
 use super::metrics::MetricsHandle;
 use super::popup::MonitorPopup;
-use super::render::{grabbing_cursor, MonitorRenderInput, MonitorRenderer};
+use super::render::{MonitorRenderInput, MonitorRenderer};
 use super::taskbar::{
     compute_clamped_offset, compute_monitor_bar_rect, ensure_above_taskbar, is_fullscreen_active,
     query_taskbar_state, TaskbarState,
 };
 use super::wireless::WirelessHandle;
 use super::{
-    WM_APP_MONITOR_CLOSE_SELF, WM_APP_MONITOR_CONFIG_CHANGED, WM_APP_MONITOR_METRICS_UPDATED,
-    WM_APP_MONITOR_PICK_CUSTOM_APP, WM_APP_MONITOR_POPUP_CLOSED, WM_APP_MONITOR_RESET_POS,
-    WM_APP_MONITOR_TOGGLE_LOCK, WM_APP_MONITOR_WIRELESS_UPDATED,
+    WM_APP_MONITOR_BRIGHTNESS_UPDATED, WM_APP_MONITOR_CLOSE_SELF, WM_APP_MONITOR_CONFIG_CHANGED,
+    WM_APP_MONITOR_METRICS_UPDATED, WM_APP_MONITOR_PICK_CUSTOM_APP, WM_APP_MONITOR_POPUP_CLOSED,
+    WM_APP_MONITOR_RESET_POS, WM_APP_MONITOR_TOGGLE_LOCK, WM_APP_MONITOR_WIRELESS_UPDATED,
 };
-use crate::color::Rgb;
-use crate::system::{exclude_from_peek, is_light_taskbar, system_accent_color};
+use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::system::{exclude_from_peek, is_light_taskbar, resolve_unified_accent};
 use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -33,14 +34,13 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    VK_CONTROL,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW, IsIconic,
-    IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, GetCursorPos, GetWindowLongPtrW,
+    IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW,
     RegisterWindowMessageW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE,
+    CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HCURSOR, HICON, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE,
     SC_MINIMIZE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA, WM_CAPTURECHANGED, WM_CONTEXTMENU, WM_DESTROY,
     WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_RBUTTONDOWN,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW,
@@ -106,6 +106,7 @@ impl MonitorBarInstance {
 
             let metrics = MetricsHandle::start(hwnd, WM_APP_MONITOR_METRICS_UPDATED);
             let wireless = WirelessHandle::start(hwnd, WM_APP_MONITOR_WIRELESS_UPDATED);
+            let brightness = BrightnessHandle::start(hwnd, WM_APP_MONITOR_BRIGHTNESS_UPDATED);
             let renderer =
                 MonitorRenderer::new_with_factories(d2d_factory.clone(), dwrite_factory.clone())?;
             let popup = MonitorPopup::new(
@@ -113,11 +114,16 @@ impl MonitorBarInstance {
                 config_path.clone(),
                 Arc::clone(&cfg),
                 wireless.clone(),
+                brightness.clone(),
                 d2d_factory,
                 dwrite_factory,
             )?;
 
             let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+
+            let light_taskbar = is_light_taskbar();
+            let init_dpi = query_taskbar_state().map(|t| t.dpi).unwrap_or(96);
+            let (drag_cursor, drag_cursor_owned) = renderer.create_grabbing_cursor(init_dpi)?;
 
             let mut state = Box::new(AppState {
                 hwnd,
@@ -128,6 +134,7 @@ impl MonitorBarInstance {
                 cfg,
                 metrics,
                 wireless,
+                brightness,
                 renderer,
                 popup,
                 popup_closed_at: None,
@@ -135,9 +142,9 @@ impl MonitorBarInstance {
                 bar_y: 0,
                 bar_w: 222,
                 bar_h: 48,
-                dpi: 96,
-                light_taskbar: is_light_taskbar(),
-                accent: system_accent_color(),
+                dpi: init_dpi,
+                light_taskbar,
+                accent: resolve_unified_accent(NEUTRAL_BACKDROP_FALLBACK, light_taskbar).0,
                 hover_t: 0.0,
                 mouse_inside: false,
                 tracking_leave: false,
@@ -149,7 +156,8 @@ impl MonitorBarInstance {
                 press_offset_x: 0,
                 hidden_by_guard: false,
                 arrow_cursor,
-                drag_cursor: grabbing_cursor(),
+                drag_cursor,
+                drag_cursor_owned,
             });
 
             state.sync_taskbar_and_render(true);
@@ -191,6 +199,7 @@ struct AppState {
     cfg: Arc<Mutex<MonitorConfig>>,
     metrics: MetricsHandle,
     wireless: WirelessHandle,
+    brightness: BrightnessHandle,
     renderer: MonitorRenderer,
     popup: MonitorPopup,
     popup_closed_at: Option<Instant>,
@@ -213,6 +222,7 @@ struct AppState {
     hidden_by_guard: bool,
     arrow_cursor: HCURSOR,
     drag_cursor: HCURSOR,
+    drag_cursor_owned: bool,
 }
 
 impl AppState {
@@ -299,7 +309,7 @@ impl AppState {
         let (x, y, w, h) = compute_monitor_bar_rect(&tb, width_dip, cfg.offset_x);
 
         let light_now = is_light_taskbar();
-        let accent_now = system_accent_color();
+        let accent_now = resolve_unified_accent(NEUTRAL_BACKDROP_FALLBACK, light_now).0;
         let changed_geom = self.bar_x != x
             || self.bar_y != y
             || self.bar_w != w
@@ -406,10 +416,6 @@ impl AppState {
     }
 }
 
-fn is_ctrl_down() -> bool {
-    unsafe { (GetKeyState(i32::from(VK_CONTROL.0)) & (0x8000u16 as i16)) != 0 }
-}
-
 unsafe extern "system" fn monitor_bar_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -454,7 +460,7 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_SETCURSOR => {
             let cfg = state.cfg_snapshot();
-            let movable = state.dragging || (state.mouse_inside && (!cfg.locked || is_ctrl_down()));
+            let movable = state.dragging || !cfg.locked;
             let _ = SetCursor(if movable {
                 state.drag_cursor
             } else {
@@ -518,13 +524,16 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let cfg = state.cfg_snapshot();
-            let can_drag = !cfg.locked || is_ctrl_down();
+            let can_drag = !cfg.locked;
             state.lbutton_down = true;
             state.drag_pending = can_drag;
             state.dragging = false;
             state.press_cursor_x = pt.x;
             state.press_offset_x = cfg.offset_x;
             let _ = SetCapture(hwnd);
+            if can_drag {
+                let _ = SetCursor(state.drag_cursor);
+            }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
@@ -536,12 +545,12 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
             state.dragging = false;
             let _ = ReleaseCapture();
 
+            let cfg = state.cfg_snapshot();
             if was_dragging {
-                let cfg = state.cfg_snapshot();
                 state.save_current_cfg(&cfg);
                 state.ensure_hover_timer();
                 state.render_now();
-            } else if was_pressed {
+            } else if was_pressed && cfg.locked {
                 let mut pt = POINT::default();
                 let inside = GetCursorPos(&mut pt).is_ok()
                     && pt.x >= state.bar_x
@@ -570,6 +579,16 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_DPICHANGED | WM_SETTINGCHANGE => {
             state.sync_taskbar_and_render(true);
+            if msg == WM_DPICHANGED {
+                if let Ok((new_drag, new_owned)) = state.renderer.create_grabbing_cursor(state.dpi)
+                {
+                    if state.drag_cursor_owned && !state.drag_cursor.is_invalid() {
+                        let _ = DestroyIcon(HICON(state.drag_cursor.0));
+                    }
+                    state.drag_cursor = new_drag;
+                    state.drag_cursor_owned = new_owned;
+                }
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_METRICS_UPDATED => {
@@ -578,6 +597,10 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_APP_MONITOR_WIRELESS_UPDATED => {
             state.popup.update_wireless(state.wireless.snapshot());
+            LRESULT(0)
+        }
+        WM_APP_MONITOR_BRIGHTNESS_UPDATED => {
+            state.popup.update_brightness(state.brightness.snapshot());
             LRESULT(0)
         }
         WM_APP_MONITOR_POPUP_CLOSED => {
@@ -655,6 +678,10 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
             owned.popup.hide_immediately();
             owned.metrics.stop();
             owned.wireless.stop();
+            owned.brightness.stop();
+            if owned.drag_cursor_owned && !owned.drag_cursor.is_invalid() {
+                let _ = DestroyIcon(HICON(owned.drag_cursor.0));
+            }
             drop(owned);
             LRESULT(0)
         }

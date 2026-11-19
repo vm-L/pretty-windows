@@ -8,6 +8,8 @@ pub struct Config {
     pub enabled: bool,
     /// Whether the taskbar bar position is locked against accidental dragging.
     pub locked: bool,
+    /// Whether MediaBar extracts accent colors dynamically from active album artwork.
+    pub auto_color: bool,
     /// Horizontal offset in physical pixels relative to the default tray-left anchor.
     /// Negative values shift MediaBar further left; positive values shift right (clamped).
     pub offset_x: i32,
@@ -18,6 +20,7 @@ impl Default for Config {
         Self {
             enabled: true,
             locked: true,
+            auto_color: true,
             offset_x: 0,
         }
     }
@@ -48,6 +51,11 @@ impl Config {
                         cfg.locked = parsed;
                     }
                 }
+                "auto_color" => {
+                    if let Ok(parsed) = value.parse::<bool>() {
+                        cfg.auto_color = parsed;
+                    }
+                }
                 "offset_x" => {
                     if let Ok(parsed) = value.parse::<i32>() {
                         cfg.offset_x = parsed;
@@ -62,8 +70,8 @@ impl Config {
     /// Serializes configuration to human-readable TOML.
     pub fn serialize(&self) -> String {
         format!(
-            "# MediaBar 配置文件\nenabled = {}\nlocked = {}\noffset_x = {}\n",
-            self.enabled, self.locked, self.offset_x
+            "# MediaBar 配置文件\nenabled = {}\nlocked = {}\nauto_color = {}\noffset_x = {}\n",
+            self.enabled, self.locked, self.auto_color, self.offset_x
         )
     }
 
@@ -102,6 +110,7 @@ mod tests {
         let cfg = Config {
             enabled: false,
             locked: false,
+            auto_color: false,
             offset_x: -148,
         };
         let toml = cfg.serialize();
@@ -120,6 +129,7 @@ mod tests {
         let parsed = Config::parse(raw);
         assert!(parsed.enabled);
         assert!(parsed.locked);
+        assert!(parsed.auto_color);
         assert_eq!(parsed.offset_x, -24);
     }
 

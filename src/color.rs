@@ -1,3 +1,6 @@
+/// Neutral fallback base color when screen sampling is unavailable (never forces Win11 blue).
+pub const NEUTRAL_BACKDROP_FALLBACK: Rgb = Rgb::new(128, 128, 130);
+
 /// RGB color representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb {
@@ -241,6 +244,55 @@ pub fn extract_accent_from_bgra(
     }
 
     adjust_accent_for_theme(dominant, light_taskbar)
+}
+
+/// Computes the mean opaque RGB color of a BGRA8 image (used to sample popup/taskbar backdrops).
+pub fn extract_backdrop_base_rgb(bgra: &[u8], width: usize, height: usize) -> Option<Rgb> {
+    let total_pixels = width.checked_mul(height)?;
+    if total_pixels == 0 || bgra.len() < total_pixels * 4 {
+        return None;
+    }
+    let mut sum_r = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_b = 0u64;
+    let mut count = 0u64;
+    for px in bgra[..total_pixels * 4].chunks_exact(4) {
+        if px[3] >= 128 {
+            sum_b += u64::from(px[0]);
+            sum_g += u64::from(px[1]);
+            sum_r += u64::from(px[2]);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    Some(Rgb::new(
+        (sum_r / count).min(255) as u8,
+        (sum_g / count).min(255) as u8,
+        (sum_b / count).min(255) as u8,
+    ))
+}
+
+/// Derives a unified theme accent directly from a backdrop color by preserving its hue & natural
+/// saturation while lifting lightness for crisp legibility (never falling back to blue).
+pub fn derive_background_accent(bg: Rgb, light_glass: bool) -> Rgb {
+    let (h, s, l) = rgb_to_hsl(bg);
+    let max_c = bg.r.max(bg.g).max(bg.b);
+    let min_c = bg.r.min(bg.g).min(bg.b);
+    let chroma = f32::from(max_c - min_c) / 255.0;
+    let chroma_factor = ((chroma - 0.025) / 0.055).clamp(0.0, 1.0);
+    let s_out = if s < 0.04 || chroma_factor <= 0.0 {
+        0.0
+    } else {
+        (s * chroma_factor).min(0.72)
+    };
+    let target_l = if light_glass {
+        (l + 0.20).clamp(0.34, 0.48)
+    } else {
+        (l + 0.34).clamp(0.70, 0.86)
+    };
+    hsl_to_rgb(h, s_out, target_l)
 }
 
 /// Applies a fast 3-pass separable box blur (approximating Gaussian blur) on BGRA8 pixels.
@@ -489,5 +541,40 @@ mod tests {
         assert!(blurred[center] < 255 && blurred[center] > 0);
         let neighbor = (8 * w + 9) * 4;
         assert!(blurred[neighbor] > 0);
+    }
+
+    #[test]
+    fn background_accent_preserves_hue_lifts_lightness_and_never_turns_blue() {
+        // Dark emerald backdrop -> preserves green hue (~120-165), higher lightness, no blue drift
+        let dark_green = Rgb::new(22, 64, 42);
+        let (gh, gs, gl) = rgb_to_hsl(dark_green);
+        let derived_dark = derive_background_accent(dark_green, false);
+        let (dh, ds, dl) = rgb_to_hsl(derived_dark);
+        assert!((gh - dh).abs() <= 4.0, "hue drifted: {gh} -> {dh}");
+        assert!(ds <= gs + 0.02, "saturation unexpectedly boosted: {gs} -> {ds}");
+        assert!(dl > gl && dl >= 0.70, "expected lifted lightness: {gl} -> {dl}");
+
+        // Warm amber backdrop on light glass -> stays warm in readable light-glass range
+        let warm_amber = Rgb::new(110, 62, 24);
+        let (wh, ws, _) = rgb_to_hsl(warm_amber);
+        let derived_light = derive_background_accent(warm_amber, true);
+        let (lh, ls, ll) = rgb_to_hsl(derived_light);
+        assert!((wh - lh).abs() <= 4.0, "warm hue drifted: {wh} -> {lh}");
+        assert!(ls <= ws + 0.02);
+        assert!((0.34..=0.48).contains(&ll));
+
+        // Neutral gray/black/white backdrops stay neutral (zero saturation, never blue)
+        for gray in [Rgb::new(18, 18, 20), NEUTRAL_BACKDROP_FALLBACK, Rgb::new(245, 245, 247)] {
+            for light_glass in [false, true] {
+                let out = derive_background_accent(gray, light_glass);
+                let (_, s, _) = rgb_to_hsl(out);
+                assert!(s <= 0.06, "neutral bg {gray:?} became saturated {out:?} (s={s})");
+            }
+        }
+
+        // BGRA backdrop average extraction
+        let px = [20u8, 60, 100, 255, 40, 80, 120, 255];
+        assert_eq!(extract_backdrop_base_rgb(&px, 2, 1), Some(Rgb::new(110, 70, 30)));
+        assert_eq!(extract_backdrop_base_rgb(&[], 0, 0), None);
     }
 }

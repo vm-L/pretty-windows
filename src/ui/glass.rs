@@ -1,4 +1,4 @@
-use crate::color::{gaussian_blur_bgra, Rgb};
+use crate::color::{extract_backdrop_base_rgb, gaussian_blur_bgra, Rgb};
 use crate::ui::{
     sample_liquid_silk_field, RectF, DIVIDER_H_DIP, SILK_H, SILK_UPDATE_INTERVAL_MS, SILK_W,
 };
@@ -7,7 +7,7 @@ use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 use windows::core::w;
 use windows::Foundation::Numerics::Matrix3x2;
-use windows::Win32::Foundation::{HWND, POINT, SIZE};
+use windows::Win32::Foundation::{BOOL, HWND, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT,
     D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
@@ -23,16 +23,18 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
     DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-    DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
+    BitBlt, CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC,
+    ReleaseDC, SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    BLENDFUNCTION, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, SRCCOPY,
 };
-use windows::Win32::UI::WindowsAndMessaging::{UpdateLayeredWindow, ULW_ALPHA};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateIconIndirect, LoadCursorW, UpdateLayeredWindow, HCURSOR, ICONINFO, IDC_HAND, ULW_ALPHA,
+};
 
 /// Offscreen 32-bit premultiplied BGRA DIB surface that commits transparently via `UpdateLayeredWindow`.
 pub struct LayeredSurface {
@@ -323,27 +325,27 @@ pub fn create_text_format(
     }
 }
 
-/// Captures the desktop region directly behind a popup and applies soft frosted blur.
-pub fn capture_blurred_desktop_bitmap(
+/// Captures the desktop region directly behind a popup, returning both the frosted bitmap and its mean RGB.
+pub fn capture_blurred_desktop_backdrop(
     rt: &ID2D1DCRenderTarget,
     screen_x: i32,
     screen_y: i32,
     w: i32,
     h: i32,
-) -> Option<ID2D1Bitmap> {
+) -> (Option<ID2D1Bitmap>, Option<Rgb>) {
     if w <= 0 || h <= 0 {
-        return None;
+        return (None, None);
     }
 
     unsafe {
         let screen_dc = GetDC(None);
         if screen_dc.is_invalid() {
-            return None;
+            return (None, None);
         }
         let mem_dc = CreateCompatibleDC(screen_dc);
         if mem_dc.is_invalid() {
             let _ = ReleaseDC(None, screen_dc);
-            return None;
+            return (None, None);
         }
 
         let bmi = BITMAPINFO {
@@ -362,13 +364,13 @@ pub fn capture_blurred_desktop_bitmap(
         let Ok(bmp) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
             let _ = DeleteDC(mem_dc);
             let _ = ReleaseDC(None, screen_dc);
-            return None;
+            return (None, None);
         };
         let old = SelectObject(mem_dc, bmp);
         let _ = BitBlt(mem_dc, 0, 0, w, h, screen_dc, screen_x, screen_y, SRCCOPY);
         let _ = ReleaseDC(None, screen_dc);
 
-        let result = if !bits_ptr.is_null() {
+        let (result, mean_rgb) = if !bits_ptr.is_null() {
             let raw =
                 std::slice::from_raw_parts(bits_ptr.cast::<u8>(), (w as usize) * (h as usize) * 4);
             let dw = (w as usize / 4).max(1);
@@ -400,6 +402,7 @@ pub fn capture_blurred_desktop_bitmap(
                     down.push(255);
                 }
             }
+            let mean = extract_backdrop_base_rgb(&down, dw, dh);
             let blurred = gaussian_blur_bgra(&down, dw, dh, 6);
             let props = D2D1_BITMAP_PROPERTIES {
                 pixelFormat: D2D1_PIXEL_FORMAT {
@@ -409,16 +412,106 @@ pub fn capture_blurred_desktop_bitmap(
                 dpiX: 96.0,
                 dpiY: 96.0,
             };
-            rt.CreateBitmap(
-                D2D_SIZE_U {
-                    width: dw as u32,
-                    height: dh as u32,
-                },
-                Some(blurred.as_ptr().cast()),
-                (dw * 4) as u32,
-                &props,
-            )
-            .ok()
+            let bmp = rt
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: dw as u32,
+                        height: dh as u32,
+                    },
+                    Some(blurred.as_ptr().cast()),
+                    (dw * 4) as u32,
+                    &props,
+                )
+                .ok();
+            (bmp, mean)
+        } else {
+            (None, None)
+        };
+
+        let _ = SelectObject(mem_dc, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem_dc);
+        (result, mean_rgb)
+    }
+}
+
+/// Captures only the blurred desktop bitmap behind a popup (compatibility helper).
+#[allow(dead_code)]
+pub fn capture_blurred_desktop_bitmap(
+    rt: &ID2D1DCRenderTarget,
+    screen_x: i32,
+    screen_y: i32,
+    w: i32,
+    h: i32,
+) -> Option<ID2D1Bitmap> {
+    capture_blurred_desktop_backdrop(rt, screen_x, screen_y, w, h).0
+}
+
+/// Samples the mean opaque RGB color of a small screen region (e.g. taskbar background next to a widget).
+pub fn sample_screen_region_rgb(screen_x: i32, screen_y: i32, w: i32, h: i32) -> Option<Rgb> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let sw = w.clamp(1, 128);
+    let sh = h.clamp(1, 64);
+
+    unsafe {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
+            return None;
+        }
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_invalid() {
+            let _ = ReleaseDC(None, screen_dc);
+            return None;
+        }
+
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: sw,
+                biHeight: -sh,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits_ptr = null_mut();
+        let Ok(bmp) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
+            let _ = DeleteDC(mem_dc);
+            let _ = ReleaseDC(None, screen_dc);
+            return None;
+        };
+        let old = SelectObject(mem_dc, bmp);
+        let _ = BitBlt(mem_dc, 0, 0, sw, sh, screen_dc, screen_x, screen_y, SRCCOPY);
+        let _ = ReleaseDC(None, screen_dc);
+
+        let rgb = if !bits_ptr.is_null() {
+            let raw = std::slice::from_raw_parts(
+                bits_ptr.cast::<u8>(),
+                (sw as usize) * (sh as usize) * 4,
+            );
+            // Force alpha >= 255 in case desktop DC leaves zero alpha bytes.
+            let mut sum_r = 0u64;
+            let mut sum_g = 0u64;
+            let mut sum_b = 0u64;
+            let count = (sw as u64) * (sh as u64);
+            for px in raw.chunks_exact(4) {
+                sum_b += u64::from(px[0]);
+                sum_g += u64::from(px[1]);
+                sum_r += u64::from(px[2]);
+            }
+            if count > 0 {
+                Some(Rgb::new(
+                    (sum_r / count).min(255) as u8,
+                    (sum_g / count).min(255) as u8,
+                    (sum_b / count).min(255) as u8,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -426,7 +519,7 @@ pub fn capture_blurred_desktop_bitmap(
         let _ = SelectObject(mem_dc, old);
         let _ = DeleteObject(bmp);
         let _ = DeleteDC(mem_dc);
-        result
+        rgb
     }
 }
 
@@ -950,26 +1043,27 @@ pub unsafe fn draw_divider(
     }
 }
 
-/// Draws single-line clipped DirectWrite text inside `rect`.
-pub unsafe fn draw_text_in_rect(
+/// Draws single-line clipped DirectWrite text inside `rect` and returns the measured width (clamped to `rect.width()`).
+pub unsafe fn draw_text_in_rect_measured(
     dwrite_factory: &IDWriteFactory,
     rt: &ID2D1DCRenderTarget,
     text: &str,
     rect: RectF,
     fmt: &IDWriteTextFormat,
     color: D2D1_COLOR_F,
-) {
+) -> f32 {
     let wide: Vec<u16> = text.encode_utf16().collect();
+    let max_w = rect.width().max(1.0);
     let Ok(layout) = dwrite_factory.CreateTextLayout(
         &wide,
         fmt,
-        rect.width().max(1.0),
+        max_w,
         rect.height().max(12.0),
     ) else {
-        return;
+        return 0.0;
     };
     let Ok(brush) = rt.CreateSolidColorBrush(&color, None) else {
-        return;
+        return 0.0;
     };
     rt.DrawTextLayout(
         D2D_POINT_2F {
@@ -980,6 +1074,169 @@ pub unsafe fn draw_text_in_rect(
         &brush,
         D2D1_DRAW_TEXT_OPTIONS_CLIP,
     );
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    if layout.GetMetrics(&mut metrics).is_ok() {
+        metrics.width.min(max_w).max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Draws single-line clipped DirectWrite text inside `rect`.
+pub unsafe fn draw_text_in_rect(
+    dwrite_factory: &IDWriteFactory,
+    rt: &ID2D1DCRenderTarget,
+    text: &str,
+    rect: RectF,
+    fmt: &IDWriteTextFormat,
+    color: D2D1_COLOR_F,
+) {
+    let _ = draw_text_in_rect_measured(dwrite_factory, rt, text, rect, fmt, color);
+}
+
+/// Draws a sleek rounded Liquid Glass slider track, accent fill, and responsive circular thumb knob.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn draw_glass_slider(
+    rt: &ID2D1DCRenderTarget,
+    track: RectF,
+    level: f32,
+    dimmed: bool,
+    hovered_or_dragging: bool,
+    light_glass: bool,
+    accent: Rgb,
+    scale: f32,
+) {
+    let rad = track.height() * 0.5;
+    let groove_col = if light_glass {
+        D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.14,
+        }
+    } else {
+        D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.20,
+        }
+    };
+    let groove_rr = D2D1_ROUNDED_RECT {
+        rect: d2d_rect(track),
+        radiusX: rad,
+        radiusY: rad,
+    };
+    if let Ok(gb) = rt.CreateSolidColorBrush(&groove_col, None) {
+        rt.FillRoundedRectangle(&groove_rr, &gb);
+    }
+
+    let lv = level.clamp(0.0, 1.0);
+    let fill_w = track.width() * lv;
+    if fill_w > 0.5 {
+        let fill_rect = RectF::new(
+            track.left,
+            track.top,
+            (track.left + fill_w).min(track.right),
+            track.bottom,
+        );
+        let fill_rr = D2D1_ROUNDED_RECT {
+            rect: d2d_rect(fill_rect),
+            radiusX: rad,
+            radiusY: rad,
+        };
+        let fill_alpha = if dimmed { 0.36 } else { 0.96 };
+        if let Ok(fb) = rt.CreateSolidColorBrush(&d2d_color_rgb(accent, fill_alpha), None) {
+            rt.FillRoundedRectangle(&fill_rr, &fb);
+        }
+    }
+
+    let knob_x = track.left + fill_w;
+    let knob_y = (track.top + track.bottom) * 0.5;
+    let outer_r = if hovered_or_dragging {
+        6.2 * scale
+    } else {
+        5.0 * scale
+    };
+
+    // Subtle dark outer halo for crisp legibility on bright wallpapers or accents
+    let halo_col = D2D1_COLOR_F {
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+        a: if light_glass { 0.18 } else { 0.26 },
+    };
+    if let Ok(hb) = rt.CreateSolidColorBrush(&halo_col, None) {
+        rt.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F {
+                    x: knob_x,
+                    y: knob_y,
+                },
+                radiusX: outer_r + 0.9 * scale,
+                radiusY: outer_r + 0.9 * scale,
+            },
+            &hb,
+        );
+    }
+
+    let knob_col = D2D1_COLOR_F {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: if dimmed { 0.86 } else { 0.99 },
+    };
+    if let Ok(kb) = rt.CreateSolidColorBrush(&knob_col, None) {
+        rt.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F {
+                    x: knob_x,
+                    y: knob_y,
+                },
+                radiusX: outer_r,
+                radiusY: outer_r,
+            },
+            &kb,
+        );
+    }
+
+    let inner_r = if hovered_or_dragging {
+        outer_r * 0.48
+    } else {
+        outer_r * 0.40
+    };
+    let core_col = if dimmed {
+        if light_glass {
+            D2D1_COLOR_F {
+                r: 0.48,
+                g: 0.48,
+                b: 0.52,
+                a: 0.90,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 0.62,
+                g: 0.64,
+                b: 0.68,
+                a: 0.92,
+            }
+        }
+    } else {
+        d2d_color_rgb(accent, 0.98)
+    };
+    if let Ok(cb) = rt.CreateSolidColorBrush(&core_col, None) {
+        rt.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F {
+                    x: knob_x,
+                    y: knob_y,
+                },
+                radiusX: inner_r,
+                radiusY: inner_r,
+            },
+            &cb,
+        );
+    }
 }
 
 /// Draws compact beamed eighth-notes vector icon centered at `(cx, cy)`.
@@ -1038,17 +1295,307 @@ pub unsafe fn draw_music_note_icon(
         1.3 * s,
         None,
     );
-    rt.DrawLine(
-        D2D_POINT_2F {
-            x: cx - 1.5 * s,
-            y: cy - 4.2 * s,
-        },
-        D2D_POINT_2F {
-            x: cx + 4.7 * s,
-            y: cy - 5.2 * s,
+    self_line(rt, cx - 1.5 * s, cy - 4.2 * s, cx + 4.7 * s, cy - 5.2 * s, brush, 1.8 * s);
+}
+
+#[inline]
+unsafe fn self_line(
+    rt: &ID2D1DCRenderTarget,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    brush: &ID2D1SolidColorBrush,
+    stroke_w: f32,
+) {
+    rt.DrawLine(D2D_POINT_2F { x: x0, y: y0 }, D2D_POINT_2F { x: x1, y: y1 }, brush, stroke_w, None);
+}
+
+/// Draws the dual horizontal slider-bars "设置" vector icon centered at `(cx, cy)`.
+pub unsafe fn draw_settings_icon(
+    rt: &ID2D1DCRenderTarget,
+    cx: f32,
+    cy: f32,
+    s: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    self_line(rt, cx - 5.2 * s, cy - 2.6 * s, cx + 5.2 * s, cy - 2.6 * s, brush, 1.3 * s);
+    rt.FillEllipse(
+        &D2D1_ELLIPSE {
+            point: D2D_POINT_2F {
+                x: cx - 1.6 * s,
+                y: cy - 2.6 * s,
+            },
+            radiusX: 2.0 * s,
+            radiusY: 2.0 * s,
         },
         brush,
-        1.8 * s,
-        None,
     );
+    self_line(rt, cx - 5.2 * s, cy + 2.6 * s, cx + 5.2 * s, cy + 2.6 * s, brush, 1.3 * s);
+    rt.FillEllipse(
+        &D2D1_ELLIPSE {
+            point: D2D_POINT_2F {
+                x: cx + 1.8 * s,
+                y: cy + 2.6 * s,
+            },
+            radiusX: 2.0 * s,
+            radiusY: 2.0 * s,
+        },
+        brush,
+    );
+}
+
+/// Draws a Win11-style Liquid Glass pill toggle switch aligned right at `right_x` vertically centered at `cy`.
+pub unsafe fn draw_pill_switch(
+    rt: &ID2D1DCRenderTarget,
+    right_x: f32,
+    cy: f32,
+    on: bool,
+    accent: Rgb,
+    s: f32,
+    light_glass: bool,
+) {
+    let w = 28.0 * s;
+    let h = 15.0 * s;
+    let left = right_x - w;
+    let top = cy - h * 0.5;
+    let rr = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left,
+            top,
+            right: right_x,
+            bottom: top + h,
+        },
+        radiusX: h * 0.5,
+        radiusY: h * 0.5,
+    };
+    let track_col = if on {
+        d2d_color_rgb(accent, 0.92)
+    } else if light_glass {
+        D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.18,
+        }
+    } else {
+        D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.22,
+        }
+    };
+    if let Ok(tb) = rt.CreateSolidColorBrush(&track_col, None) {
+        rt.FillRoundedRectangle(&rr, &tb);
+    }
+
+    let thumb_r = 5.0 * s;
+    let knob_x = if on {
+        right_x - 2.5 * s - thumb_r
+    } else {
+        left + 2.5 * s + thumb_r
+    };
+    let accent_luma =
+        (0.2126 * f32::from(accent.r) + 0.7152 * f32::from(accent.g) + 0.0722 * f32::from(accent.b))
+            / 255.0;
+    let knob_col = if on && accent_luma > 0.62 {
+        D2D1_COLOR_F {
+            r: 0.09,
+            g: 0.10,
+            b: 0.12,
+            a: 0.92,
+        }
+    } else {
+        D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 0.96,
+        }
+    };
+    if let Ok(kb) = rt.CreateSolidColorBrush(&knob_col, None) {
+        rt.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: knob_x, y: cy },
+                radiusX: thumb_r,
+                radiusY: thumb_r,
+            },
+            &kb,
+        );
+    }
+}
+
+/// Renders a DPI-aware anti-aliased grabbing hand cursor (`HCURSOR`) with dark outline and white fill.
+/// Returns `(cursor, is_owned_icon)` where `is_owned_icon` indicates `DestroyIcon` cleanup is required.
+pub fn create_grabbing_cursor(
+    rt: &ID2D1DCRenderTarget,
+    dpi: u32,
+) -> windows::core::Result<(HCURSOR, bool)> {
+    let scale = (dpi.max(96) as f32) / 96.0;
+    let size = ((24.0 * scale).round() as i32).clamp(24, 64);
+    let u = (size as f32) / 24.0;
+
+    let mut surf = LayeredSurface::new()?;
+    surf.ensure_size(size, size)?;
+    let bind_rect = RECT {
+        left: 0,
+        top: 0,
+        right: size,
+        bottom: size,
+    };
+
+    unsafe {
+        rt.BindDC(surf.dc(), &bind_rect)?;
+        rt.BeginDraw();
+        rt.Clear(Some(&D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }));
+
+        let outline_col = D2D1_COLOR_F {
+            r: 0.06,
+            g: 0.06,
+            b: 0.08,
+            a: 0.94,
+        };
+        let fill_col = D2D1_COLOR_F {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        };
+
+        if let (Ok(outline_brush), Ok(fill_brush)) = (
+            rt.CreateSolidColorBrush(&outline_col, None),
+            rt.CreateSolidColorBrush(&fill_col, None),
+        ) {
+            let fingers: [(f32, f32, f32, f32); 4] = [
+                (7.0, 5.8, 10.1, 12.2),
+                (10.0, 4.7, 13.1, 12.2),
+                (13.0, 5.1, 16.1, 12.2),
+                (16.0, 6.4, 19.0, 12.6),
+            ];
+            let palm = (7.0f32, 9.6f32, 19.0f32, 19.4f32);
+            let thumb = (3.8f32, 10.6f32, 8.2f32, 16.4f32);
+            let pad = 1.15 * u;
+
+            // Dark outline pass
+            for &(l, t, r, b) in &fingers {
+                rt.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: l * u - pad,
+                            top: t * u - pad,
+                            right: r * u + pad,
+                            bottom: b * u + pad,
+                        },
+                        radiusX: 1.55 * u + pad,
+                        radiusY: 1.55 * u + pad,
+                    },
+                    &outline_brush,
+                );
+            }
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: thumb.0 * u - pad,
+                        top: thumb.1 * u - pad,
+                        right: thumb.2 * u + pad,
+                        bottom: thumb.3 * u + pad,
+                    },
+                    radiusX: 2.0 * u + pad,
+                    radiusY: 2.0 * u + pad,
+                },
+                &outline_brush,
+            );
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: palm.0 * u - pad,
+                        top: palm.1 * u - pad,
+                        right: palm.2 * u + pad,
+                        bottom: palm.3 * u + pad,
+                    },
+                    radiusX: 3.8 * u + pad,
+                    radiusY: 3.8 * u + pad,
+                },
+                &outline_brush,
+            );
+
+            // White fill pass
+            for &(l, t, r, b) in &fingers {
+                rt.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: l * u,
+                            top: t * u,
+                            right: r * u,
+                            bottom: b * u,
+                        },
+                        radiusX: 1.55 * u,
+                        radiusY: 1.55 * u,
+                    },
+                    &fill_brush,
+                );
+            }
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: thumb.0 * u,
+                        top: thumb.1 * u,
+                        right: thumb.2 * u,
+                        bottom: thumb.3 * u,
+                    },
+                    radiusX: 2.0 * u,
+                    radiusY: 2.0 * u,
+                },
+                &fill_brush,
+            );
+            rt.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: palm.0 * u,
+                        top: palm.1 * u,
+                        right: palm.2 * u,
+                        bottom: palm.3 * u,
+                    },
+                    radiusX: 3.8 * u,
+                    radiusY: 3.8 * u,
+                },
+                &fill_brush,
+            );
+
+            // Subtle knuckle dividers
+            for x in [10.05f32, 13.05, 16.05] {
+                self_line(rt, x * u, 6.2 * u, x * u, 11.4 * u, &outline_brush, 0.95 * u);
+            }
+        }
+
+        rt.EndDraw(None, None)?;
+
+        let row_words = (size as usize).div_ceil(16);
+        let mask_bytes = vec![0u8; row_words * 2 * (size as usize)];
+        let mask_bmp = CreateBitmap(size, size, 1, 1, Some(mask_bytes.as_ptr().cast()));
+        if mask_bmp.is_invalid() {
+            return Ok((LoadCursorW(None, IDC_HAND)?, false));
+        }
+
+        let info = ICONINFO {
+            fIcon: BOOL(0),
+            xHotspot: (size / 2) as u32,
+            yHotspot: (size / 2) as u32,
+            hbmMask: mask_bmp,
+            hbmColor: surf.bitmap_handle(),
+        };
+        let icon_res = CreateIconIndirect(&info);
+        let _ = DeleteObject(mask_bmp);
+
+        match icon_res {
+            Ok(hicon) if !hicon.is_invalid() => Ok((HCURSOR(hicon.0), true)),
+            _ => Ok((LoadCursorW(None, IDC_HAND)?, false)),
+        }
+    }
 }

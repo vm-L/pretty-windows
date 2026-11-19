@@ -9,12 +9,12 @@ use super::volume::{
     enumerate_app_volumes, format_volume_pct, slider_ratio_from_x, step_volume_by_wheel,
     AppVolumeEntry, MasterVolumeControl,
 };
-use crate::color::{adjust_accent_for_theme, Rgb};
+use crate::color::{derive_background_accent, Rgb, NEUTRAL_BACKDROP_FALLBACK};
 use crate::ui::glass::{
-    capture_blurred_desktop_bitmap, create_round_cap_stroke, create_text_format, d2d_color_rgb,
+    capture_blurred_desktop_backdrop, create_round_cap_stroke, create_text_format, d2d_color_rgb,
     d2d_rect, danger_text_color, draw_divider, draw_glass_interior, draw_music_note_icon,
-    draw_row_highlight, draw_text_in_rect, identity_matrix, muted_text_color, primary_text_color,
-    update_silk_bitmap, LayeredSurface,
+    draw_row_highlight, draw_settings_icon, draw_text_in_rect, identity_matrix, muted_text_color,
+    primary_text_color, update_silk_bitmap, LayeredSurface,
 };
 use crate::ui::{
     compute_halo_pair, ease_out_cubic, ease_retract, row_stagger_dy, window_master_alpha,
@@ -70,6 +70,7 @@ pub const WM_APP_AUDIO_OUTPUT_CHANGED: u32 = WM_APP + 5;
 pub const SETTING_TOGGLE_LOCK: usize = 1;
 pub const SETTING_RESET_POS: usize = 2;
 pub const SETTING_CLOSE: usize = 3;
+pub const SETTING_TOGGLE_AUTO_COLOR: usize = 4;
 
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const POPUP_CLASS_NAME: windows::core::PCWSTR = w!("MediaBarSourcePopupWnd");
@@ -141,6 +142,7 @@ enum HoverTarget {
     SubVolAppRow(usize),
     SubPlayback(usize),
     SubRecording(usize),
+    SubSettingAutoColor,
     SubSettingLock,
     SubSettingResetPos,
     SubSettingClose,
@@ -193,7 +195,7 @@ struct PopupInner {
     thumb_layer: ID2D1Layer,
     round_stroke: Option<ID2D1StrokeStyle>,
     dpi: u32,
-    fallback_accent: Rgb,
+    backdrop_rgb: Rgb,
     sources: Vec<SourceItem>,
     mode: SelectionMode,
     active_id: Option<String>,
@@ -205,6 +207,7 @@ struct PopupInner {
     playback_devices: Vec<AudioEndpointItem>,
     recording_devices: Vec<AudioEndpointItem>,
     locked: bool,
+    auto_color: bool,
     active_category: Option<PrimaryCategory>,
     hover_target: HoverTarget,
     open_left: bool,
@@ -307,7 +310,7 @@ impl SourcePopup {
                 thumb_layer,
                 round_stroke,
                 dpi: 96,
-                fallback_accent: Rgb::new(0, 120, 212),
+                backdrop_rgb: NEUTRAL_BACKDROP_FALLBACK,
                 sources: Vec::new(),
                 mode: SelectionMode::Auto,
                 active_id: None,
@@ -319,6 +322,7 @@ impl SourcePopup {
                 playback_devices: Vec::new(),
                 recording_devices: Vec::new(),
                 locked: true,
+                auto_color: true,
                 active_category: None,
                 hover_target: HoverTarget::None,
                 open_left: false,
@@ -333,8 +337,8 @@ impl SourcePopup {
                 silk_bmp: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
                 flow_phase: 0.0,
-                halo_colors: [(0.35, 0.58, 0.90); 2],
-                ui_accent: (0.0, 120.0 / 255.0, 212.0 / 255.0),
+                halo_colors: [(0.76, 0.76, 0.78); 2],
+                ui_accent: (0.76, 0.76, 0.78),
                 halo_colors_ready: false,
                 last_flow_tick: Instant::now(),
                 last_silk_tick: None,
@@ -435,12 +439,23 @@ impl SourcePopup {
         }
     }
 
-    pub fn set_system_theme(&mut self, light_taskbar: bool, fallback_accent: Rgb) {
+    pub fn set_system_theme(&mut self, light_taskbar: bool, backdrop_rgb: Rgb) {
         let changed = self.inner.light_glass != light_taskbar
-            || self.inner.fallback_accent != fallback_accent;
+            || self.inner.backdrop_rgb != backdrop_rgb;
         self.inner.light_glass = light_taskbar;
-        self.inner.fallback_accent = fallback_accent;
+        self.inner.backdrop_rgb = backdrop_rgb;
         if changed {
+            self.inner.halo_colors_ready = false;
+            self.inner.last_silk_tick = None;
+            if self.is_visible() {
+                let _ = self.inner.render();
+            }
+        }
+    }
+
+    pub fn set_auto_color(&mut self, auto_color: bool) {
+        if self.inner.auto_color != auto_color {
+            self.inner.auto_color = auto_color;
             self.inner.halo_colors_ready = false;
             self.inner.last_silk_tick = None;
             if self.is_visible() {
@@ -456,20 +471,22 @@ impl SourcePopup {
         click_screen_x: i32,
         dpi: u32,
         light_taskbar: bool,
-        fallback_accent: Rgb,
+        fallback_backdrop_rgb: Rgb,
         sources: Vec<SourceItem>,
         mode: SelectionMode,
         active_id: Option<String>,
         locked: bool,
+        auto_color: bool,
         pill_overlap_px: i32,
     ) {
         self.inner.dpi = dpi.max(96);
         self.inner.light_glass = light_taskbar;
-        self.inner.fallback_accent = fallback_accent;
+        self.inner.backdrop_rgb = fallback_backdrop_rgb;
         self.inner.sources = sources;
         self.inner.mode = mode;
         self.inner.active_id = active_id;
         self.inner.locked = locked;
+        self.inner.auto_color = auto_color;
         self.inner.pill_overlap_px = pill_overlap_px.max(0);
         self.inner.playback_devices = enumerate_audio_endpoints(false);
         self.inner.recording_devices = enumerate_audio_endpoints(true);
@@ -551,8 +568,12 @@ impl SourcePopup {
         self.inner.win_w = win_w;
         self.inner.win_h = win_h;
 
-        self.inner.backdrop_bmp =
-            capture_blurred_desktop_bitmap(&self.inner.rt, win_x, win_y, win_w, win_h);
+        let (bmp, sampled_bg) =
+            capture_blurred_desktop_backdrop(&self.inner.rt, win_x, win_y, win_w, win_h);
+        self.inner.backdrop_bmp = bmp;
+        if let Some(bg) = sampled_bg {
+            self.inner.backdrop_rgb = bg;
+        }
         self.inner.halo_colors_ready = false;
         self.inner.last_silk_tick = None;
         self.inner.last_color_tick = Instant::now();
@@ -893,7 +914,7 @@ impl PopupInner {
                 INNER_PAD_DIP * 2.0 + rows_h
             }
             PrimaryCategory::Settings => {
-                INNER_PAD_DIP * 2.0 + SETTING_ROW_H_DIP * 3.0 + ROW_GAP_DIP + DIVIDER_H_DIP
+                INNER_PAD_DIP * 2.0 + SETTING_ROW_H_DIP * 4.0 + ROW_GAP_DIP * 2.0 + DIVIDER_H_DIP
             }
         };
         (w_dip * s, h_dip * s)
@@ -1113,7 +1134,7 @@ impl PopupInner {
         rects
     }
 
-    fn settings_row_rects(&self, card: RectF) -> [RectF; 3] {
+    fn settings_row_rects(&self, card: RectF) -> [RectF; 4] {
         let s = self.scale();
         let pad = INNER_PAD_DIP * s;
         let x0 = card.left + pad;
@@ -1122,12 +1143,14 @@ impl PopupInner {
         let gap = ROW_GAP_DIP * s;
         let mut y = card.top + pad;
 
+        let r_auto_color = RectF::new(x0, y, x1, y + rh);
+        y += rh + gap;
         let r_lock = RectF::new(x0, y, x1, y + rh);
         y += rh + gap;
         let r_reset = RectF::new(x0, y, x1, y + rh);
         y = r_reset.bottom + DIVIDER_H_DIP * s;
         let r_close = RectF::new(x0, y, x1, y + rh);
-        [r_lock, r_reset, r_close]
+        [r_auto_color, r_lock, r_reset, r_close]
     }
 
     fn point_inside_cards(&self, x: f32, y: f32) -> bool {
@@ -1310,8 +1333,11 @@ impl PopupInner {
                             .unwrap_or(HoverTarget::None)
                     }
                     PrimaryCategory::Settings => {
-                        let [r_lock, r_reset, r_close] = self.settings_row_rects(sub_rect);
-                        if r_lock.contains(x, y) {
+                        let [r_auto_color, r_lock, r_reset, r_close] =
+                            self.settings_row_rects(sub_rect);
+                        if r_auto_color.contains(x, y) {
+                            HoverTarget::SubSettingAutoColor
+                        } else if r_lock.contains(x, y) {
                             HoverTarget::SubSettingLock
                         } else if r_reset.contains(x, y) {
                             HoverTarget::SubSettingResetPos
@@ -1422,20 +1448,30 @@ impl PopupInner {
             .clamp(0.001, 0.05);
         self.last_color_tick = now;
 
-        let cover = self
-            .active_id
-            .as_ref()
-            .and_then(|aid| self.sources.iter().find(|src| &src.id == aid))
-            .and_then(|src| src.cover.as_deref())
-            .or_else(|| self.sources.iter().find_map(|src| src.cover.as_deref()));
-        let pair = compute_cover_halo_pair(cover, self.fallback_accent, self.light_glass);
+        let bg_dark = derive_background_accent(self.backdrop_rgb, false);
+        let bg_ui = derive_background_accent(self.backdrop_rgb, self.light_glass);
+        let pair = if self.auto_color {
+            let cover = self
+                .active_id
+                .as_ref()
+                .and_then(|aid| self.sources.iter().find(|src| &src.id == aid))
+                .and_then(|src| src.cover.as_deref())
+                .or_else(|| self.sources.iter().find_map(|src| src.cover.as_deref()));
+            compute_cover_halo_pair(cover, bg_dark, self.light_glass)
+        } else {
+            compute_halo_pair(bg_dark, self.light_glass)
+        };
         let target = [pair[0].to_normalized(), pair[1].to_normalized()];
-        let ui_target = resolve_dynamic_menu_accent(
-            &self.sources,
-            self.active_id.as_deref(),
-            self.fallback_accent,
-            self.light_glass,
-        )
+        let ui_target = if self.auto_color {
+            resolve_dynamic_menu_accent(
+                &self.sources,
+                self.active_id.as_deref(),
+                bg_ui,
+                self.light_glass,
+            )
+        } else {
+            bg_ui
+        }
         .to_normalized();
 
         let was_ready = self.halo_colors_ready;
@@ -2922,55 +2958,7 @@ impl PopupInner {
                 );
             }
             PrimaryCategory::Settings => {
-                // Two clean horizontal slider bars with thumb circles
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx - 5.2 * s,
-                        y: cy - 2.6 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx + 5.2 * s,
-                        y: cy - 2.6 * s,
-                    },
-                    brush,
-                    1.3 * s,
-                    None,
-                );
-                self.rt.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F {
-                            x: cx - 1.6 * s,
-                            y: cy - 2.6 * s,
-                        },
-                        radiusX: 2.0 * s,
-                        radiusY: 2.0 * s,
-                    },
-                    brush,
-                );
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx - 5.2 * s,
-                        y: cy + 2.6 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx + 5.2 * s,
-                        y: cy + 2.6 * s,
-                    },
-                    brush,
-                    1.3 * s,
-                    None,
-                );
-                self.rt.FillEllipse(
-                    &D2D1_ELLIPSE {
-                        point: D2D_POINT_2F {
-                            x: cx + 1.8 * s,
-                            y: cy + 2.6 * s,
-                        },
-                        radiusX: 2.0 * s,
-                        radiusY: 2.0 * s,
-                    },
-                    brush,
-                );
+                draw_settings_icon(&self.rt, cx, cy, s, brush);
             }
         }
     }
@@ -3068,17 +3056,20 @@ impl PopupInner {
         for (idx, (src, row_rect)) in self.sources.iter().zip(source_rects.iter()).enumerate() {
             let hovered = self.hover_target == HoverTarget::SubSource(idx);
             let selected = matches!(self.mode, SelectionMode::Manual(ref id) if id == &src.id);
-            let row_accent = src
-                .cover
-                .as_ref()
-                .map(|c| {
-                    if self.light_glass {
-                        c.accent_light
-                    } else {
-                        c.accent_dark
-                    }
-                })
-                .unwrap_or(auto_accent);
+            let row_accent = if self.auto_color {
+                src.cover
+                    .as_ref()
+                    .map(|c| {
+                        if self.light_glass {
+                            c.accent_light
+                        } else {
+                            c.accent_dark
+                        }
+                    })
+                    .unwrap_or(auto_accent)
+            } else {
+                auto_accent
+            };
             draw_row_highlight(
                 &self.rt,
                 *row_rect,
@@ -3088,7 +3079,16 @@ impl PopupInner {
                 s,
                 self.light_glass,
             );
-            self.draw_source_row(*row_rect, src, selected, title_fmt, sub_fmt, badge_fmt, s);
+            self.draw_source_row(
+                *row_rect,
+                src,
+                selected,
+                auto_accent,
+                title_fmt,
+                sub_fmt,
+                badge_fmt,
+                s,
+            );
         }
     }
 
@@ -3409,7 +3409,24 @@ impl PopupInner {
         title_fmt: &IDWriteTextFormat,
         s: f32,
     ) {
-        let [r_lock, r_reset, r_close] = self.settings_row_rects(card);
+        let [r_auto_color, r_lock, r_reset, r_close] = self.settings_row_rects(card);
+
+        draw_row_highlight(
+            &self.rt,
+            r_auto_color,
+            self.hover_target == HoverTarget::SubSettingAutoColor,
+            self.auto_color,
+            accent,
+            s,
+            self.light_glass,
+        );
+        self.draw_setting_label(
+            r_auto_color,
+            "自动取色",
+            primary_text_color(self.light_glass),
+            title_fmt,
+            s,
+        );
 
         draw_row_highlight(
             &self.rt,
@@ -3488,6 +3505,7 @@ impl PopupInner {
         rect: RectF,
         src: &SourceItem,
         selected: bool,
+        fallback_accent: Rgb,
         title_fmt: &IDWriteTextFormat,
         sub_fmt: &IDWriteTextFormat,
         badge_fmt: &IDWriteTextFormat,
@@ -3602,17 +3620,20 @@ impl PopupInner {
         );
 
         let is_playing = src.status == PlaybackState::Playing;
-        let accent = src
-            .cover
-            .as_ref()
-            .map(|c| {
-                if self.light_glass {
-                    c.accent_light
-                } else {
-                    c.accent_dark
-                }
-            })
-            .unwrap_or_else(|| adjust_accent_for_theme(self.fallback_accent, self.light_glass));
+        let accent = if self.auto_color {
+            src.cover
+                .as_ref()
+                .map(|c| {
+                    if self.light_glass {
+                        c.accent_light
+                    } else {
+                        c.accent_dark
+                    }
+                })
+                .unwrap_or(fallback_accent)
+        } else {
+            fallback_accent
+        };
         let badge_col = if is_playing {
             d2d_color_rgb(accent, 0.98)
         } else if selected {
@@ -3785,11 +3806,11 @@ fn compute_submenu_vertical_span(
 }
 
 /// Resolves the menu's dynamic UI accent color from the active source cover (matching spectrum bars),
-/// falling back to any available source cover or the system accent color.
+/// falling back to any available source cover or the backdrop-derived neutral accent.
 fn resolve_dynamic_menu_accent(
     sources: &[SourceItem],
     active_id: Option<&str>,
-    fallback: Rgb,
+    fallback_ui: Rgb,
     light_theme: bool,
 ) -> Rgb {
     let cover = active_id
@@ -3804,19 +3825,16 @@ fn resolve_dynamic_menu_accent(
                 cov.accent_dark
             }
         })
-        .unwrap_or_else(|| adjust_accent_for_theme(fallback, light_theme))
+        .unwrap_or(fallback_ui)
 }
 
 /// Computes two soft, restrained silk-tint colors derived from the active cover's purified accent color.
 fn compute_cover_halo_pair(
     cover: Option<&MediaCover>,
-    fallback: Rgb,
+    fallback_dark: Rgb,
     light_theme: bool,
 ) -> [Rgb; 2] {
-    let base_rgb = cover.map_or_else(
-        || adjust_accent_for_theme(fallback, false),
-        |cov| cov.accent_dark,
-    );
+    let base_rgb = cover.map_or(fallback_dark, |cov| cov.accent_dark);
     compute_halo_pair(base_rgb, light_theme)
 }
 
@@ -4011,6 +4029,18 @@ unsafe extern "system" fn popup_wnd_proc(
                         }
                     }
                 }
+                HoverTarget::SubSettingAutoColor => {
+                    state.auto_color = !state.auto_color;
+                    state.halo_colors_ready = false;
+                    state.last_silk_tick = None;
+                    let _ = PostMessageW(
+                        state.main_hwnd,
+                        WM_APP_SETTING_ACTION,
+                        WPARAM(SETTING_TOGGLE_AUTO_COLOR),
+                        LPARAM(0),
+                    );
+                    let _ = state.render();
+                }
                 HoverTarget::SubSettingLock => {
                     state.locked = !state.locked;
                     let _ = PostMessageW(
@@ -4141,22 +4171,29 @@ mod tests {
 
         for light_theme in [false, true] {
             for cov in [Some(&teal_cover), Some(&warm_cover), None] {
-                let pair = compute_cover_halo_pair(cov, Rgb::new(0, 120, 212), light_theme);
+                let pair = compute_cover_halo_pair(
+                    cov,
+                    derive_background_accent(Rgb::new(22, 64, 42), false),
+                    light_theme,
+                );
                 for c in pair {
                     let (_, s, l) = rgb_to_hsl(c);
                     assert!(
-                        (0.40..=0.74).contains(&s),
-                        "expected restrained halo saturation in [0.40, 0.74], got {s} ({c:?})"
+                        (0.30..=0.74).contains(&s),
+                        "expected restrained halo saturation in [0.30, 0.74], got {s} ({c:?})"
                     );
                     assert!(
-                        (0.52..=0.78).contains(&l),
-                        "expected controlled halo luminance in [0.52, 0.78], got {l} ({c:?})"
+                        (0.52..=0.80).contains(&l),
+                        "expected controlled halo luminance in [0.52, 0.80], got {l} ({c:?})"
                     );
                 }
             }
 
-            let gray_pair =
-                compute_cover_halo_pair(Some(&gray_cover), Rgb::new(0, 120, 212), light_theme);
+            let gray_pair = compute_cover_halo_pair(
+                Some(&gray_cover),
+                derive_background_accent(NEUTRAL_BACKDROP_FALLBACK, false),
+                light_theme,
+            );
             for c in gray_pair {
                 let (_, s, l) = rgb_to_hsl(c);
                 assert!(
@@ -4269,15 +4306,15 @@ mod tests {
             cover_a.accent_dark
         );
 
-        // No covers anywhere falls back to calibrated system accent
+        // No covers anywhere falls back cleanly to the provided backdrop accent without alteration
         let plain_sources = vec![mk("no_cover", None)];
         assert_eq!(
             resolve_dynamic_menu_accent(&plain_sources, Some("no_cover"), fallback, false),
-            adjust_accent_for_theme(fallback, false)
+            fallback
         );
         assert_eq!(
             resolve_dynamic_menu_accent(&plain_sources, Some("no_cover"), fallback, true),
-            adjust_accent_for_theme(fallback, true)
+            fallback
         );
     }
 

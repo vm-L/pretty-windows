@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 /// Visual styles supported for Windows 11 multi-monitor taskbars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TaskbarStyle {
-    #[default]
     Default,
     Transparent,
     Blur,
     Acrylic,
+    #[default]
     LiquidGlass,
 }
 
@@ -87,7 +87,7 @@ pub struct TaskbarConfig {
 }
 
 impl TaskbarConfig {
-    /// Parses configuration from TOML-formatted text, falling back to `Default` for unknown values.
+    /// Parses configuration from TOML-formatted text, falling back to `LiquidGlass` for unknown values.
     pub fn parse(content: &str) -> Self {
         let mut cfg = Self::default();
         for raw_line in content.lines() {
@@ -182,6 +182,8 @@ mod tests {
         );
 
         let bad = "style = \"nonexistent\"";
+        assert_eq!(TaskbarStyle::default(), TaskbarStyle::LiquidGlass);
+        assert_eq!(TaskbarConfig::default().style, TaskbarStyle::LiquidGlass);
         assert_eq!(TaskbarConfig::parse(bad), TaskbarConfig::default());
         assert_eq!(
             TaskbarConfig::load_from_path(Path::new("/nonexistent/Taskbar_missing.toml")),

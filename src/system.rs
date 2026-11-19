@@ -39,9 +39,10 @@ pub(crate) fn is_shell_flyout_process_name(exe_name: &str) -> bool {
 
 #[cfg(windows)]
 mod win {
-    use crate::color::Rgb;
+    use crate::color::{derive_background_accent, Rgb};
     use std::cell::RefCell;
     use std::mem::size_of;
+    use std::sync::{Mutex, OnceLock};
     use windows::core::{w, PCWSTR, PWSTR};
     use windows::UI::ViewManagement::{UIColorType, UISettings};
     use windows::Win32::Foundation::{CloseHandle, HMODULE, HWND, RECT};
@@ -118,6 +119,36 @@ mod win {
             }
         }
         Rgb::new(0, 120, 212)
+    }
+
+    fn mediabar_shared_accent_slot() -> &'static Mutex<Option<(Rgb, Rgb)>> {
+        static SHARED_ACCENT: OnceLock<Mutex<Option<(Rgb, Rgb)>>> = OnceLock::new();
+        SHARED_ACCENT.get_or_init(|| Mutex::new(None))
+    }
+
+    /// Publishes MediaBar's active cover accent pair `(light, dark)` for Tray & MonitorBar synchronization.
+    /// Pass `None` when MediaBar is stopped, auto-color is disabled, or no active cover exists.
+    pub fn set_mediabar_shared_accent(accent: Option<(Rgb, Rgb)>) {
+        if let Ok(mut guard) = mediabar_shared_accent_slot().lock() {
+            *guard = accent;
+        }
+    }
+
+    /// Returns MediaBar's currently published `(accent_light, accent_dark)`, if active.
+    pub fn get_mediabar_shared_accent() -> Option<(Rgb, Rgb)> {
+        mediabar_shared_accent_slot().lock().ok().and_then(|g| *g)
+    }
+
+    /// Resolves `(ui_accent, halo_dark_base)` across Tray, MediaBar, and MonitorBar:
+    /// prefers MediaBar's published album accent when active; otherwise lifts backdrop lightness preserving hue.
+    pub fn resolve_unified_accent(backdrop_bg: Rgb, light_glass: bool) -> (Rgb, Rgb) {
+        if let Some((al, ad)) = get_mediabar_shared_accent() {
+            return (if light_glass { al } else { ad }, ad);
+        }
+        (
+            derive_background_accent(backdrop_bg, light_glass),
+            derive_background_accent(backdrop_bg, false),
+        )
     }
 
     /// Returns `true` if Pretty Windows is configured to launch at Windows startup.

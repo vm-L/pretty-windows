@@ -1,18 +1,23 @@
 //! Liquid-fused cascading Liquid Glass context menu for MonitorBar.
 
 use super::actions::open_shell_target;
+use super::brightness::{
+    format_brightness_pct, BrightnessHandle, BrightnessMode, BrightnessSnapshot,
+};
 use super::config::{save_config, LeftClickAction, MetricItem, MonitorConfig};
 use super::wireless::{BtDeviceKind, WifiNetworkItem, WirelessHandle, WirelessSnapshot};
 use super::{
     WM_APP_MONITOR_CLOSE_SELF, WM_APP_MONITOR_CONFIG_CHANGED, WM_APP_MONITOR_PICK_CUSTOM_APP,
     WM_APP_MONITOR_POPUP_CLOSED, WM_APP_MONITOR_RESET_POS, WM_APP_MONITOR_TOGGLE_LOCK,
 };
-use crate::color::{adjust_accent_for_theme, Rgb};
+use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::system::resolve_unified_accent;
 use crate::ui::glass::{
-    capture_blurred_desktop_bitmap, create_round_cap_stroke, create_text_format, d2d_color_rgb,
-    d2d_rect, danger_text_color, draw_divider, draw_glass_interior, draw_row_highlight,
-    draw_text_in_rect, identity_matrix, muted_text_color, primary_text_color, update_silk_bitmap,
-    LayeredSurface,
+    capture_blurred_desktop_backdrop, create_round_cap_stroke, create_text_format, d2d_color_rgb,
+    d2d_rect, danger_text_color, draw_divider, draw_glass_interior, draw_glass_slider,
+    draw_pill_switch, draw_row_highlight, draw_settings_icon, draw_text_in_rect,
+    draw_text_in_rect_measured, identity_matrix, muted_text_color, primary_text_color,
+    update_silk_bitmap, LayeredSurface,
 };
 use crate::ui::{
     compute_halo_pair, ease_out_cubic, ease_retract, row_stagger_dy, window_master_alpha,
@@ -36,7 +41,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry, ID2D1GeometrySink, ID2D1Layer,
     ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
-    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_LARGE, D2D1_ARC_SIZE_SMALL, D2D1_ELLIPSE,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_ELLIPSE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
     D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
@@ -49,16 +54,16 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindowVisible, KillTimer,
     LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
     HCURSOR, HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CAPTURECHANGED, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const POPUP_CLASS_NAME: windows::core::PCWSTR = w!("PrettyWindows_MonitorPopup");
@@ -67,10 +72,13 @@ const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 
 const PRIMARY_W_DIP: f32 = 154.0;
 const SUB_WIRELESS_W_DIP: f32 = 244.0;
+const SUB_BRIGHTNESS_W_DIP: f32 = 256.0;
 const SUB_CLICK_W_DIP: f32 = 206.0;
 const SUB_DISPLAY_W_DIP: f32 = 152.0;
-const SUB_POS_W_DIP: f32 = 148.0;
+const SUB_SETTINGS_W_DIP: f32 = 172.0;
 const MAX_LIST_ROWS: usize = 6;
+const BRIGHTNESS_ROW_H_DIP: f32 = 46.0;
+const MAX_BRIGHTNESS_ROWS: usize = 5;
 const FOOT_MENISCUS_DIP: f32 = 10.0;
 const STEP_MENISCUS_DIP: f32 = 13.5;
 const SUB_VERT_STIFFNESS: f32 = 860.0;
@@ -80,10 +88,10 @@ const SUB_VERT_DAMPING: f32 = 44.5;
 enum PrimaryItem {
     WiFi,
     Bluetooth,
+    Brightness,
     LeftClick,
     Display,
-    Position,
-    Close,
+    Settings,
 }
 
 impl PrimaryItem {
@@ -91,10 +99,10 @@ impl PrimaryItem {
         match self {
             PrimaryItem::WiFi => Some(SubmenuKind::WiFi),
             PrimaryItem::Bluetooth => Some(SubmenuKind::Bluetooth),
+            PrimaryItem::Brightness => Some(SubmenuKind::Brightness),
             PrimaryItem::LeftClick => Some(SubmenuKind::LeftClick),
             PrimaryItem::Display => Some(SubmenuKind::Display),
-            PrimaryItem::Position => Some(SubmenuKind::Position),
-            PrimaryItem::Close => None,
+            PrimaryItem::Settings => Some(SubmenuKind::Settings),
         }
     }
 
@@ -102,10 +110,10 @@ impl PrimaryItem {
         match self {
             PrimaryItem::WiFi => "WiFi",
             PrimaryItem::Bluetooth => "蓝牙",
-            PrimaryItem::LeftClick => "左键行为",
-            PrimaryItem::Display => "显示项目",
-            PrimaryItem::Position => "位置",
-            PrimaryItem::Close => "关闭",
+            PrimaryItem::Brightness => "亮度",
+            PrimaryItem::LeftClick => "左键",
+            PrimaryItem::Display => "数据",
+            PrimaryItem::Settings => "设置",
         }
     }
 }
@@ -114,18 +122,20 @@ impl PrimaryItem {
 enum SubmenuKind {
     WiFi,
     Bluetooth,
+    Brightness,
     LeftClick,
     Display,
-    Position,
+    Settings,
 }
 
 impl SubmenuKind {
     fn width_dip(self) -> f32 {
         match self {
             SubmenuKind::WiFi | SubmenuKind::Bluetooth => SUB_WIRELESS_W_DIP,
+            SubmenuKind::Brightness => SUB_BRIGHTNESS_W_DIP,
             SubmenuKind::LeftClick => SUB_CLICK_W_DIP,
             SubmenuKind::Display => SUB_DISPLAY_W_DIP,
-            SubmenuKind::Position => SUB_POS_W_DIP,
+            SubmenuKind::Settings => SUB_SETTINGS_W_DIP,
         }
     }
 }
@@ -138,17 +148,28 @@ enum SubHoverTarget {
     BtToggle,
     BtDevice(usize),
     BtMoreSettings,
+    BrightnessRow(usize),
+    BrightnessSlider(usize),
+    BrightnessMoreSettings,
     LeftClickPreset(LeftClickAction),
-    LeftClickPickFile,
     DisplayMetric(MetricItem),
-    PositionLock,
-    PositionReset,
+    SettingLock,
+    SettingReset,
+    SettingClose,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HoverTarget {
     Primary(PrimaryItem),
     Sub(SubHoverTarget),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BrightnessRowGeom {
+    label_rect: RectF,
+    pct_rect: RectF,
+    track_rect: RectF,
+    slider_hit_rect: RectF,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,6 +192,7 @@ struct SubLayout {
     list_viewport: Option<RectF>,
     list_total_items: usize,
     list_scroll: usize,
+    list_max_rows: usize,
 }
 
 /// Manages the MonitorBar liquid-fused cascading Liquid Glass popup window lifecycle.
@@ -186,6 +208,8 @@ struct MonitorPopupInner {
     cfg: Arc<Mutex<MonitorConfig>>,
     wireless: WirelessHandle,
     wireless_snap: WirelessSnapshot,
+    brightness: BrightnessHandle,
+    brightness_snap: BrightnessSnapshot,
     d2d_factory: ID2D1Factory1,
     dwrite_factory: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
@@ -201,7 +225,7 @@ struct MonitorPopupInner {
     win_h: i32,
     open_left: bool,
     light_glass: bool,
-    fallback_accent: Rgb,
+    backdrop_rgb: Rgb,
     ui_accent: (f32, f32, f32),
     halo_colors: [(f32, f32, f32); 2],
     halo_colors_ready: bool,
@@ -209,6 +233,7 @@ struct MonitorPopupInner {
     silk_bmp: Option<ID2D1Bitmap>,
     silk_buf: Vec<u8>,
     last_silk_tick: Option<Instant>,
+    last_color_tick: Instant,
     last_flow_tick: Instant,
     flow_phase: f64,
     anim_phase: PopupAnimPhase,
@@ -220,6 +245,8 @@ struct MonitorPopupInner {
     sub_anim: Option<SubSpringState>,
     wifi_scroll: usize,
     bt_scroll: usize,
+    brightness_scroll: usize,
+    dragging_brightness: Option<usize>,
     hover: Option<HoverTarget>,
     tracking_leave: bool,
     timer_interval_ms: u32,
@@ -230,11 +257,13 @@ struct MonitorPopupInner {
 }
 
 impl MonitorPopup {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         owner_hwnd: HWND,
         config_path: PathBuf,
         cfg: Arc<Mutex<MonitorConfig>>,
         wireless: WirelessHandle,
+        brightness: BrightnessHandle,
         d2d_factory: ID2D1Factory1,
         dwrite_factory: IDWriteFactory,
     ) -> windows::core::Result<Self> {
@@ -284,6 +313,7 @@ impl MonitorPopup {
             let round_stroke = create_round_cap_stroke(&d2d_factory);
             let surface = LayeredSurface::new()?;
             let wireless_snap = wireless.snapshot();
+            let brightness_snap = brightness.snapshot();
 
             let mut inner = Box::new(MonitorPopupInner {
                 hwnd,
@@ -292,6 +322,8 @@ impl MonitorPopup {
                 cfg,
                 wireless,
                 wireless_snap,
+                brightness,
+                brightness_snap,
                 d2d_factory,
                 dwrite_factory,
                 rt,
@@ -307,14 +339,15 @@ impl MonitorPopup {
                 win_h: 1,
                 open_left: true,
                 light_glass: false,
-                fallback_accent: Rgb::new(0, 120, 212),
-                ui_accent: (0.0, 120.0 / 255.0, 212.0 / 255.0),
-                halo_colors: [(0.35, 0.58, 0.90); 2],
+                backdrop_rgb: NEUTRAL_BACKDROP_FALLBACK,
+                ui_accent: (0.76, 0.76, 0.78),
+                halo_colors: [(0.76, 0.76, 0.78); 2],
                 halo_colors_ready: false,
                 backdrop_bmp: None,
                 silk_bmp: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
                 last_silk_tick: None,
+                last_color_tick: Instant::now(),
                 last_flow_tick: Instant::now(),
                 flow_phase: 0.0,
                 anim_phase: PopupAnimPhase::Open,
@@ -326,6 +359,8 @@ impl MonitorPopup {
                 sub_anim: None,
                 wifi_scroll: 0,
                 bt_scroll: 0,
+                brightness_scroll: 0,
+                dragging_brightness: None,
                 hover: None,
                 tracking_leave: false,
                 timer_interval_ms: 0,
@@ -405,6 +440,22 @@ impl MonitorPopup {
         }
     }
 
+    pub fn update_brightness(&mut self, mut snapshot: BrightnessSnapshot) {
+        if let Some(drag_idx) = self.inner.dragging_brightness {
+            if let Some(prev) = self.inner.brightness_snap.displays.get(drag_idx) {
+                if let Some(cur) = snapshot.displays.iter_mut().find(|d| d.id == prev.id) {
+                    cur.brightness = prev.brightness;
+                }
+            }
+        }
+        self.inner.brightness_snap = snapshot;
+        self.inner.clamp_scrolls();
+        self.inner.sync_timer_rate();
+        if self.is_visible() {
+            let _ = self.inner.render();
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -412,12 +463,12 @@ impl MonitorPopup {
         click_screen_x: i32,
         dpi: u32,
         light_glass: bool,
-        accent: Rgb,
+        _accent: Rgb,
         pill_overlap_px: i32,
     ) {
         self.inner.dpi = dpi.max(96);
         self.inner.light_glass = light_glass;
-        self.inner.fallback_accent = accent;
+        self.inner.backdrop_rgb = NEUTRAL_BACKDROP_FALLBACK;
         self.inner.pill_overlap_px = pill_overlap_px.max(0);
         self.inner.hover = None;
         self.inner.tracking_leave = false;
@@ -425,14 +476,18 @@ impl MonitorPopup {
         self.inner.sub_anim = None;
         self.inner.wifi_scroll = 0;
         self.inner.bt_scroll = 0;
+        self.inner.brightness_scroll = 0;
+        self.inner.dragging_brightness = None;
         self.inner.win_h = 0;
         self.inner.wireless_snap = self.inner.wireless.snapshot();
         self.inner.wireless.request_refresh(false);
+        self.inner.brightness_snap = self.inner.brightness.snapshot();
+        self.inner.brightness.request_refresh();
 
         let s = self.inner.scale();
         let side_pad = (SHADOW_PAD_DIP * s).round() as i32;
         let primary_w = (PRIMARY_W_DIP * s).round() as i32;
-        let max_sub_w = (SUB_WIRELESS_W_DIP * s).round() as i32;
+        let max_sub_w = (SUB_WIRELESS_W_DIP.max(SUB_BRIGHTNESS_W_DIP) * s).round() as i32;
         let max_reach = self.inner.max_popup_reach_px();
 
         let mon = unsafe { MonitorFromRect(&anchor_rect, MONITOR_DEFAULTTONEAREST) };
@@ -497,10 +552,15 @@ impl MonitorPopup {
         self.inner.win_w = win_w;
         self.inner.win_h = win_h;
 
-        self.inner.backdrop_bmp =
-            capture_blurred_desktop_bitmap(&self.inner.rt, win_x, win_y, win_w, win_h);
+        let (bmp, sampled_bg) =
+            capture_blurred_desktop_backdrop(&self.inner.rt, win_x, win_y, win_w, win_h);
+        self.inner.backdrop_bmp = bmp;
+        if let Some(bg) = sampled_bg {
+            self.inner.backdrop_rgb = bg;
+        }
         self.inner.halo_colors_ready = false;
         self.inner.last_silk_tick = None;
+        self.inner.last_color_tick = Instant::now();
         self.inner.anim_phase = PopupAnimPhase::Opening;
         self.inner.open_spring = Spring1D::new(0.14, 2.8);
         self.inner.open_elapsed = 0.0;
@@ -522,6 +582,7 @@ impl MonitorPopup {
             let _ = SetForegroundWindow(self.hwnd);
         }
         self.inner.last_flow_tick = Instant::now();
+        self.inner.last_color_tick = self.inner.last_flow_tick;
         self.inner.sync_timer_rate();
     }
 }
@@ -546,8 +607,22 @@ fn submenu_height_dip(list_rows: usize) -> f32 {
         + DIVIDER_H_DIP * 2.0
 }
 
+fn brightness_submenu_height_dip(display_rows: usize) -> f32 {
+    if display_rows == 0 {
+        INNER_PAD_DIP * 2.0 + ROW_H_DIP * 2.0 + DIVIDER_H_DIP
+    } else {
+        let rows = display_rows.min(MAX_BRIGHTNESS_ROWS);
+        let gaps = rows.saturating_sub(1);
+        INNER_PAD_DIP * 2.0
+            + BRIGHTNESS_ROW_H_DIP * (rows as f32)
+            + ROW_GAP_DIP * (gaps as f32)
+            + DIVIDER_H_DIP
+            + ROW_H_DIP
+    }
+}
+
 fn primary_rows_height_dip() -> f32 {
-    INNER_PAD_DIP * 2.0 + ROW_H_DIP * 6.0 + ROW_GAP_DIP * 4.0 + DIVIDER_H_DIP
+    INNER_PAD_DIP * 2.0 + ROW_H_DIP * 6.0 + ROW_GAP_DIP * 5.0
 }
 
 fn compute_submenu_vertical_span(
@@ -730,11 +805,14 @@ impl MonitorPopupInner {
                 };
                 submenu_height_dip(n)
             }
-            SubmenuKind::LeftClick => {
-                INNER_PAD_DIP * 2.0 + ROW_H_DIP * 6.0 + ROW_GAP_DIP * 4.0 + DIVIDER_H_DIP
+            SubmenuKind::Brightness => {
+                brightness_submenu_height_dip(self.brightness_snap.displays.len())
             }
+            SubmenuKind::LeftClick => INNER_PAD_DIP * 2.0 + ROW_H_DIP * 5.0 + ROW_GAP_DIP * 4.0,
             SubmenuKind::Display => INNER_PAD_DIP * 2.0 + ROW_H_DIP * 5.0 + ROW_GAP_DIP * 4.0,
-            SubmenuKind::Position => INNER_PAD_DIP * 2.0 + ROW_H_DIP * 2.0 + ROW_GAP_DIP,
+            SubmenuKind::Settings => {
+                INNER_PAD_DIP * 2.0 + ROW_H_DIP * 3.0 + ROW_GAP_DIP + DIVIDER_H_DIP
+            }
         };
         (w, h_dip * s)
     }
@@ -742,7 +820,9 @@ impl MonitorPopupInner {
     fn max_popup_reach_px(&self) -> i32 {
         let s = self.scale();
         let overlap = self.primary_overlap_px();
-        let max_sub_h = submenu_height_dip(MAX_LIST_ROWS) * s;
+        let max_sub_h = submenu_height_dip(MAX_LIST_ROWS)
+            .max(brightness_submenu_height_dip(MAX_BRIGHTNESS_ROWS))
+            * s;
         let pri_h = self.primary_height_px();
         pri_h.max(overlap + max_sub_h).ceil() as i32
     }
@@ -770,7 +850,6 @@ impl MonitorPopupInner {
         let x1 = card.right - inner;
         let rh = ROW_H_DIP * s;
         let gap = ROW_GAP_DIP * s;
-        let div_h = DIVIDER_H_DIP * s;
         let mut y = card.top + inner;
 
         let r0 = RectF::new(x0, y, x1, y + rh);
@@ -782,16 +861,16 @@ impl MonitorPopupInner {
         let r3 = RectF::new(x0, y, x1, y + rh);
         y += rh + gap;
         let r4 = RectF::new(x0, y, x1, y + rh);
-        y = r4.bottom + div_h;
+        y += rh + gap;
         let r5 = RectF::new(x0, y, x1, y + rh);
 
         [
             (PrimaryItem::WiFi, r0),
             (PrimaryItem::Bluetooth, r1),
-            (PrimaryItem::LeftClick, r2),
-            (PrimaryItem::Display, r3),
-            (PrimaryItem::Position, r4),
-            (PrimaryItem::Close, r5),
+            (PrimaryItem::Brightness, r2),
+            (PrimaryItem::LeftClick, r3),
+            (PrimaryItem::Display, r4),
+            (PrimaryItem::Settings, r5),
         ]
     }
 
@@ -881,10 +960,51 @@ impl MonitorPopupInner {
         }
     }
 
+    fn brightness_row_geom(&self, row_rect: RectF, s: f32) -> BrightnessRowGeom {
+        let col_left = row_rect.left + 12.0 * s;
+        let col_right = row_rect.right - 10.0 * s;
+        let pct_w = 40.0 * s;
+
+        let upper_top = row_rect.top + 4.0 * s;
+        let upper_bottom = row_rect.top + 22.0 * s;
+        let label_rect = RectF::new(
+            col_left,
+            upper_top,
+            (col_right - pct_w).max(col_left + 30.0 * s),
+            upper_bottom,
+        );
+        let pct_rect = RectF::new(col_right - pct_w, upper_top, col_right, upper_bottom);
+
+        let track_h = 4.0 * s;
+        let track_cy = row_rect.top + 32.5 * s;
+        let track_left = col_left + 4.0 * s;
+        let track_right = (col_right - 4.0 * s).max(track_left + 24.0 * s);
+        let track_rect = RectF::new(
+            track_left,
+            track_cy - track_h * 0.5,
+            track_right,
+            track_cy + track_h * 0.5,
+        );
+        let slider_hit_rect = RectF::new(
+            track_left - 8.0 * s,
+            row_rect.top + 18.0 * s,
+            track_right + 8.0 * s,
+            row_rect.bottom,
+        );
+
+        BrightnessRowGeom {
+            label_rect,
+            pct_rect,
+            track_rect,
+            slider_hit_rect,
+        }
+    }
+
     fn build_sub_layout(&self, sr: RectF, kind: SubmenuKind) -> SubLayout {
         let s = self.scale();
         let inner = INNER_PAD_DIP * s;
         let rh = ROW_H_DIP * s;
+        let brh = BRIGHTNESS_ROW_H_DIP * s;
         let gap = ROW_GAP_DIP * s;
         let div_h = DIVIDER_H_DIP * s;
 
@@ -897,6 +1017,7 @@ impl MonitorPopupInner {
         let mut list_viewport = None;
         let mut list_total_items = 0usize;
         let mut list_scroll = 0usize;
+        let mut list_max_rows = MAX_LIST_ROWS;
 
         match kind {
             SubmenuKind::WiFi => {
@@ -987,24 +1108,46 @@ impl MonitorPopupInner {
                     rect: RectF::new(sx0, sy, sx1, sy + rh),
                 });
             }
+            SubmenuKind::Brightness => {
+                list_max_rows = MAX_BRIGHTNESS_ROWS;
+                list_total_items = self.brightness_snap.displays.len();
+                list_scroll = self.brightness_scroll;
+                let list_top = sy;
+                if list_total_items == 0 {
+                    let r = RectF::new(sx0, sy, sx1, sy + rh);
+                    rows.push(SubRowRect { target: None, rect: r });
+                    sy = r.bottom;
+                    dividers.push(r);
+                } else {
+                    let visible = (list_total_items - list_scroll).min(MAX_BRIGHTNESS_ROWS);
+                    for i in 0..visible {
+                        let r = RectF::new(sx0, sy, sx1, sy + brh);
+                        rows.push(SubRowRect {
+                            target: Some(SubHoverTarget::BrightnessRow(list_scroll + i)),
+                            rect: r,
+                        });
+                        sy = r.bottom + if i + 1 < visible { gap } else { 0.0 };
+                    }
+                    if list_total_items > MAX_BRIGHTNESS_ROWS {
+                        list_viewport = Some(RectF::new(sx0, list_top, sx1, sy));
+                    }
+                    dividers.push(RectF::new(sx0, sy - brh, sx1, sy));
+                }
+                sy += div_h;
+                rows.push(SubRowRect {
+                    target: Some(SubHoverTarget::BrightnessMoreSettings),
+                    rect: RectF::new(sx0, sy, sx1, sy + rh),
+                });
+            }
             SubmenuKind::LeftClick => {
-                for (idx, action) in LeftClickAction::ALL.into_iter().enumerate() {
+                for action in LeftClickAction::ALL {
                     let r = RectF::new(sx0, sy, sx1, sy + rh);
                     rows.push(SubRowRect {
                         target: Some(SubHoverTarget::LeftClickPreset(action)),
                         rect: r,
                     });
-                    if idx == 4 {
-                        dividers.push(r);
-                        sy = r.bottom + div_h;
-                    } else {
-                        sy = r.bottom + gap;
-                    }
+                    sy = r.bottom + gap;
                 }
-                rows.push(SubRowRect {
-                    target: Some(SubHoverTarget::LeftClickPickFile),
-                    rect: RectF::new(sx0, sy, sx1, sy + rh),
-                });
             }
             SubmenuKind::Display => {
                 for item in MetricItem::ALL {
@@ -1016,17 +1159,26 @@ impl MonitorPopupInner {
                     sy = r.bottom + gap;
                 }
             }
-            SubmenuKind::Position => {
-                let r1 = RectF::new(sx0, sy, sx1, sy + rh);
+            SubmenuKind::Settings => {
+                let r_lock = RectF::new(sx0, sy, sx1, sy + rh);
                 rows.push(SubRowRect {
-                    target: Some(SubHoverTarget::PositionLock),
-                    rect: r1,
+                    target: Some(SubHoverTarget::SettingLock),
+                    rect: r_lock,
                 });
-                sy = r1.bottom + gap;
-                let r2 = RectF::new(sx0, sy, sx1, sy + rh);
+                sy = r_lock.bottom + gap;
+
+                let r_reset = RectF::new(sx0, sy, sx1, sy + rh);
                 rows.push(SubRowRect {
-                    target: Some(SubHoverTarget::PositionReset),
-                    rect: r2,
+                    target: Some(SubHoverTarget::SettingReset),
+                    rect: r_reset,
+                });
+                dividers.push(r_reset);
+                sy = r_reset.bottom + div_h;
+
+                let r_close = RectF::new(sx0, sy, sx1, sy + rh);
+                rows.push(SubRowRect {
+                    target: Some(SubHoverTarget::SettingClose),
+                    rect: r_close,
                 });
             }
         }
@@ -1037,6 +1189,7 @@ impl MonitorPopupInner {
             list_viewport,
             list_total_items,
             list_scroll,
+            list_max_rows,
         }
     }
 
@@ -1048,6 +1201,14 @@ impl MonitorPopupInner {
         let max_bt = self.wireless_snap.bt_devices.len().saturating_sub(MAX_LIST_ROWS);
         if self.bt_scroll > max_bt {
             self.bt_scroll = max_bt;
+        }
+        let max_bright = self
+            .brightness_snap
+            .displays
+            .len()
+            .saturating_sub(MAX_BRIGHTNESS_ROWS);
+        if self.brightness_scroll > max_bright {
+            self.brightness_scroll = max_bright;
         }
     }
 
@@ -1135,14 +1296,67 @@ impl MonitorPopupInner {
             let sr = self.sub_card_rect(kind);
             if sr.contains(x, y) {
                 let sub_layout = self.build_sub_layout(sr, kind);
+                let s = self.scale();
                 for row in sub_layout.rows {
                     if row.rect.contains(x, y) {
+                        if let Some(SubHoverTarget::BrightnessRow(idx)) = row.target {
+                            let geom = self.brightness_row_geom(row.rect, s);
+                            if geom.slider_hit_rect.contains(x, y) {
+                                return Some(HoverTarget::Sub(SubHoverTarget::BrightnessSlider(idx)));
+                            }
+                            return Some(HoverTarget::Sub(SubHoverTarget::BrightnessRow(idx)));
+                        }
                         return row.target.map(HoverTarget::Sub);
                     }
                 }
             }
         }
         None
+    }
+
+    fn brightness_track_rect_for_idx(&self, idx: usize) -> Option<RectF> {
+        let sr = self.sub_card_rect(SubmenuKind::Brightness);
+        let sub_layout = self.build_sub_layout(sr, SubmenuKind::Brightness);
+        let s = self.scale();
+        for row in sub_layout.rows {
+            if row.target == Some(SubHoverTarget::BrightnessRow(idx)) {
+                return Some(self.brightness_row_geom(row.rect, s).track_rect);
+            }
+        }
+        None
+    }
+
+    fn apply_brightness_drag(&mut self, idx: usize, cursor_x: f32) -> bool {
+        let Some(track) = self.brightness_track_rect_for_idx(idx) else {
+            return false;
+        };
+        let t = ((cursor_x - track.left) / track.width().max(1.0)).clamp(0.0, 1.0);
+        let pct = (t * 100.0).round() as u8;
+        let Some(disp) = self.brightness_snap.displays.get_mut(idx) else {
+            return false;
+        };
+        if disp.brightness == pct {
+            return false;
+        }
+        disp.brightness = pct;
+        let id = disp.id.clone();
+        self.brightness.set_brightness(&id, pct);
+        true
+    }
+
+    fn step_brightness_wheel(&mut self, idx: usize, wheel_delta: i16) -> bool {
+        let step = if wheel_delta > 0 { 5i16 } else { -5i16 };
+        let Some(disp) = self.brightness_snap.displays.get_mut(idx) else {
+            return false;
+        };
+        let next = (i16::from(disp.brightness) + step).clamp(0, 100) as u8;
+        if next == disp.brightness {
+            return false;
+        }
+        disp.brightness = next;
+        let id = disp.id.clone();
+        self.brightness.set_brightness(&id, next);
+        true
     }
 
     fn set_active_submenu(&mut self, next: Option<SubmenuKind>) -> bool {
@@ -1199,6 +1413,7 @@ impl MonitorPopupInner {
             match kind {
                 SubmenuKind::WiFi => self.wireless.request_refresh(true),
                 SubmenuKind::Bluetooth => self.wireless.request_refresh(false),
+                SubmenuKind::Brightness => self.brightness.request_refresh(),
                 _ => {}
             }
         } else {
@@ -1274,6 +1489,11 @@ impl MonitorPopupInner {
         if self.anim_phase == PopupAnimPhase::Closing {
             return;
         }
+        if self.dragging_brightness.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
         self.anim_phase = PopupAnimPhase::Closing;
         self.close_progress = 0.0;
         self.close_started_at = Some(Instant::now());
@@ -1308,6 +1528,11 @@ impl MonitorPopupInner {
     fn reset_transient_state(&mut self) {
         unsafe {
             let _ = KillTimer(self.hwnd, TIMER_POPUP_FLOW_ID);
+        }
+        if self.dragging_brightness.take().is_some() {
+            unsafe {
+                let _ = ReleaseCapture();
+            }
         }
         self.timer_interval_ms = 0;
         self.backdrop_bmp = None;
@@ -2038,14 +2263,35 @@ impl MonitorPopupInner {
         }
     }
 
-    fn ensure_halo_colors(&mut self, pri_rect: RectF, s: f32) {
-        if !self.halo_colors_ready {
+    fn update_silk_and_accent(&mut self, pri_rect: RectF, s: f32) {
+        let now = Instant::now();
+        let dt_color = now
+            .duration_since(self.last_color_tick)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        self.last_color_tick = now;
+
+        let (ui_rgb, halo_base_dark) = resolve_unified_accent(self.backdrop_rgb, self.light_glass);
+        let pair = compute_halo_pair(halo_base_dark, self.light_glass);
+        let target = [pair[0].to_normalized(), pair[1].to_normalized()];
+        let ui_target = ui_rgb.to_normalized();
+
+        let was_ready = self.halo_colors_ready;
+        if !was_ready {
+            self.halo_colors = target;
+            self.ui_accent = ui_target;
             self.halo_colors_ready = true;
-            let base_dark = adjust_accent_for_theme(self.fallback_accent, false);
-            let pair = compute_halo_pair(base_dark, self.light_glass);
-            self.halo_colors = [pair[0].to_normalized(), pair[1].to_normalized()];
-            self.ui_accent =
-                adjust_accent_for_theme(self.fallback_accent, self.light_glass).to_normalized();
+        } else {
+            let k = (dt_color * 4.5).clamp(0.02, 1.0);
+            for (cur, tgt) in self.halo_colors.iter_mut().zip(target.iter()) {
+                cur.0 += (tgt.0 - cur.0) * k;
+                cur.1 += (tgt.1 - cur.1) * k;
+                cur.2 += (tgt.2 - cur.2) * k;
+            }
+            let k_ui = (dt_color * 6.0).clamp(0.02, 1.0);
+            self.ui_accent.0 += (ui_target.0 - self.ui_accent.0) * k_ui;
+            self.ui_accent.1 += (ui_target.1 - self.ui_accent.1) * k_ui;
+            self.ui_accent.2 += (ui_target.2 - self.ui_accent.2) * k_ui;
         }
 
         update_silk_bitmap(
@@ -2053,7 +2299,7 @@ impl MonitorPopupInner {
             &mut self.silk_bmp,
             &mut self.silk_buf,
             &mut self.last_silk_tick,
-            false,
+            !was_ready,
             self.win_w,
             self.win_h,
             pri_rect.left,
@@ -2071,7 +2317,7 @@ impl MonitorPopupInner {
         self.ensure_formats(s)?;
 
         let target_primary = self.primary_card_rect();
-        self.ensure_halo_colors(target_primary, s);
+        self.update_silk_and_accent(target_primary, s);
 
         let accent = Rgb::new(
             (self.ui_accent.0 * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -2205,17 +2451,9 @@ impl MonitorPopupInner {
                             self.active_sub.is_some() && item.submenu() == self.active_sub;
                         self.draw_primary_row_bg(r, hovered, expanded, accent, s);
 
-                        let mut fg = if item == PrimaryItem::Close {
-                            danger_text_color(self.light_glass)
-                        } else {
-                            let mut c = primary_text_color(self.light_glass);
-                            if !hovered && !expanded {
-                                c.a *= 0.88;
-                            }
-                            c
-                        };
-                        if hovered && item == PrimaryItem::Close {
-                            fg.a = 1.0;
+                        let mut fg = primary_text_color(self.light_glass);
+                        if !hovered && !expanded {
+                            fg.a *= 0.88;
                         }
 
                         if let Ok(icon_brush) = self.rt.CreateSolidColorBrush(&fg, None) {
@@ -2248,10 +2486,6 @@ impl MonitorPopupInner {
                                 fmt,
                                 fg,
                             );
-                        }
-
-                        if item == PrimaryItem::Position {
-                            draw_divider(&self.rt, r, s, self.light_glass);
                         }
                     }
 
@@ -2529,7 +2763,20 @@ impl MonitorPopupInner {
 
         for row in &layout.rows {
             let r = row.rect;
-            let hovered = row.target.is_some() && self.hover == row.target.map(HoverTarget::Sub);
+            let hovered = match row.target {
+                Some(SubHoverTarget::BrightnessRow(idx)) => {
+                    self.dragging_brightness == Some(idx)
+                        || matches!(
+                            self.hover,
+                            Some(HoverTarget::Sub(
+                                SubHoverTarget::BrightnessRow(i)
+                                    | SubHoverTarget::BrightnessSlider(i)
+                            )) if i == idx
+                        )
+                }
+                Some(target) => self.hover == Some(HoverTarget::Sub(target)),
+                None => false,
+            };
             let selected = match row.target {
                 Some(SubHoverTarget::WifiNetwork(idx)) => self
                     .wireless_snap
@@ -2543,7 +2790,7 @@ impl MonitorPopupInner {
                     .is_some_and(|d| d.is_connected),
                 Some(SubHoverTarget::LeftClickPreset(action)) => cfg.left_click == action,
                 Some(SubHoverTarget::DisplayMetric(item)) => cfg.is_visible(item),
-                Some(SubHoverTarget::PositionLock) => cfg.locked,
+                Some(SubHoverTarget::SettingLock) => cfg.locked,
                 _ => false,
             };
 
@@ -2561,12 +2808,14 @@ impl MonitorPopupInner {
                         fmt,
                         primary_fg,
                     );
-                    self.draw_pill_switch(
+                    draw_pill_switch(
+                        &self.rt,
                         r.right - 10.0 * s,
                         (r.top + r.bottom) * 0.5,
                         self.wireless_snap.wifi_enabled,
                         accent,
                         s,
+                        self.light_glass,
                     );
                 }
                 Some(SubHoverTarget::BtToggle) => {
@@ -2578,12 +2827,14 @@ impl MonitorPopupInner {
                         fmt,
                         primary_fg,
                     );
-                    self.draw_pill_switch(
+                    draw_pill_switch(
+                        &self.rt,
                         r.right - 10.0 * s,
                         (r.top + r.bottom) * 0.5,
                         self.wireless_snap.bt_enabled,
                         accent,
                         s,
+                        self.light_glass,
                     );
                 }
                 Some(SubHoverTarget::WifiNetwork(idx)) => {
@@ -2672,6 +2923,96 @@ impl MonitorPopupInner {
                         primary_fg,
                     );
                 }
+                Some(SubHoverTarget::BrightnessRow(idx)) => {
+                    if let Some(disp) = self.brightness_snap.displays.get(idx) {
+                        let geom = self.brightness_row_geom(r, s);
+                        let is_software = disp.mode == BrightnessMode::Software;
+                        let name_rect = if is_software {
+                            RectF::new(
+                                geom.label_rect.left,
+                                geom.label_rect.top,
+                                (geom.label_rect.right - 10.0 * s)
+                                    .max(geom.label_rect.left + 20.0 * s),
+                                geom.label_rect.bottom,
+                            )
+                        } else {
+                            geom.label_rect
+                        };
+                        let measured_w = draw_text_in_rect_measured(
+                            &self.dwrite_factory,
+                            &self.rt,
+                            &disp.name,
+                            name_rect,
+                            fmt,
+                            primary_fg,
+                        );
+                        if is_software {
+                            let dot_x = (name_rect.left + measured_w + 4.5 * s)
+                                .min(geom.pct_rect.left - 5.0 * s);
+                            let dot_y = name_rect.top + 5.0 * s;
+                            let dot_r = 2.6 * s;
+                            let dot_col = if self.light_glass {
+                                D2D1_COLOR_F {
+                                    r: 0.86,
+                                    g: 0.22,
+                                    b: 0.24,
+                                    a: 0.96,
+                                }
+                            } else {
+                                D2D1_COLOR_F {
+                                    r: 1.0,
+                                    g: 0.36,
+                                    b: 0.36,
+                                    a: 0.98,
+                                }
+                            };
+                            if let Ok(db) = self.rt.CreateSolidColorBrush(&dot_col, None) {
+                                self.rt.FillEllipse(
+                                    &D2D1_ELLIPSE {
+                                        point: D2D_POINT_2F { x: dot_x, y: dot_y },
+                                        radiusX: dot_r,
+                                        radiusY: dot_r,
+                                    },
+                                    &db,
+                                );
+                            }
+                        }
+
+                        let pct_str = format_brightness_pct(disp.brightness);
+                        draw_text_in_rect(
+                            &self.dwrite_factory,
+                            &self.rt,
+                            &pct_str,
+                            geom.pct_rect,
+                            badge_fmt,
+                            muted_fg,
+                        );
+
+                        let slider_active = self.dragging_brightness == Some(idx)
+                            || self.hover == Some(HoverTarget::Sub(SubHoverTarget::BrightnessSlider(idx)));
+                        draw_glass_slider(
+                            &self.rt,
+                            geom.track_rect,
+                            f32::from(disp.brightness) / 100.0,
+                            false,
+                            slider_active,
+                            self.light_glass,
+                            accent,
+                            s,
+                        );
+                    }
+                }
+                Some(SubHoverTarget::BrightnessSlider(_)) => {}
+                Some(SubHoverTarget::BrightnessMoreSettings) => {
+                    draw_text_in_rect(
+                        &self.dwrite_factory,
+                        &self.rt,
+                        "更多屏幕设置",
+                        RectF::new(r.left + 12.0 * s, r.top, r.right - 12.0 * s, r.bottom),
+                        fmt,
+                        primary_fg,
+                    );
+                }
                 Some(SubHoverTarget::LeftClickPreset(action)) => {
                     let text = if action == LeftClickAction::CustomApp
                         && !cfg.custom_app_path.is_empty()
@@ -2693,16 +3034,6 @@ impl MonitorPopupInner {
                         primary_fg,
                     );
                 }
-                Some(SubHoverTarget::LeftClickPickFile) => {
-                    draw_text_in_rect(
-                        &self.dwrite_factory,
-                        &self.rt,
-                        "选择自定义程序...",
-                        RectF::new(r.left + 14.0 * s, r.top, r.right - 10.0 * s, r.bottom),
-                        fmt,
-                        primary_fg,
-                    );
-                }
                 Some(SubHoverTarget::DisplayMetric(item)) => {
                     draw_text_in_rect(
                         &self.dwrite_factory,
@@ -2713,24 +3044,38 @@ impl MonitorPopupInner {
                         primary_fg,
                     );
                 }
-                Some(SubHoverTarget::PositionLock) => {
+                Some(SubHoverTarget::SettingLock) => {
                     draw_text_in_rect(
                         &self.dwrite_factory,
                         &self.rt,
                         "锁定位置",
-                        RectF::new(r.left + 14.0 * s, r.top, r.right - 10.0 * s, r.bottom),
+                        RectF::new(r.left + 12.0 * s, r.top, r.right - 10.0 * s, r.bottom),
                         fmt,
                         primary_fg,
                     );
                 }
-                Some(SubHoverTarget::PositionReset) => {
+                Some(SubHoverTarget::SettingReset) => {
                     draw_text_in_rect(
                         &self.dwrite_factory,
                         &self.rt,
                         "重置位置",
-                        RectF::new(r.left + 14.0 * s, r.top, r.right - 10.0 * s, r.bottom),
+                        RectF::new(r.left + 12.0 * s, r.top, r.right - 10.0 * s, r.bottom),
                         fmt,
                         primary_fg,
+                    );
+                }
+                Some(SubHoverTarget::SettingClose) => {
+                    let mut close_col = danger_text_color(self.light_glass);
+                    if hovered {
+                        close_col.a = 1.0;
+                    }
+                    draw_text_in_rect(
+                        &self.dwrite_factory,
+                        &self.rt,
+                        "关闭",
+                        RectF::new(r.left + 12.0 * s, r.top, r.right - 10.0 * s, r.bottom),
+                        fmt,
+                        close_col,
                     );
                 }
                 None => {
@@ -2757,6 +3102,13 @@ impl MonitorPopupInner {
                                 "无已配对设备"
                             }
                         }
+                        SubmenuKind::Brightness => {
+                            if self.brightness_snap.busy {
+                                "正在检测显示器..."
+                            } else {
+                                "未检测到显示器"
+                            }
+                        }
                         _ => "",
                     };
                     if !msg.is_empty() {
@@ -2778,13 +3130,14 @@ impl MonitorPopupInner {
         }
 
         if let Some(vp) = layout.list_viewport {
-            if layout.list_total_items > MAX_LIST_ROWS {
+            let max_visible = layout.list_max_rows.max(1);
+            if layout.list_total_items > max_visible {
                 let top = vp.top + 4.0 * s;
                 let bottom = vp.bottom - 4.0 * s;
                 let track_h = (bottom - top).max(8.0);
-                let ratio = (MAX_LIST_ROWS as f32) / (layout.list_total_items as f32);
+                let ratio = (max_visible as f32) / (layout.list_total_items as f32);
                 let thumb_h = (track_h * ratio).max(16.0 * s);
-                let max_scroll = (layout.list_total_items - MAX_LIST_ROWS) as f32;
+                let max_scroll = (layout.list_total_items - max_visible) as f32;
                 let scroll_t = if max_scroll > 0.0 {
                     (layout.list_scroll as f32) / max_scroll
                 } else {
@@ -2807,66 +3160,6 @@ impl MonitorPopupInner {
                     self.rt.FillRoundedRectangle(&bar_rr, &b);
                 }
             }
-        }
-    }
-
-    unsafe fn draw_pill_switch(&self, right_x: f32, cy: f32, on: bool, accent: Rgb, s: f32) {
-        let w = 28.0 * s;
-        let h = 15.0 * s;
-        let left = right_x - w;
-        let top = cy - h * 0.5;
-        let rr = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left,
-                top,
-                right: right_x,
-                bottom: top + h,
-            },
-            radiusX: h * 0.5,
-            radiusY: h * 0.5,
-        };
-        let track_col = if on {
-            d2d_color_rgb(accent, 0.92)
-        } else if self.light_glass {
-            D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.18,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.22,
-            }
-        };
-        if let Ok(tb) = self.rt.CreateSolidColorBrush(&track_col, None) {
-            self.rt.FillRoundedRectangle(&rr, &tb);
-        }
-
-        let thumb_r = 5.0 * s;
-        let knob_x = if on {
-            right_x - 2.5 * s - thumb_r
-        } else {
-            left + 2.5 * s + thumb_r
-        };
-        let knob_col = D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.96,
-        };
-        if let Ok(kb) = self.rt.CreateSolidColorBrush(&knob_col, None) {
-            self.rt.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F { x: knob_x, y: cy },
-                    radiusX: thumb_r,
-                    radiusY: thumb_r,
-                },
-                &kb,
-            );
         }
     }
 
@@ -3063,6 +3356,37 @@ impl MonitorPopupInner {
             PrimaryItem::Bluetooth => {
                 self.draw_bluetooth_icon(cx, cy, s, brush);
             }
+            PrimaryItem::Brightness => {
+                self.rt.DrawEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F { x: cx, y: cy },
+                        radiusX: 2.5 * s,
+                        radiusY: 2.5 * s,
+                    },
+                    brush,
+                    1.25 * s,
+                    st,
+                );
+                let inner_r = 4.2 * s;
+                let outer_r = 5.4 * s;
+                for step in 0..8 {
+                    let angle = (step as f32) * std::f32::consts::FRAC_PI_4;
+                    let (sin_a, cos_a) = angle.sin_cos();
+                    self.rt.DrawLine(
+                        D2D_POINT_2F {
+                            x: cx + inner_r * cos_a,
+                            y: cy + inner_r * sin_a,
+                        },
+                        D2D_POINT_2F {
+                            x: cx + outer_r * cos_a,
+                            y: cy + outer_r * sin_a,
+                        },
+                        brush,
+                        1.25 * s,
+                        st,
+                    );
+                }
+            }
             PrimaryItem::LeftClick => {
                 let p0 = D2D_POINT_2F {
                     x: cx - 3.2 * s,
@@ -3102,87 +3426,8 @@ impl MonitorPopupInner {
                     }
                 }
             }
-            PrimaryItem::Position => {
-                let body = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: cx - 4.0 * s,
-                        top: cy - 0.6 * s,
-                        right: cx + 4.0 * s,
-                        bottom: cy + 4.8 * s,
-                    },
-                    radiusX: 1.5 * s,
-                    radiusY: 1.5 * s,
-                };
-                self.rt.DrawRoundedRectangle(&body, brush, 1.3 * s, st);
-                if let Ok(geo) = self.d2d_factory.CreatePathGeometry() {
-                    if let Ok(sink) = geo.Open() {
-                        sink.BeginFigure(
-                            D2D_POINT_2F {
-                                x: cx - 2.3 * s,
-                                y: cy - 0.6 * s,
-                            },
-                            D2D1_FIGURE_BEGIN_HOLLOW,
-                        );
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: cx + 2.3 * s,
-                                y: cy - 0.6 * s,
-                            },
-                            size: D2D_SIZE_F {
-                                width: 2.3 * s,
-                                height: 3.0 * s,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_SMALL,
-                        });
-                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                        let _ = sink.Close();
-                        self.rt.DrawGeometry(&geo, brush, 1.3 * s, st);
-                    }
-                }
-            }
-            PrimaryItem::Close => {
-                if let Ok(arc) = self.d2d_factory.CreatePathGeometry() {
-                    if let Ok(sink) = arc.Open() {
-                        sink.BeginFigure(
-                            D2D_POINT_2F {
-                                x: cx + 3.1 * s,
-                                y: cy - 3.2 * s,
-                            },
-                            D2D1_FIGURE_BEGIN_HOLLOW,
-                        );
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: cx - 3.1 * s,
-                                y: cy - 3.2 * s,
-                            },
-                            size: D2D_SIZE_F {
-                                width: 4.5 * s,
-                                height: 4.5 * s,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_LARGE,
-                        });
-                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                        let _ = sink.Close();
-                        self.rt.DrawGeometry(&arc, brush, 1.35 * s, st);
-                    }
-                }
-                self.rt.DrawLine(
-                    D2D_POINT_2F {
-                        x: cx,
-                        y: cy - 5.1 * s,
-                    },
-                    D2D_POINT_2F {
-                        x: cx,
-                        y: cy + 0.2 * s,
-                    },
-                    brush,
-                    1.35 * s,
-                    st,
-                );
+            PrimaryItem::Settings => {
+                draw_settings_icon(&self.rt, cx, cy, s, brush);
             }
         }
     }
@@ -3266,6 +3511,12 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
             }
             let x = ((lparam.0 & 0xFFFF) as i16) as f32;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
+            if let Some(idx) = state.dragging_brightness {
+                if state.apply_brightness_drag(idx, x) {
+                    let _ = state.render();
+                }
+                return LRESULT(0);
+            }
             let next_hover = state.hit_test(x, y);
             let sub_changed = match next_hover {
                 Some(HoverTarget::Primary(item)) => state.set_active_submenu(item.submenu()),
@@ -3279,8 +3530,17 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
         }
         WM_MOUSELEAVE_MSG => {
             state.tracking_leave = false;
-            if state.anim_phase != PopupAnimPhase::Closing && state.hover.is_some() {
+            if state.anim_phase != PopupAnimPhase::Closing
+                && state.dragging_brightness.is_none()
+                && state.hover.is_some()
+            {
                 state.hover = None;
+                let _ = state.render();
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            if state.dragging_brightness.take().is_some() {
                 let _ = state.render();
             }
             LRESULT(0)
@@ -3291,6 +3551,23 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
             }
             let delta = ((wparam.0 >> 16) as i16) as i32;
             let steps = -(delta / 120);
+            if state.active_sub == Some(SubmenuKind::Brightness) && delta != 0 {
+                let mut pt = POINT {
+                    x: i32::from((lparam.0 & 0xFFFF) as i16),
+                    y: i32::from(((lparam.0 >> 16) & 0xFFFF) as i16),
+                };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                let wheel_hover = state.hit_test(pt.x as f32, pt.y as f32);
+                if let Some(HoverTarget::Sub(
+                    SubHoverTarget::BrightnessRow(idx) | SubHoverTarget::BrightnessSlider(idx),
+                )) = wheel_hover
+                {
+                    if state.step_brightness_wheel(idx, delta as i16) {
+                        let _ = state.render();
+                    }
+                    return LRESULT(0);
+                }
+            }
             if steps != 0 {
                 let max_wifi = state
                     .wireless_snap
@@ -3302,6 +3579,11 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
                     .bt_devices
                     .len()
                     .saturating_sub(MAX_LIST_ROWS);
+                let max_bright = state
+                    .brightness_snap
+                    .displays
+                    .len()
+                    .saturating_sub(MAX_BRIGHTNESS_ROWS);
                 let mut changed = false;
                 match state.active_sub {
                     Some(SubmenuKind::WiFi) if max_wifi > 0 => {
@@ -3317,6 +3599,14 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
                             .clamp(0, max_bt as isize) as usize;
                         if next != state.bt_scroll {
                             state.bt_scroll = next;
+                            changed = true;
+                        }
+                    }
+                    Some(SubmenuKind::Brightness) if max_bright > 0 => {
+                        let next = (state.brightness_scroll as isize + steps as isize)
+                            .clamp(0, max_bright as isize) as usize;
+                        if next != state.brightness_scroll {
+                            state.brightness_scroll = next;
                             changed = true;
                         }
                     }
@@ -3336,6 +3626,15 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
             if !state.point_inside_cards(x, y) {
                 state.begin_close();
+                return LRESULT(0);
+            }
+            let next_hover = state.hit_test(x, y);
+            state.hover = next_hover;
+            if let Some(HoverTarget::Sub(SubHoverTarget::BrightnessSlider(idx))) = next_hover {
+                state.dragging_brightness = Some(idx);
+                let _ = SetCapture(hwnd);
+                let _ = state.apply_brightness_drag(idx, x);
+                let _ = state.render();
             }
             LRESULT(0)
         }
@@ -3345,16 +3644,13 @@ unsafe extern "system" fn monitor_popup_wnd_proc(
             }
             let x = ((lparam.0 & 0xFFFF) as i16) as f32;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
+            if state.dragging_brightness.take().is_some() {
+                let _ = ReleaseCapture();
+                state.hover = state.hit_test(x, y);
+                let _ = state.render();
+                return LRESULT(0);
+            }
             match state.hit_test(x, y) {
-                Some(HoverTarget::Primary(PrimaryItem::Close)) => {
-                    state.hide_immediately();
-                    let _ = PostMessageW(
-                        state.owner_hwnd,
-                        WM_APP_MONITOR_CLOSE_SELF,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
-                }
                 Some(HoverTarget::Primary(item)) => {
                     if state.set_active_submenu(item.submenu()) {
                         let _ = state.render();
@@ -3411,22 +3707,13 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
             open_shell_target("ms-settings:bluetooth");
             state.begin_close();
         }
+        SubHoverTarget::BrightnessRow(_) | SubHoverTarget::BrightnessSlider(_) => {}
+        SubHoverTarget::BrightnessMoreSettings => {
+            open_shell_target("ms-settings:display");
+            state.begin_close();
+        }
         SubHoverTarget::LeftClickPreset(action) => {
-            let need_pick = {
-                if let Ok(mut guard) = state.cfg.lock() {
-                    if action == LeftClickAction::CustomApp && guard.custom_app_path.trim().is_empty()
-                    {
-                        true
-                    } else {
-                        guard.left_click = action;
-                        save_config(&state.config_path, &guard);
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if need_pick {
+            if action == LeftClickAction::CustomApp {
                 state.hide_immediately();
                 unsafe {
                     let _ = PostMessageW(
@@ -3437,6 +3724,10 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
                     );
                 }
             } else {
+                if let Ok(mut guard) = state.cfg.lock() {
+                    guard.left_click = action;
+                    save_config(&state.config_path, &guard);
+                }
                 unsafe {
                     let _ = PostMessageW(
                         state.owner_hwnd,
@@ -3446,17 +3737,6 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
                     );
                 }
                 state.begin_close();
-            }
-        }
-        SubHoverTarget::LeftClickPickFile => {
-            state.hide_immediately();
-            unsafe {
-                let _ = PostMessageW(
-                    state.owner_hwnd,
-                    WM_APP_MONITOR_PICK_CUSTOM_APP,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
             }
         }
         SubHoverTarget::DisplayMetric(item) => {
@@ -3482,7 +3762,7 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
                 let _ = state.render();
             }
         }
-        SubHoverTarget::PositionLock => {
+        SubHoverTarget::SettingLock => {
             unsafe {
                 let _ = PostMessageW(
                     state.owner_hwnd,
@@ -3493,7 +3773,7 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
             }
             state.begin_close();
         }
-        SubHoverTarget::PositionReset => {
+        SubHoverTarget::SettingReset => {
             unsafe {
                 let _ = PostMessageW(
                     state.owner_hwnd,
@@ -3503,6 +3783,17 @@ fn handle_sub_click(state: &mut MonitorPopupInner, target: SubHoverTarget) {
                 );
             }
             state.begin_close();
+        }
+        SubHoverTarget::SettingClose => {
+            state.hide_immediately();
+            unsafe {
+                let _ = PostMessageW(
+                    state.owner_hwnd,
+                    WM_APP_MONITOR_CLOSE_SELF,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
         }
     }
 }
