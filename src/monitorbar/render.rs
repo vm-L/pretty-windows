@@ -9,14 +9,12 @@ use crate::ui::glass::{
 };
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_OPEN,
-    D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1DCRenderTarget, ID2D1Factory1, D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL,
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
-    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    ID2D1DCRenderTarget, ID2D1Factory1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
+    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -31,12 +29,11 @@ pub struct MonitorRenderInput<'a> {
     pub accent: Rgb,
     pub hover_t: f32,
     pub dragging: bool,
-    pub popup_open_span_x: Option<(f32, f32)>,
+    pub popup_open: bool,
 }
 
 /// Hardware-backed Direct2D renderer committing frames into a 32-bit premultiplied layered surface.
 pub struct MonitorRenderer {
-    pub d2d_factory: ID2D1Factory1,
     pub dwrite_factory: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
     surface: LayeredSurface,
@@ -47,7 +44,7 @@ pub struct MonitorRenderer {
 
 impl MonitorRenderer {
     pub fn new_with_factories(
-        d2d_factory: ID2D1Factory1,
+        d2d_factory: &ID2D1Factory1,
         dwrite_factory: IDWriteFactory,
     ) -> windows::core::Result<Self> {
         unsafe {
@@ -67,7 +64,6 @@ impl MonitorRenderer {
             let surface = LayeredSurface::new()?;
 
             Ok(Self {
-                d2d_factory,
                 dwrite_factory,
                 rt,
                 surface,
@@ -164,7 +160,7 @@ impl MonitorRenderer {
             }
 
             // Hover / drag / open-popup subtle Liquid Glass capsule pill; fully transparent at rest.
-            let backdrop_t = if input.popup_open_span_x.is_some() {
+            let backdrop_t = if input.popup_open {
                 hover_t.max(1.0)
             } else {
                 hover_t
@@ -211,94 +207,7 @@ impl MonitorRenderer {
                     }
                 };
                 if let Ok(bb) = self.rt.CreateSolidColorBrush(&border_col, None) {
-                    if let Some((raw_l, raw_r)) = input.popup_open_span_x {
-                        let r = input.layout.bg_rect;
-                        let rad = input.layout.bg_radius;
-                        let gap_l = raw_l.clamp(r.left + rad, r.right - rad);
-                        let gap_r = raw_r.clamp(gap_l, r.right - rad);
-                        if let Ok(geo) = self.d2d_factory.CreatePathGeometry() {
-                            if let Ok(sink) = geo.Open() {
-                                sink.BeginFigure(
-                                    D2D_POINT_2F { x: gap_r, y: r.top },
-                                    D2D1_FIGURE_BEGIN_HOLLOW,
-                                );
-                                sink.AddLine(D2D_POINT_2F {
-                                    x: r.right - rad,
-                                    y: r.top,
-                                });
-                                sink.AddArc(&D2D1_ARC_SEGMENT {
-                                    point: D2D_POINT_2F {
-                                        x: r.right,
-                                        y: r.top + rad,
-                                    },
-                                    size: D2D_SIZE_F {
-                                        width: rad,
-                                        height: rad,
-                                    },
-                                    rotationAngle: 0.0,
-                                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                                    arcSize: D2D1_ARC_SIZE_SMALL,
-                                });
-                                sink.AddLine(D2D_POINT_2F {
-                                    x: r.right,
-                                    y: r.bottom - rad,
-                                });
-                                sink.AddArc(&D2D1_ARC_SEGMENT {
-                                    point: D2D_POINT_2F {
-                                        x: r.right - rad,
-                                        y: r.bottom,
-                                    },
-                                    size: D2D_SIZE_F {
-                                        width: rad,
-                                        height: rad,
-                                    },
-                                    rotationAngle: 0.0,
-                                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                                    arcSize: D2D1_ARC_SIZE_SMALL,
-                                });
-                                sink.AddLine(D2D_POINT_2F {
-                                    x: r.left + rad,
-                                    y: r.bottom,
-                                });
-                                sink.AddArc(&D2D1_ARC_SEGMENT {
-                                    point: D2D_POINT_2F {
-                                        x: r.left,
-                                        y: r.bottom - rad,
-                                    },
-                                    size: D2D_SIZE_F {
-                                        width: rad,
-                                        height: rad,
-                                    },
-                                    rotationAngle: 0.0,
-                                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                                    arcSize: D2D1_ARC_SIZE_SMALL,
-                                });
-                                sink.AddLine(D2D_POINT_2F {
-                                    x: r.left,
-                                    y: r.top + rad,
-                                });
-                                sink.AddArc(&D2D1_ARC_SEGMENT {
-                                    point: D2D_POINT_2F {
-                                        x: r.left + rad,
-                                        y: r.top,
-                                    },
-                                    size: D2D_SIZE_F {
-                                        width: rad,
-                                        height: rad,
-                                    },
-                                    rotationAngle: 0.0,
-                                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                                    arcSize: D2D1_ARC_SIZE_SMALL,
-                                });
-                                sink.AddLine(D2D_POINT_2F { x: gap_l, y: r.top });
-                                sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                                let _ = sink.Close();
-                                self.rt.DrawGeometry(&geo, &bb, 1.0 * s, None);
-                            }
-                        }
-                    } else {
-                        self.rt.DrawRoundedRectangle(&rr, &bb, 1.0 * s, None);
-                    }
+                    self.rt.DrawRoundedRectangle(&rr, &bb, 1.0 * s, None);
                 }
             }
 

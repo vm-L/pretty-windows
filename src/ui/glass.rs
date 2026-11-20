@@ -1,6 +1,7 @@
-use crate::color::{extract_backdrop_base_rgb, gaussian_blur_bgra, Rgb};
+use crate::color::{extract_backdrop_base_rgb, gaussian_blur_bgra, inpaint_occluded_rects_bgra, Rgb};
 use crate::ui::{
-    sample_liquid_silk_field, RectF, DIVIDER_H_DIP, SILK_H, SILK_UPDATE_INTERVAL_MS, SILK_W,
+    generate_acrylic_noise_bgra, sample_liquid_silk_field, PopupGlassRecipe, RectF,
+    DIVIDER_H_DIP, SILK_H, SILK_UPDATE_INTERVAL_MS, SILK_W,
 };
 use std::mem::size_of;
 use std::ptr::null_mut;
@@ -13,11 +14,12 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry, ID2D1SolidColorBrush,
-    ID2D1StrokeStyle, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
-    D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
-    D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES1,
+    ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle, D2D1_BITMAP_BRUSH_PROPERTIES,
+    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_ROUND, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ELLIPSE,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES1,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteInlineObject, IDWriteTextFormat, DWRITE_FONT_STRETCH_NORMAL,
@@ -325,13 +327,16 @@ pub fn create_text_format(
     }
 }
 
-/// Captures the desktop region directly behind a popup, returning both the frosted bitmap and its mean RGB.
-pub fn capture_blurred_desktop_backdrop(
+/// Captures the desktop region directly behind a popup while inpaints out any transient
+/// occluding windows (e.g. dismissing overflow flyouts/tooltips), returning the blurred bitmap and mean RGB.
+pub fn capture_blurred_desktop_backdrop_excluding(
     rt: &ID2D1DCRenderTarget,
     screen_x: i32,
     screen_y: i32,
     w: i32,
     h: i32,
+    blur_radius: usize,
+    exclude_screen_rects: &[RECT],
 ) -> (Option<ID2D1Bitmap>, Option<Rgb>) {
     if w <= 0 || h <= 0 {
         return (None, None);
@@ -402,28 +407,60 @@ pub fn capture_blurred_desktop_backdrop(
                     down.push(255);
                 }
             }
-            let mean = extract_backdrop_base_rgb(&down, dw, dh);
-            let blurred = gaussian_blur_bgra(&down, dw, dh, 6);
-            let props = D2D1_BITMAP_PROPERTIES {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-            };
-            let bmp = rt
-                .CreateBitmap(
-                    D2D_SIZE_U {
-                        width: dw as u32,
-                        height: dh as u32,
+
+            let mut fully_occluded = false;
+            if !exclude_screen_rects.is_empty() {
+                let mut down_rects = Vec::with_capacity(exclude_screen_rects.len());
+                for r in exclude_screen_rects {
+                    let rx0 = (r.left - screen_x).max(0) as usize;
+                    let ry0 = (r.top - screen_y).max(0) as usize;
+                    let rx1 = (r.right - screen_x).max(0) as usize;
+                    let ry1 = (r.bottom - screen_y).max(0) as usize;
+                    let x0 = (rx0 / 4).min(dw);
+                    let y0 = (ry0 / 4).min(dh);
+                    let x1 = (rx1.saturating_add(3) / 4).min(dw);
+                    let y1 = (ry1.saturating_add(3) / 4).min(dh);
+                    if x0 < x1 && y0 < y1 {
+                        down_rects.push((x0, y0, x1, y1));
+                    }
+                }
+                if !down_rects.is_empty()
+                    && !inpaint_occluded_rects_bgra(&mut down, dw, dh, &down_rects)
+                {
+                    fully_occluded = true;
+                }
+            }
+
+            if fully_occluded {
+                (None, None)
+            } else {
+                let mean = extract_backdrop_base_rgb(&down, dw, dh);
+                let blurred = if blur_radius == 0 {
+                    down
+                } else {
+                    gaussian_blur_bgra(&down, dw, dh, blur_radius)
+                };
+                let props = D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                     },
-                    Some(blurred.as_ptr().cast()),
-                    (dw * 4) as u32,
-                    &props,
-                )
-                .ok();
-            (bmp, mean)
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                };
+                let bmp = rt
+                    .CreateBitmap(
+                        D2D_SIZE_U {
+                            width: dw as u32,
+                            height: dh as u32,
+                        },
+                        Some(blurred.as_ptr().cast()),
+                        (dw * 4) as u32,
+                        &props,
+                    )
+                    .ok();
+                (bmp, mean)
+            }
         } else {
             (None, None)
         };
@@ -435,6 +472,19 @@ pub fn capture_blurred_desktop_backdrop(
     }
 }
 
+/// Captures the desktop region directly behind a popup, returning both the blurred bitmap and its mean RGB.
+#[allow(dead_code)]
+pub fn capture_blurred_desktop_backdrop(
+    rt: &ID2D1DCRenderTarget,
+    screen_x: i32,
+    screen_y: i32,
+    w: i32,
+    h: i32,
+    blur_radius: usize,
+) -> (Option<ID2D1Bitmap>, Option<Rgb>) {
+    capture_blurred_desktop_backdrop_excluding(rt, screen_x, screen_y, w, h, blur_radius, &[])
+}
+
 /// Captures only the blurred desktop bitmap behind a popup (compatibility helper).
 #[allow(dead_code)]
 pub fn capture_blurred_desktop_bitmap(
@@ -444,7 +494,7 @@ pub fn capture_blurred_desktop_bitmap(
     w: i32,
     h: i32,
 ) -> Option<ID2D1Bitmap> {
-    capture_blurred_desktop_backdrop(rt, screen_x, screen_y, w, h).0
+    capture_blurred_desktop_backdrop(rt, screen_x, screen_y, w, h, 6).0
 }
 
 /// Samples the mean opaque RGB color of a small screen region (e.g. taskbar background next to a widget).
@@ -603,7 +653,59 @@ pub fn update_silk_bitmap(
     }
 }
 
-/// Draws the 4 interior layers of Liquid Glass (blurred backdrop, neutral base, liquid silk, diagonal sheen).
+/// Lazily cached 128×128 tiled premultiplied BGRA micro-grain brush shared across frosted/acrylic popups.
+#[derive(Default)]
+pub struct PopupNoiseCache {
+    brush: Option<ID2D1BitmapBrush>,
+    max_alpha: u8,
+}
+
+impl PopupNoiseCache {
+    pub fn ensure_brush(
+        &mut self,
+        rt: &ID2D1DCRenderTarget,
+        max_alpha: u8,
+    ) -> Option<&ID2D1BitmapBrush> {
+        if max_alpha == 0 {
+            return None;
+        }
+        if self.brush.is_none() || self.max_alpha != max_alpha {
+            const NOISE_SIZE: u32 = 128;
+            let bytes = generate_acrylic_noise_bgra(NOISE_SIZE as usize, 0x51A7_C301, max_alpha);
+            let bmp_props = D2D1_BITMAP_PROPERTIES {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+            };
+            unsafe {
+                let bmp = rt
+                    .CreateBitmap(
+                        D2D_SIZE_U {
+                            width: NOISE_SIZE,
+                            height: NOISE_SIZE,
+                        },
+                        Some(bytes.as_ptr().cast()),
+                        NOISE_SIZE * 4,
+                        &bmp_props,
+                    )
+                    .ok()?;
+                let brush_props = D2D1_BITMAP_BRUSH_PROPERTIES {
+                    extendModeX: D2D1_EXTEND_MODE_WRAP,
+                    extendModeY: D2D1_EXTEND_MODE_WRAP,
+                    interpolationMode: D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                };
+                self.brush = rt.CreateBitmapBrush(&bmp, Some(&brush_props), None).ok();
+                self.max_alpha = max_alpha;
+            }
+        }
+        self.brush.as_ref()
+    }
+}
+
+/// Draws the style-harmonized glass interior layers (blurred backdrop, neutral base, frosted veil, grain, silk, diagonal sheen).
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn draw_glass_interior(
     rt: &ID2D1DCRenderTarget,
@@ -613,6 +715,8 @@ pub unsafe fn draw_glass_interior(
     backdrop_bmp: Option<&ID2D1Bitmap>,
     silk_bmp: Option<&ID2D1Bitmap>,
     light_glass: bool,
+    recipe: &PopupGlassRecipe,
+    noise_cache: &mut PopupNoiseCache,
 ) {
     let full_win = D2D_RECT_F {
         left: 0.0,
@@ -625,103 +729,146 @@ pub unsafe fn draw_glass_interior(
         rt.DrawBitmap(
             bg_bmp,
             Some(&full_win),
-            0.88,
+            recipe.backdrop_alpha,
             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
             None,
         );
     } else {
-        let fallback_bg = if light_glass {
-            D2D1_COLOR_F {
-                r: 246.0 / 255.0,
-                g: 246.0 / 255.0,
-                b: 248.0 / 255.0,
-                a: 0.90,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 26.0 / 255.0,
-                g: 26.0 / 255.0,
-                b: 28.0 / 255.0,
-                a: 0.88,
-            }
+        let fallback_bg = D2D1_COLOR_F {
+            r: recipe.tint_rgb.0,
+            g: recipe.tint_rgb.1,
+            b: recipe.tint_rgb.2,
+            a: (recipe.tint_alpha + 0.28).clamp(0.45, 0.92),
         };
         if let Ok(fb_brush) = rt.CreateSolidColorBrush(&fallback_bg, None) {
             rt.FillRectangle(&d2d_rect(bounds), &fb_brush);
         }
     }
 
-    let glass_base = if light_glass {
-        D2D1_COLOR_F {
-            r: 246.0 / 255.0,
-            g: 246.0 / 255.0,
-            b: 248.0 / 255.0,
-            a: 0.74,
-        }
-    } else {
-        D2D1_COLOR_F {
-            r: 24.0 / 255.0,
-            g: 24.0 / 255.0,
-            b: 26.0 / 255.0,
-            a: 0.72,
-        }
+    let glass_base = D2D1_COLOR_F {
+        r: recipe.tint_rgb.0,
+        g: recipe.tint_rgb.1,
+        b: recipe.tint_rgb.2,
+        a: recipe.tint_alpha,
     };
     if let Ok(base_brush) = rt.CreateSolidColorBrush(&glass_base, None) {
         rt.FillRectangle(&d2d_rect(bounds), &base_brush);
     }
 
-    if let Some(silk) = silk_bmp {
-        rt.DrawBitmap(
-            silk,
-            Some(&full_win),
-            1.0,
-            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-            None,
-        );
+    if recipe.frost_veil_top_alpha > 0.002 {
+        let veil_stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: recipe.frost_veil_top_alpha,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 0.55,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: recipe.frost_veil_mid_alpha,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: recipe.frost_veil_bot_alpha,
+                },
+            },
+        ];
+        if let Ok(sc) =
+            rt.CreateGradientStopCollection(&veil_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+        {
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F {
+                    x: bounds.left,
+                    y: bounds.top,
+                },
+                endPoint: D2D_POINT_2F {
+                    x: bounds.left,
+                    y: bounds.bottom,
+                },
+            };
+            if let Ok(veil_brush) = rt.CreateLinearGradientBrush(&props, None, &sc) {
+                rt.FillRectangle(&d2d_rect(bounds), &veil_brush);
+            }
+        }
     }
 
-    let sheen_stops = [
-        D2D1_GRADIENT_STOP {
-            position: 0.0,
-            color: D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: if light_glass { 0.26 } else { 0.14 },
+    if recipe.grain_max_alpha > 0 {
+        if let Some(noise_brush) = noise_cache.ensure_brush(rt, recipe.grain_max_alpha) {
+            rt.FillRectangle(&d2d_rect(bounds), noise_brush);
+        }
+    }
+
+    if recipe.silk_alpha > 0.002 {
+        if let Some(silk) = silk_bmp {
+            rt.DrawBitmap(
+                silk,
+                Some(&full_win),
+                recipe.silk_alpha,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            );
+        }
+    }
+
+    if recipe.sheen_scale > 0.01 {
+        let ss = recipe.sheen_scale;
+        let sheen_stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: (if light_glass { 0.24 } else { 0.14 }) * ss,
+                },
             },
-        },
-        D2D1_GRADIENT_STOP {
-            position: 0.45,
-            color: D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: if light_glass { 0.03 } else { 0.02 },
+            D2D1_GRADIENT_STOP {
+                position: 0.45,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: (if light_glass { 0.03 } else { 0.02 }) * ss,
+                },
             },
-        },
-        D2D1_GRADIENT_STOP {
-            position: 1.0,
-            color: D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: if light_glass { 0.10 } else { 0.06 },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: (if light_glass { 0.09 } else { 0.06 }) * ss,
+                },
             },
-        },
-    ];
-    if let Ok(sc) = rt.CreateGradientStopCollection(&sheen_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
-    {
-        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-            startPoint: D2D_POINT_2F {
-                x: bounds.left,
-                y: bounds.top,
-            },
-            endPoint: D2D_POINT_2F {
-                x: bounds.right,
-                y: bounds.bottom,
-            },
-        };
-        if let Ok(sheen_brush) = rt.CreateLinearGradientBrush(&props, None, &sc) {
-            rt.FillRectangle(&d2d_rect(bounds), &sheen_brush);
+        ];
+        if let Ok(sc) =
+            rt.CreateGradientStopCollection(&sheen_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+        {
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F {
+                    x: bounds.left,
+                    y: bounds.top,
+                },
+                endPoint: D2D_POINT_2F {
+                    x: bounds.right,
+                    y: bounds.bottom,
+                },
+            };
+            if let Ok(sheen_brush) = rt.CreateLinearGradientBrush(&props, None, &sc) {
+                rt.FillRectangle(&d2d_rect(bounds), &sheen_brush);
+            }
         }
     }
 }
@@ -771,98 +918,66 @@ pub unsafe fn draw_rounded_card_shadows(
     }
 }
 
-fn rim_gradient_stops(light_glass: bool) -> [D2D1_GRADIENT_STOP; 3] {
-    if light_glass {
-        [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.82,
-                },
+fn rim_gradient_stops(recipe: &PopupGlassRecipe) -> [D2D1_GRADIENT_STOP; 3] {
+    [
+        D2D1_GRADIENT_STOP {
+            position: 0.0,
+            color: D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: recipe.rim_top_alpha,
             },
-            D2D1_GRADIENT_STOP {
-                position: 0.55,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.42,
-                },
+        },
+        D2D1_GRADIENT_STOP {
+            position: 0.55,
+            color: D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: recipe.rim_mid_alpha,
             },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.22,
-                },
+        },
+        D2D1_GRADIENT_STOP {
+            position: 1.0,
+            color: D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: recipe.rim_bot_alpha,
             },
-        ]
-    } else {
-        [
-            D2D1_GRADIENT_STOP {
-                position: 0.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.48,
-                },
-            },
-            D2D1_GRADIENT_STOP {
-                position: 0.55,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.18,
-                },
-            },
-            D2D1_GRADIENT_STOP {
-                position: 1.0,
-                color: D2D1_COLOR_F {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.13,
-                },
-            },
-        ]
-    }
+        },
+    ]
 }
 
-/// Draws the crisp vertical-gradient glass rim highlight around a standalone closed rounded card.
+/// Draws the restrained vertical-gradient glass rim highlight around a standalone closed rounded card.
 #[allow(dead_code)]
 pub unsafe fn draw_rounded_card_rim(
     rt: &ID2D1DCRenderTarget,
     card_rect: RectF,
     radius: f32,
     s: f32,
-    light_glass: bool,
+    recipe: &PopupGlassRecipe,
 ) {
     let rr = D2D1_ROUNDED_RECT {
         rect: d2d_rect(card_rect),
         radiusX: radius,
         radiusY: radius,
     };
-    if light_glass {
+    if recipe.rim_dark_sep_alpha > 0.004 {
         let def_col = D2D1_COLOR_F {
             r: 0.0,
             g: 0.0,
             b: 0.0,
-            a: 0.09,
+            a: recipe.rim_dark_sep_alpha,
         };
         if let Ok(def_brush) = rt.CreateSolidColorBrush(&def_col, None) {
-            rt.DrawRoundedRectangle(&rr, &def_brush, 1.3 * s, None);
+            rt.DrawRoundedRectangle(&rr, &def_brush, 1.25 * s, None);
         }
     }
 
-    let rim_stops = rim_gradient_stops(light_glass);
-    let stroke_w = if light_glass { 1.0 * s } else { 1.15 * s };
+    let rim_stops = rim_gradient_stops(recipe);
+    let stroke_w = recipe.rim_stroke_dip * s;
     if let Ok(sc) =
         rt.CreateGradientStopCollection(&rim_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
     {
@@ -882,7 +997,7 @@ pub unsafe fn draw_rounded_card_rim(
     }
 }
 
-/// Draws the standard Liquid Glass specular rim highlight along an arbitrary closed/unified geometry contour.
+/// Draws the restrained glass rim highlight along an arbitrary closed/unified geometry contour.
 pub unsafe fn draw_geometry_rim(
     rt: &ID2D1DCRenderTarget,
     geo: &ID2D1Geometry,
@@ -890,22 +1005,22 @@ pub unsafe fn draw_geometry_rim(
     top_y: f32,
     bottom_y: f32,
     s: f32,
-    light_glass: bool,
+    recipe: &PopupGlassRecipe,
 ) {
-    if light_glass {
+    if recipe.rim_dark_sep_alpha > 0.004 {
         let def_col = D2D1_COLOR_F {
             r: 0.0,
             g: 0.0,
             b: 0.0,
-            a: 0.09,
+            a: recipe.rim_dark_sep_alpha,
         };
         if let Ok(def_brush) = rt.CreateSolidColorBrush(&def_col, None) {
-            rt.DrawGeometry(geo, &def_brush, 1.3 * s, None);
+            rt.DrawGeometry(geo, &def_brush, 1.25 * s, None);
         }
     }
 
-    let rim_stops = rim_gradient_stops(light_glass);
-    let stroke_w = if light_glass { 1.0 * s } else { 1.15 * s };
+    let rim_stops = rim_gradient_stops(recipe);
+    let stroke_w = recipe.rim_stroke_dip * s;
     if let Ok(sc) =
         rt.CreateGradientStopCollection(&rim_stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
     {

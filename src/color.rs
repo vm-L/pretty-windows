@@ -400,6 +400,138 @@ fn box_blur_v(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: u
     }
 }
 
+/// Replaces pixels inside transient occluding rectangles (e.g. dismissing overflow flyouts/tooltips)
+/// by smoothly interpolating from nearest unoccluded orthogonal neighbors along 4 cardinal rays,
+/// falling back to the unoccluded mean RGB when an entire row/column is covered.
+/// Returns `false` if the entire buffer is occluded (caller should use a neutral glass fallback).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn inpaint_occluded_rects_bgra(
+    bgra: &mut [u8],
+    width: usize,
+    height: usize,
+    occluded_rects: &[(usize, usize, usize, usize)],
+) -> bool {
+    let Some(total) = width.checked_mul(height) else {
+        return false;
+    };
+    let Some(byte_len) = total.checked_mul(4) else {
+        return false;
+    };
+    if width == 0 || height == 0 || bgra.len() < byte_len {
+        return false;
+    }
+    if occluded_rects.is_empty() {
+        return true;
+    }
+
+    let mut mask = vec![false; total];
+    let mut occluded_count = 0usize;
+    for &(rx0, ry0, rx1, ry1) in occluded_rects {
+        let x0 = rx0.min(width);
+        let x1 = rx1.min(width);
+        let y0 = ry0.min(height);
+        let y1 = ry1.min(height);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        for y in y0..y1 {
+            let row_off = y * width;
+            for x in x0..x1 {
+                let idx = row_off + x;
+                if !mask[idx] {
+                    mask[idx] = true;
+                    occluded_count += 1;
+                }
+            }
+        }
+    }
+
+    if occluded_count == 0 {
+        return true;
+    }
+    if occluded_count >= total {
+        return false;
+    }
+
+    let mut sum_b = 0u64;
+    let mut sum_g = 0u64;
+    let mut sum_r = 0u64;
+    let mut clean_count = 0u64;
+    for (i, px) in bgra[..byte_len].chunks_exact(4).enumerate() {
+        if !mask[i] {
+            sum_b += u64::from(px[0]);
+            sum_g += u64::from(px[1]);
+            sum_r += u64::from(px[2]);
+            clean_count += 1;
+        }
+    }
+    let clean_denom = clean_count.max(1) as f32;
+    let mean_b = (sum_b as f32) / clean_denom;
+    let mean_g = (sum_g as f32) / clean_denom;
+    let mean_r = (sum_r as f32) / clean_denom;
+
+    let clean = bgra[..byte_len].to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            if !mask[y * width + x] {
+                continue;
+            }
+            let mut acc_b = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_r = 0.0f32;
+            let mut w_sum = 0.0f32;
+
+            let mut accumulate_clean = |nx: usize, ny: usize, dist: usize| {
+                let p = (ny * width + nx) * 4;
+                let w = 1.0 / (dist.max(1) as f32);
+                acc_b += f32::from(clean[p]) * w;
+                acc_g += f32::from(clean[p + 1]) * w;
+                acc_r += f32::from(clean[p + 2]) * w;
+                w_sum += w;
+            };
+
+            for lx in (0..x).rev() {
+                if !mask[y * width + lx] {
+                    accumulate_clean(lx, y, x - lx);
+                    break;
+                }
+            }
+            for rx in (x + 1)..width {
+                if !mask[y * width + rx] {
+                    accumulate_clean(rx, y, rx - x);
+                    break;
+                }
+            }
+            for uy in (0..y).rev() {
+                if !mask[uy * width + x] {
+                    accumulate_clean(x, uy, y - uy);
+                    break;
+                }
+            }
+            for dy in (y + 1)..height {
+                if !mask[dy * width + x] {
+                    accumulate_clean(x, dy, dy - y);
+                    break;
+                }
+            }
+
+            let out = (y * width + x) * 4;
+            if w_sum > 0.0 {
+                bgra[out] = (acc_b / w_sum).round().clamp(0.0, 255.0) as u8;
+                bgra[out + 1] = (acc_g / w_sum).round().clamp(0.0, 255.0) as u8;
+                bgra[out + 2] = (acc_r / w_sum).round().clamp(0.0, 255.0) as u8;
+            } else {
+                bgra[out] = mean_b.round().clamp(0.0, 255.0) as u8;
+                bgra[out + 1] = mean_g.round().clamp(0.0, 255.0) as u8;
+                bgra[out + 2] = mean_r.round().clamp(0.0, 255.0) as u8;
+            }
+            bgra[out + 3] = 255;
+        }
+    }
+
+    true
+}
+
 /// Adjusts saturation and brightness on straight BGRA pixels for vibrant liquid-glass backdrops.
 #[allow(dead_code)]
 pub fn boost_vibrance_bgra(bgra: &mut [u8], sat_mul: f32, luma_mul: f32) {
@@ -576,5 +708,37 @@ mod tests {
         let px = [20u8, 60, 100, 255, 40, 80, 120, 255];
         assert_eq!(extract_backdrop_base_rgb(&px, 2, 1), Some(Rgb::new(110, 70, 30)));
         assert_eq!(extract_backdrop_base_rgb(&[], 0, 0), None);
+    }
+
+    #[test]
+    fn inpaint_occluded_rects_replaces_transient_corner_cleanly() {
+        let w = 8usize;
+        let h = 8usize;
+        let mut buf = [247u8, 247, 247, 255].repeat(w * h);
+        // Pollute the bottom-left 4x4 corner with a dark-blue BGRA swatch (B=180, G=140, R=100)
+        for y in 4..8 {
+            for x in 0..4 {
+                let i = (y * w + x) * 4;
+                buf[i] = 180;
+                buf[i + 1] = 140;
+                buf[i + 2] = 100;
+                buf[i + 3] = 255;
+            }
+        }
+
+        // Empty occlusion list is a no-op returning true
+        let untouched_snapshot = buf.clone();
+        assert!(inpaint_occluded_rects_bgra(&mut buf, w, h, &[]));
+        assert_eq!(buf, untouched_snapshot);
+
+        // Full coverage reports false so caller can use neutral fallback
+        let mut full_buf = buf.clone();
+        assert!(!inpaint_occluded_rects_bgra(&mut full_buf, w, h, &[(0, 0, w, h)]));
+
+        // Occluding bottom-left corner restores pure white from surrounding clean neighbors
+        assert!(inpaint_occluded_rects_bgra(&mut buf, w, h, &[(0, 4, 4, 8)]));
+        for px in buf.chunks_exact(4) {
+            assert_eq!(px, &[247, 247, 247, 255]);
+        }
     }
 }

@@ -238,7 +238,7 @@ pub struct RenderFrame<'a> {
     pub vol_hud_dragging: bool,
     pub master_volume: f32,
     pub master_muted: bool,
-    pub popup_open_span_x: Option<(f32, f32)>,
+    pub popup_open: bool,
     pub bar_levels: &'a [f32; NUM_BARS],
     pub title_marquee: &'a mut MarqueeState,
     pub artist_marquee: &'a mut MarqueeState,
@@ -587,7 +587,7 @@ impl BarRenderer {
             }
 
             // 1. Hover micro-translucent taskbar pill backdrop (always crisp when volume HUD or popup is active)
-            let backdrop_t = if frame.vol_hud_active || frame.popup_open_span_x.is_some() {
+            let backdrop_t = if frame.vol_hud_active || frame.popup_open {
                 layout.hover_t.max(1.0)
             } else {
                 layout.hover_t
@@ -600,7 +600,7 @@ impl BarRenderer {
                     frame.hover_zone == HitZone::MediaInfo,
                     !frame.locked,
                     frame.vol_hud_active,
-                    frame.popup_open_span_x,
+                    frame.popup_open,
                 );
             }
 
@@ -880,7 +880,7 @@ impl BarRenderer {
         media_hovered: bool,
         unlocked: bool,
         vol_hud_active: bool,
-        popup_open_span_x: Option<(f32, f32)>,
+        popup_open: bool,
     ) {
         let bg_color = if light_taskbar {
             D2D1_COLOR_F {
@@ -921,7 +921,7 @@ impl BarRenderer {
         if let Ok(bg_brush) = self.rt.CreateSolidColorBrush(&bg_color, None) {
             self.rt.FillRoundedRectangle(&rrect, &bg_brush);
         }
-        if media_hovered && popup_open_span_x.is_none() {
+        if media_hovered && !popup_open {
             let sub_color = if light_taskbar {
                 D2D1_COLOR_F {
                     r: 0.0,
@@ -957,96 +957,8 @@ impl BarRenderer {
             }
         }
         if let Ok(border_brush) = self.rt.CreateSolidColorBrush(&border_color, None) {
-            if let Some((raw_l, raw_r)) = popup_open_span_x {
-                let r = layout.bg_rect;
-                let rad = layout.bg_radius;
-                let gap_l = raw_l.clamp(r.left + rad, r.right - rad);
-                let gap_r = raw_r.clamp(gap_l, r.right - rad);
-                if let Ok(geo) = self.d2d_factory.CreatePathGeometry() {
-                    if let Ok(sink) = geo.Open() {
-                        sink.BeginFigure(
-                            D2D_POINT_2F { x: gap_r, y: r.top },
-                            D2D1_FIGURE_BEGIN_HOLLOW,
-                        );
-                        sink.AddLine(D2D_POINT_2F {
-                            x: r.right - rad,
-                            y: r.top,
-                        });
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: r.right,
-                                y: r.top + rad,
-                            },
-                            size: D2D_SIZE_F {
-                                width: rad,
-                                height: rad,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_SMALL,
-                        });
-                        sink.AddLine(D2D_POINT_2F {
-                            x: r.right,
-                            y: r.bottom - rad,
-                        });
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: r.right - rad,
-                                y: r.bottom,
-                            },
-                            size: D2D_SIZE_F {
-                                width: rad,
-                                height: rad,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_SMALL,
-                        });
-                        sink.AddLine(D2D_POINT_2F {
-                            x: r.left + rad,
-                            y: r.bottom,
-                        });
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: r.left,
-                                y: r.bottom - rad,
-                            },
-                            size: D2D_SIZE_F {
-                                width: rad,
-                                height: rad,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_SMALL,
-                        });
-                        sink.AddLine(D2D_POINT_2F {
-                            x: r.left,
-                            y: r.top + rad,
-                        });
-                        sink.AddArc(&D2D1_ARC_SEGMENT {
-                            point: D2D_POINT_2F {
-                                x: r.left + rad,
-                                y: r.top,
-                            },
-                            size: D2D_SIZE_F {
-                                width: rad,
-                                height: rad,
-                            },
-                            rotationAngle: 0.0,
-                            sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
-                            arcSize: D2D1_ARC_SIZE_SMALL,
-                        });
-                        sink.AddLine(D2D_POINT_2F { x: gap_l, y: r.top });
-                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                        let _ = sink.Close();
-                        self.rt
-                            .DrawGeometry(&geo, &border_brush, 1.0 * layout.scale, None);
-                    }
-                }
-            } else {
-                self.rt
-                    .DrawRoundedRectangle(&rrect, &border_brush, 1.0 * layout.scale, None);
-            }
+            self.rt
+                .DrawRoundedRectangle(&rrect, &border_brush, 1.0 * layout.scale, None);
         }
     }
 

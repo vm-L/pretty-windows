@@ -1,7 +1,7 @@
 use crate::taskbar::TaskbarStyle;
 use crate::ui::{
-    ease_retract, PopupAnimPhase, RectF, DIVIDER_H_DIP, INNER_PAD_DIP, ROW_GAP_DIP, ROW_H_DIP,
-    SHADOW_PAD_DIP,
+    ease_retract, PopupAnimPhase, RectF, DIVIDER_H_DIP, INNER_PAD_DIP, POPUP_FLOAT_GAP_DIP,
+    ROW_GAP_DIP, ROW_H_DIP, SHADOW_PAD_DIP,
 };
 
 /// Logical width of the primary tray menu card in DIPs.
@@ -175,6 +175,45 @@ impl TrayMenuLayout {
     }
 }
 
+/// Shifts an anchor cursor point resting on a docked taskbar outward to match
+/// `POPUP_FLOAT_GAP_DIP` above/beside the taskbar edge, while preserving clicks inside
+/// the work area (such as inside the overflow tray flyout) or on auto-hide taskbars.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn adjust_tray_anchor_for_work_area(
+    cursor_x: i32,
+    cursor_y: i32,
+    work_left: i32,
+    work_top: i32,
+    work_right: i32,
+    work_bottom: i32,
+    mon_left: i32,
+    mon_top: i32,
+    mon_right: i32,
+    mon_bottom: i32,
+    dpi: u32,
+) -> (i32, i32) {
+    let s = (dpi.max(96) as f32) / 96.0;
+    let cursor_offset = (2.0 * s).round() as i32;
+    let float_gap = (POPUP_FLOAT_GAP_DIP * s).round() as i32;
+    let pad_adj = (float_gap - cursor_offset).max(0);
+
+    let mut adj_x = cursor_x;
+    let mut adj_y = cursor_y;
+
+    if work_bottom < mon_bottom && cursor_y >= work_bottom - float_gap {
+        adj_y = work_bottom - pad_adj;
+    } else if work_top > mon_top && cursor_y <= work_top + float_gap {
+        adj_y = work_top + pad_adj;
+    } else if work_right < mon_right && cursor_x >= work_right - float_gap {
+        adj_x = work_right - pad_adj;
+    } else if work_left > mon_left && cursor_x <= work_left + float_gap {
+        adj_x = work_left + pad_adj;
+    }
+
+    (adj_x, adj_y)
+}
+
 /// Computes `(win_x, win_y, sub_open_left, open_down)` anchored to `(cursor_x, cursor_y)`
 /// within full monitor bounds `[mon_left..mon_right, mon_top..mon_bottom]`.
 /// Primary prefers right-up; submenu opens to the side with space (preferring right of primary).
@@ -275,6 +314,62 @@ pub fn animated_tray_card_rect(
             target.right,
             target.bottom,
         )
+    }
+}
+
+pub const TRAY_EVENT_LBUTTONUP: u32 = 0x0202;
+pub const TRAY_EVENT_RBUTTONUP: u32 = 0x0205;
+pub const TRAY_EVENT_CONTEXTMENU: u32 = 0x007B;
+pub const TRAY_EVENT_NIN_SELECT: u32 = 0x0400;
+pub const TRAY_EVENT_NIN_KEYSELECT: u32 = 0x0401;
+
+const TRAY_COMPANION_DEDUP_MS: u64 = 85;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum TrayTriggerKind {
+    Left,
+    Right,
+    Keyboard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct TrayClickDecision {
+    pub kind: TrayTriggerKind,
+    pub use_cursor: bool,
+}
+
+/// Filters Win11 `NOTIFYICON_VERSION_4` tray callback events reliably:
+/// accepts both mouse-up and shell semantic events (preventing lost clicks on slight pointer drift)
+/// while deduplicating companion events emitted for the same physical click.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct TrayClickFilter {
+    last: Option<(TrayTriggerKind, u32, u64)>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl TrayClickFilter {
+    pub fn evaluate(&mut self, event: u32, now_ms: u64) -> Option<TrayClickDecision> {
+        let (kind, use_cursor) = match event {
+            TRAY_EVENT_LBUTTONUP | TRAY_EVENT_NIN_SELECT => (TrayTriggerKind::Left, true),
+            TRAY_EVENT_RBUTTONUP | TRAY_EVENT_CONTEXTMENU => (TrayTriggerKind::Right, true),
+            TRAY_EVENT_NIN_KEYSELECT => (TrayTriggerKind::Keyboard, false),
+            _ => return None,
+        };
+
+        if let Some((prev_kind, prev_event, prev_ms)) = self.last {
+            if prev_kind == kind
+                && prev_event != event
+                && now_ms.saturating_sub(prev_ms) < TRAY_COMPANION_DEDUP_MS
+            {
+                return None;
+            }
+        }
+
+        self.last = Some((kind, event, now_ms));
+        Some(TrayClickDecision { kind, use_cursor })
     }
 }
 
@@ -482,5 +577,128 @@ mod tests {
             assert!(op_dn.bottom <= win_h - 4.0);
             assert!(op_dn.height() >= 38.0);
         }
+    }
+
+    #[test]
+    fn tray_click_filter_handles_v4_companions_drift_and_rapid_clicks() {
+        const WM_MOUSEMOVE_EV: u32 = 0x0200;
+        const WM_LBUTTONDOWN_EV: u32 = 0x0201;
+        const WM_LBUTTONDBLCLK_EV: u32 = 0x0203;
+        const WM_RBUTTONDOWN_EV: u32 = 0x0204;
+
+        let mut filter = TrayClickFilter::default();
+
+        // Down / move / double-click noise is ignored cleanly
+        assert_eq!(filter.evaluate(WM_MOUSEMOVE_EV, 10), None);
+        assert_eq!(filter.evaluate(WM_LBUTTONDOWN_EV, 12), None);
+        assert_eq!(filter.evaluate(WM_RBUTTONDOWN_EV, 14), None);
+        assert_eq!(filter.evaluate(WM_LBUTTONDBLCLK_EV, 16), None);
+
+        // 1. Slight pointer drift on Win11: WM_LBUTTONUP fires WITHOUT NIN_SELECT -> still opens!
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_LBUTTONUP, 100),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Left,
+                use_cursor: true,
+            })
+        );
+
+        // 2. Same click later arrives normally: WM_LBUTTONUP + NIN_SELECT 2ms apart -> companion deduped!
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_LBUTTONUP, 400),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Left,
+                use_cursor: true,
+            })
+        );
+        assert_eq!(filter.evaluate(TRAY_EVENT_NIN_SELECT, 402), None);
+
+        // 3. Reverse companion ordering on right click: WM_CONTEXTMENU then WM_RBUTTONUP -> deduped!
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_CONTEXTMENU, 700),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Right,
+                use_cursor: true,
+            })
+        );
+        assert_eq!(filter.evaluate(TRAY_EVENT_RBUTTONUP, 703), None);
+
+        // 4. Right click firing only WM_RBUTTONUP (without WM_CONTEXTMENU) still triggers!
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_RBUTTONUP, 900),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Right,
+                use_cursor: true,
+            })
+        );
+
+        // 5. Rapid successive physical left clicks within 60ms (same event code) both fire!
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_LBUTTONUP, 1000),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Left,
+                use_cursor: true,
+            })
+        );
+        assert_eq!(filter.evaluate(TRAY_EVENT_NIN_SELECT, 1001), None);
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_LBUTTONUP, 1060),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Left,
+                use_cursor: true,
+            })
+        );
+        assert_eq!(filter.evaluate(TRAY_EVENT_NIN_SELECT, 1061), None);
+
+        // 6. Keyboard activation uses tray icon rect anchor (`use_cursor: false`)
+        assert_eq!(
+            filter.evaluate(TRAY_EVENT_NIN_KEYSELECT, 1200),
+            Some(TrayClickDecision {
+                kind: TrayTriggerKind::Keyboard,
+                use_cursor: false,
+            })
+        );
+    }
+
+    #[test]
+    fn tray_anchor_floats_above_docked_taskbar_and_preserves_overflow_clicks() {
+        // Bottom docked taskbar (work 0..1032 on 1920x1080): pinned tray click at y=1056 lifts to work_bottom - 5
+        // so compute_tray_cascading_placement (-2) leaves card bottom at 1032 - 7 = 1025 (exact 7 DIP float gap).
+        let (ax, ay) =
+            adjust_tray_anchor_for_work_area(1720, 1056, 0, 0, 1920, 1032, 0, 0, 1920, 1080, 96);
+        assert_eq!((ax, ay), (1720, 1027));
+        let layout = TrayMenuLayout::compute(96, true, false);
+        let pad = SHADOW_PAD_DIP as i32;
+        let max_h = layout.primary_rect.height().round() as i32;
+        let (_, wy, _, down) =
+            compute_tray_cascading_placement(ax, ay, 0, 0, 1920, 1080, 96);
+        assert!(!down);
+        assert_eq!(wy + pad + max_h, 1032 - 7);
+
+        // Overflow flyout click well above taskbar (y=960) stays anchored directly at cursor.
+        assert_eq!(
+            adjust_tray_anchor_for_work_area(1720, 960, 0, 0, 1920, 1032, 0, 0, 1920, 1080, 96),
+            (1720, 960)
+        );
+
+        // Auto-hide taskbar (work == monitor) preserves cursor anchor untouched.
+        assert_eq!(
+            adjust_tray_anchor_for_work_area(1720, 1068, 0, 0, 1920, 1080, 0, 0, 1920, 1080, 96),
+            (1720, 1068)
+        );
+
+        // Top, right, and left docked taskbars float cleanly inward by POPUP_FLOAT_GAP_DIP (7 DIP).
+        assert_eq!(
+            adjust_tray_anchor_for_work_area(1720, 20, 0, 48, 1920, 1080, 0, 0, 1920, 1080, 96),
+            (1720, 53)
+        );
+        assert_eq!(
+            adjust_tray_anchor_for_work_area(1895, 900, 0, 0, 1872, 1080, 0, 0, 1920, 1080, 96),
+            (1867, 900)
+        );
+        assert_eq!(
+            adjust_tray_anchor_for_work_area(24, 900, 48, 0, 1920, 1080, 0, 0, 1920, 1080, 96),
+            (53, 900)
+        );
     }
 }

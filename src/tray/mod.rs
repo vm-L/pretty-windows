@@ -8,6 +8,7 @@ pub use win::run;
 
 #[cfg(windows)]
 mod win {
+    use super::layout::TrayClickFilter;
     use super::menu::{
         TrayMenu, WM_APP_TRAY_EXIT, WM_APP_TRAY_MENU_CLOSED, WM_APP_TRAY_SET_TASKBAR_STYLE,
         WM_APP_TRAY_TOGGLE_AUTOSTART, WM_APP_TRAY_TOGGLE_MEDIABAR, WM_APP_TRAY_TOGGLE_MONITORBAR,
@@ -21,15 +22,16 @@ mod win {
     };
     use crate::monitorbar::MonitorBarInstance;
     use crate::system::{
-        is_autostart_enabled, is_light_taskbar, set_autostart_enabled, system_accent_color,
+        clear_overflow_notify_pending, is_autostart_enabled, is_light_taskbar,
+        set_autostart_enabled, system_accent_color, OverflowEventHook,
     };
     use crate::taskbar::{TaskbarController, TaskbarStyle};
-    use crate::ui::{POPUP_FLOW_INTERVAL_MS, POPUP_REOPEN_DEBOUNCE_MS};
+    use crate::ui::POPUP_FLOW_INTERVAL_MS;
     use std::cell::RefCell;
     use std::mem::size_of;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     use windows::core::{w, GUID, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Direct2D::{
@@ -42,29 +44,29 @@ mod win {
     use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
-        NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICONDATAW,
-        NOTIFYICONDATAW_0, NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
+        NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
+        NOTIFYICONIDENTIFIER, NOTIFYICON_VERSION_4,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
         GetCursorPos, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, LoadIconW,
-        LoadImageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer,
-        SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, HICON, IDC_ARROW, IDI_APPLICATION,
-        IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MSG, SM_CXICON, SM_CXSMICON, WM_APP,
-        WM_CONTEXTMENU, WM_DESTROY, WM_DISPLAYCHANGE, WM_LBUTTONUP, WM_RBUTTONUP,
-        WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
+        LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        SetTimer, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, HICON, IDC_ARROW,
+        IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MSG, SM_CXICON, SM_CXSMICON,
+        WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
+        WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     const HOST_CLASS_NAME: PCWSTR = w!("PrettyWindowsTrayHostWnd");
     const TRAY_ICON_ID: u32 = 1;
     const APP_ICON_RES_ID: u16 = 1;
-    const NIN_KEYSELECT: u32 = NIN_SELECT + 1;
     const TIMER_TASKBAR_MAINTAIN_ID: usize = 1;
     const TASKBAR_STEADY_MAINTAIN_MS: u32 = 150;
 
     const WM_APP_TRAY_ICON: u32 = WM_APP + 20;
     const WM_APP_MEDIABAR_CLOSE_REQUEST: u32 = WM_APP + 25;
     const WM_APP_MONITORBAR_CLOSE_REQUEST: u32 = WM_APP + 28;
+    const WM_APP_TRAY_OVERFLOW_CHANGED: u32 = WM_APP + 29;
 
     struct TrayHostState {
         hwnd: HWND,
@@ -73,7 +75,6 @@ mod win {
         dwrite_factory: IDWriteFactory,
         tray_icon: HICON,
         tray_icon_owned: bool,
-        v4_mode: bool,
         light_taskbar: bool,
         accent: Rgb,
         dpi: u32,
@@ -83,8 +84,10 @@ mod win {
         monitorbar: Option<MonitorBarInstance>,
         taskbar: TaskbarController,
         taskbar_timer_ms: u32,
+        overflow_hook: OverflowEventHook,
         menu: TrayMenu,
-        menu_closed_at: Option<Instant>,
+        started_at: Instant,
+        click_filter: TrayClickFilter,
     }
 
     impl TrayHostState {
@@ -99,7 +102,7 @@ mod win {
                 let accent = system_accent_color();
                 let dpi = current_shell_dpi(hwnd);
                 let (tray_icon, tray_icon_owned) = load_app_icon(tray_icon_size_for_dpi(dpi), false);
-                let v4_mode = register_tray_icon(hwnd, tray_icon);
+                let _ = register_tray_icon(hwnd, tray_icon);
 
                 let menu = TrayMenu::new(hwnd, d2d_factory.clone(), dwrite_factory.clone())?;
                 let config_path = portable_config_path();
@@ -131,6 +134,8 @@ mod win {
                 };
 
                 let taskbar = TaskbarController::new(d2d_factory.clone(), light_taskbar, accent);
+                let mut overflow_hook = OverflowEventHook::new(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
+                overflow_hook.refresh_for_explorer_pid(taskbar.explorer_pid());
 
                 let mut host = Self {
                     hwnd,
@@ -139,7 +144,6 @@ mod win {
                     dwrite_factory,
                     tray_icon,
                     tray_icon_owned,
-                    v4_mode,
                     light_taskbar,
                     accent,
                     dpi,
@@ -149,8 +153,10 @@ mod win {
                     monitorbar,
                     taskbar,
                     taskbar_timer_ms: 0,
+                    overflow_hook,
                     menu,
-                    menu_closed_at: None,
+                    started_at: Instant::now(),
+                    click_filter: TrayClickFilter::default(),
                 };
                 host.sync_taskbar_timer();
                 Ok(host)
@@ -269,11 +275,6 @@ mod win {
             if self.menu.is_closing_recently() {
                 return;
             }
-            if let Some(closed_at) = self.menu_closed_at.take() {
-                if closed_at.elapsed() < Duration::from_millis(POPUP_REOPEN_DEBOUNCE_MS) {
-                    return;
-                }
-            }
 
             let anchor_pt = tray_anchor_point(self.hwnd, use_cursor);
             let dpi = current_shell_dpi(self.hwnd);
@@ -282,6 +283,8 @@ mod win {
             let accent = system_accent_color();
             self.light_taskbar = light;
             self.accent = accent;
+
+            self.taskbar.hide_overflow_backdrop();
 
             self.menu.show(
                 anchor_pt,
@@ -323,8 +326,10 @@ mod win {
         }
 
         fn re_register_tray_icon(&mut self) {
-            self.v4_mode = register_tray_icon(self.hwnd, self.tray_icon);
+            let _ = register_tray_icon(self.hwnd, self.tray_icon);
             let reverted = self.taskbar.on_taskbar_created();
+            self.overflow_hook
+                .refresh_for_explorer_pid(self.taskbar.explorer_pid());
             self.sync_taskbar_timer();
             if reverted {
                 self.sync_menu_state();
@@ -430,17 +435,13 @@ mod win {
         match msg {
             WM_APP_TRAY_ICON => {
                 let event = (lparam.0 & 0xFFFF) as u32;
-                let v4_mode = rc.try_borrow().map(|s| s.v4_mode).unwrap_or(true);
-                let trigger = if v4_mode {
-                    matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT)
-                } else {
-                    matches!(event, WM_RBUTTONUP | WM_LBUTTONUP)
-                };
-                if trigger {
-                    let use_cursor = event != NIN_KEYSELECT;
-                    if let Ok(mut state) = rc.try_borrow_mut() {
-                        state.open_or_toggle_menu(use_cursor);
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    let elapsed_ms = state.started_at.elapsed().as_millis() as u64;
+                    if let Some(decision) = state.click_filter.evaluate(event, elapsed_ms) {
+                        state.open_or_toggle_menu(decision.use_cursor);
                     }
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -448,6 +449,8 @@ mod win {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     let next = !state.is_mediabar_enabled();
                     state.set_mediabar_enabled(next);
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -461,6 +464,8 @@ mod win {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     let next = !state.is_monitorbar_enabled();
                     state.set_monitorbar_enabled(next);
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -473,6 +478,8 @@ mod win {
             WM_APP_TRAY_TOGGLE_AUTOSTART => {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.toggle_autostart();
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -480,6 +487,8 @@ mod win {
                 if let Some(style) = TaskbarStyle::from_u8(wparam.0 as u8) {
                     if let Ok(mut state) = rc.try_borrow_mut() {
                         state.set_taskbar_style(style);
+                    } else {
+                        let _ = PostMessageW(hwnd, msg, wparam, lparam);
                     }
                 }
                 LRESULT(0)
@@ -488,10 +497,20 @@ mod win {
                 if wparam.0 == TIMER_TASKBAR_MAINTAIN_ID {
                     if let Ok(mut state) = rc.try_borrow_mut() {
                         if state.taskbar.tick() {
-                            state.sync_taskbar_timer();
                             state.sync_menu_state();
                         }
+                        state.sync_taskbar_timer();
                     }
+                }
+                LRESULT(0)
+            }
+            WM_APP_TRAY_OVERFLOW_CHANGED => {
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    clear_overflow_notify_pending();
+                    state.taskbar.sync_overflow_now();
+                    state.sync_taskbar_timer();
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -499,12 +518,7 @@ mod win {
                 let _ = DestroyWindow(hwnd);
                 LRESULT(0)
             }
-            WM_APP_TRAY_MENU_CLOSED => {
-                if let Ok(mut state) = rc.try_borrow_mut() {
-                    state.menu_closed_at = Some(Instant::now());
-                }
-                LRESULT(0)
-            }
+            WM_APP_TRAY_MENU_CLOSED => LRESULT(0),
             WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.refresh_theme_and_icon();

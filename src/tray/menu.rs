@@ -1,21 +1,23 @@
 use super::layout::{
-    animated_tray_card_rect, compute_tray_cascading_placement, TrayMenuHover, TrayMenuItem,
-    TrayMenuLayout,
+    adjust_tray_anchor_for_work_area, animated_tray_card_rect, compute_tray_cascading_placement,
+    TrayMenuHover, TrayMenuItem, TrayMenuLayout,
 };
 use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
-use crate::system::resolve_unified_accent;
+use crate::system::{
+    is_shell_or_flyout_window, resolve_unified_accent, visible_transient_overlay_rects,
+};
 use crate::taskbar::TaskbarStyle;
 use crate::ui::glass::{
-    capture_blurred_desktop_backdrop, create_round_cap_stroke, create_text_format, d2d_rect,
-    danger_text_color, draw_divider, draw_geometry_rim, draw_glass_interior, draw_music_note_icon,
-    draw_row_highlight, draw_text_in_rect, identity_matrix, primary_text_color, update_silk_bitmap,
-    LayeredSurface,
+    capture_blurred_desktop_backdrop_excluding, create_round_cap_stroke, create_text_format,
+    d2d_rect, danger_text_color, draw_divider, draw_geometry_rim, draw_glass_interior,
+    draw_music_note_icon, draw_row_highlight, draw_text_in_rect, identity_matrix,
+    primary_text_color, update_silk_bitmap, LayeredSurface, PopupNoiseCache,
 };
 use crate::ui::{
-    compute_halo_pair, ease_out_cubic, ease_retract, row_stagger_dy, window_master_alpha,
-    PopupAnimPhase, RectF, Spring1D, CLOSE_ANIM_DUR_S, OPEN_SPRING_DAMPING,
-    OPEN_SPRING_STIFFNESS, PANEL_RADIUS_DIP, POPUP_ANIM_INTERVAL_MS, POPUP_FLOW_INTERVAL_MS,
-    POPUP_REOPEN_DEBOUNCE_MS, SILK_H, SILK_W, SUB_WIDTH_DAMPING, SUB_WIDTH_STIFFNESS,
+    compute_halo_pair, ease_out_cubic, ease_retract, popup_glass_recipe, rgb_luma, row_stagger_dy,
+    window_master_alpha, GlassSurfaceStyle, PopupAnimPhase, RectF, Spring1D, CLOSE_ANIM_DUR_S,
+    OPEN_SPRING_DAMPING, OPEN_SPRING_STIFFNESS, PANEL_RADIUS_DIP, POPUP_ANIM_INTERVAL_MS,
+    POPUP_FLOW_INTERVAL_MS, SILK_H, SILK_W, SUB_WIDTH_DAMPING, SUB_WIDTH_STIFFNESS,
 };
 use std::mem::{size_of, ManuallyDrop};
 use std::time::{Duration, Instant};
@@ -44,12 +46,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_ESCAPE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetWindowLongPtrW, IsWindowVisible,
-    KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetCursor, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR,
-    HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-    SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetForegroundWindow, GetWindowLongPtrW,
+    IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA,
+    HCURSOR, HWND_TOPMOST, HTTRANSPARENT, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_HIDE, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -63,6 +65,8 @@ pub const WM_APP_TRAY_TOGGLE_MONITORBAR: u32 = WM_APP + 27;
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const TRAY_MENU_CLASS_NAME: PCWSTR = w!("PrettyWindowsTrayMenuWnd");
 const TIMER_MENU_FLOW_ID: usize = 1;
+const TRAY_TOGGLE_DEBOUNCE_MS: u64 = 180;
+const SHELL_DEACTIVATE_GRACE_MS: u64 = 80;
 
 struct TrayMenuInner {
     hwnd: HWND,
@@ -93,6 +97,7 @@ struct TrayMenuInner {
     sub_width_spring: Spring1D,
     sub_fade_elapsed: f32,
     backdrop_bmp: Option<ID2D1Bitmap>,
+    noise_cache: PopupNoiseCache,
     silk_bmp: Option<ID2D1Bitmap>,
     silk_buf: Vec<u8>,
     flow_phase: f64,
@@ -106,7 +111,9 @@ struct TrayMenuInner {
     open_spring: Spring1D,
     open_elapsed: f32,
     close_progress: f32,
-    close_started_at: Option<Instant>,
+    shown_at: Option<Instant>,
+    shell_focus_reclaimed: bool,
+    close_by_deactivate_at: Option<Instant>,
     timer_interval_ms: u32,
     cached_fmt: Option<(u32, IDWriteTextFormat)>,
     arrow_cursor: HCURSOR,
@@ -197,6 +204,7 @@ impl TrayMenu {
                 sub_width_spring: Spring1D::still(0.0),
                 sub_fade_elapsed: 0.0,
                 backdrop_bmp: None,
+                noise_cache: PopupNoiseCache::default(),
                 silk_bmp: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
                 flow_phase: 0.0,
@@ -210,7 +218,9 @@ impl TrayMenu {
                 open_spring: Spring1D::still(1.0),
                 open_elapsed: 1.0,
                 close_progress: 0.0,
-                close_started_at: None,
+                shown_at: None,
+                shell_focus_reclaimed: false,
+                close_by_deactivate_at: None,
                 timer_interval_ms: 0,
                 cached_fmt: None,
                 arrow_cursor,
@@ -235,11 +245,9 @@ impl TrayMenu {
     }
 
     pub fn is_closing_recently(&self) -> bool {
-        (self.is_visible() && self.inner.anim_phase == PopupAnimPhase::Closing)
-            || self
-                .inner
-                .close_started_at
-                .is_some_and(|t| t.elapsed() < Duration::from_millis(POPUP_REOPEN_DEBOUNCE_MS))
+        self.inner
+            .close_by_deactivate_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(TRAY_TOGGLE_DEBOUNCE_MS))
     }
 
     pub fn hide(&mut self) {
@@ -250,7 +258,7 @@ impl TrayMenu {
     }
 
     pub fn hide_animated(&mut self) {
-        self.inner.begin_close();
+        self.inner.begin_close_from_deactivate();
     }
 
     pub fn ensure_topmost(&self) {
@@ -326,22 +334,44 @@ impl TrayMenu {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let monitor = unsafe {
+        let (monitor, work) = unsafe {
             if GetMonitorInfoW(mon, &mut mi).as_bool() {
-                mi.rcMonitor
+                (mi.rcMonitor, mi.rcWork)
             } else {
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: 1920,
-                    bottom: 1080,
-                }
+                (
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1920,
+                        bottom: 1080,
+                    },
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 1920,
+                        bottom: 1032,
+                    },
+                )
             }
         };
 
-        let (win_x, win_y, sub_open_left, open_down) = compute_tray_cascading_placement(
+        let (adj_x, adj_y) = adjust_tray_anchor_for_work_area(
             anchor_pt.x,
             anchor_pt.y,
+            work.left,
+            work.top,
+            work.right,
+            work.bottom,
+            monitor.left,
+            monitor.top,
+            monitor.right,
+            monitor.bottom,
+            self.inner.dpi,
+        );
+
+        let (win_x, win_y, sub_open_left, open_down) = compute_tray_cascading_placement(
+            adj_x,
+            adj_y,
             monitor.left,
             monitor.top,
             monitor.right,
@@ -357,12 +387,28 @@ impl TrayMenu {
         self.inner.sub_open_left = sub_open_left;
         self.inner.open_down = open_down;
 
-        let (bmp, sampled_bg) = capture_blurred_desktop_backdrop(
+        let capture_rect = RECT {
+            left: win_x,
+            top: win_y,
+            right: win_x + layout.win_w,
+            bottom: win_y + layout.win_h,
+        };
+        // Collect visible transient shell flyouts BEFORE stealing foreground dismisses/cloaks them.
+        let occluders = visible_transient_overlay_rects(capture_rect);
+        unsafe {
+            let _ = SetForegroundWindow(self.inner.host_hwnd);
+        }
+
+        let initial_recipe =
+            popup_glass_recipe(GlassSurfaceStyle::from(taskbar_style), light_glass, 0.5);
+        let (bmp, sampled_bg) = capture_blurred_desktop_backdrop_excluding(
             &self.inner.rt,
             win_x,
             win_y,
             layout.win_w,
             layout.win_h,
+            initial_recipe.blur_radius_4x,
+            &occluders,
         );
         self.inner.backdrop_bmp = bmp;
         if let Some(bg) = sampled_bg {
@@ -375,7 +421,9 @@ impl TrayMenu {
         self.inner.open_spring = Spring1D::new(0.14, 2.8);
         self.inner.open_elapsed = 0.0;
         self.inner.close_progress = 0.0;
-        self.inner.close_started_at = None;
+        self.inner.close_by_deactivate_at = None;
+        self.inner.shell_focus_reclaimed = false;
+        self.inner.shown_at = Some(Instant::now());
 
         let _ = self.inner.render();
 
@@ -387,10 +435,12 @@ impl TrayMenu {
                 win_y,
                 layout.win_w,
                 layout.win_h,
-                SWP_NOACTIVATE,
+                SWP_SHOWWINDOW,
             );
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(self.hwnd);
+            if GetForegroundWindow() != self.hwnd {
+                let _ = SetForegroundWindow(self.inner.host_hwnd);
+                let _ = SetForegroundWindow(self.hwnd);
+            }
         }
         self.inner.last_flow_tick = Instant::now();
         self.inner.last_color_tick = self.inner.last_flow_tick;
@@ -425,7 +475,8 @@ impl TrayMenuInner {
         self.open_spring = Spring1D::still(1.0);
         self.open_elapsed = 1.0;
         self.close_progress = 0.0;
-        self.close_started_at = None;
+        self.shown_at = None;
+        self.shell_focus_reclaimed = false;
         self.submenu_open = false;
         self.sub_width_spring = Spring1D::still(0.0);
         self.sub_fade_elapsed = 0.0;
@@ -483,6 +534,16 @@ impl TrayMenuInner {
         true
     }
 
+    fn begin_close_from_deactivate(&mut self) {
+        if self.anim_phase == PopupAnimPhase::Closing
+            || !unsafe { IsWindowVisible(self.hwnd).as_bool() }
+        {
+            return;
+        }
+        self.close_by_deactivate_at = Some(Instant::now());
+        self.begin_close();
+    }
+
     fn begin_close(&mut self) {
         if self.anim_phase == PopupAnimPhase::Closing
             || !unsafe { IsWindowVisible(self.hwnd).as_bool() }
@@ -492,7 +553,6 @@ impl TrayMenuInner {
         self.hover = None;
         self.anim_phase = PopupAnimPhase::Closing;
         self.close_progress = 0.0;
-        self.close_started_at = Some(Instant::now());
         self.last_flow_tick = Instant::now();
         self.sync_timer_rate();
         let _ = self.render();
@@ -503,7 +563,6 @@ impl TrayMenuInner {
             let _ = ShowWindow(self.hwnd, SW_HIDE);
         }
         self.reset_transient_state();
-        self.close_started_at = Some(Instant::now());
         unsafe {
             let _ = PostMessageW(self.host_hwnd, WM_APP_TRAY_MENU_CLOSED, WPARAM(0), LPARAM(0));
         }
@@ -544,12 +603,12 @@ impl TrayMenuInner {
                 return Ok(fmt.clone());
             }
         }
-        let fmt = create_text_format(&self.dwrite_factory, 12.5 * s, true, false, true)?;
+        let fmt = create_text_format(&self.dwrite_factory, 13.0 * s, false, false, true)?;
         self.cached_fmt = Some((self.dpi, fmt.clone()));
         Ok(fmt)
     }
 
-    fn update_silk(&mut self, primary_rect: RectF, s: f32) {
+    fn update_silk(&mut self, primary_rect: RectF, s: f32, draw_silk: bool) {
         let now = Instant::now();
         let dt_color = now
             .duration_since(self.last_color_tick)
@@ -580,21 +639,23 @@ impl TrayMenuInner {
             self.ui_accent.2 += (ui_target.2 - self.ui_accent.2) * k_ui;
         }
 
-        update_silk_bitmap(
-            &self.rt,
-            &mut self.silk_bmp,
-            &mut self.silk_buf,
-            &mut self.last_silk_tick,
-            !was_ready,
-            self.win_w,
-            self.win_h,
-            primary_rect.left,
-            primary_rect.bottom,
-            s,
-            self.flow_phase,
-            &self.halo_colors,
-            self.light_glass,
-        );
+        if draw_silk {
+            update_silk_bitmap(
+                &self.rt,
+                &mut self.silk_bmp,
+                &mut self.silk_buf,
+                &mut self.last_silk_tick,
+                !was_ready,
+                self.win_w,
+                self.win_h,
+                primary_rect.left,
+                primary_rect.bottom,
+                s,
+                self.flow_phase,
+                &self.halo_colors,
+                self.light_glass,
+            );
+        }
     }
 
     fn current_animated_sub_rect(&self, layout: &TrayMenuLayout, anim_primary: RectF, s: f32) -> Option<RectF> {
@@ -784,7 +845,12 @@ impl TrayMenuInner {
         self.surface.ensure_size(self.win_w, self.win_h)?;
         let title_fmt = self.ensure_title_format(s)?;
 
-        self.update_silk(layout.primary_rect, s);
+        let recipe = popup_glass_recipe(
+            GlassSurfaceStyle::from(self.taskbar_style),
+            self.light_glass,
+            rgb_luma(self.backdrop_rgb),
+        );
+        self.update_silk(layout.primary_rect, s, recipe.silk_alpha > 0.002);
 
         let accent = Rgb::new(
             (self.ui_accent.0 * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -848,9 +914,10 @@ impl TrayMenuInner {
 
             // 2. Clipped glass card interior & menu rows
             if let Ok(clip_geo) = self.build_fused_cards_geometry(anim_primary, anim_sub_opt, eff_r) {
+                let clip_geo_for_rim = clip_geo.clone();
                 let outer_params = D2D1_LAYER_PARAMETERS {
                     contentBounds: d2d_rect(union_bounds),
-                    geometricMask: ManuallyDrop::new(Some(clip_geo.clone())),
+                    geometricMask: ManuallyDrop::new(Some(clip_geo)),
                     maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                     maskTransform: identity_matrix(),
                     opacity: 1.0,
@@ -867,6 +934,8 @@ impl TrayMenuInner {
                     self.backdrop_bmp.as_ref(),
                     self.silk_bmp.as_ref(),
                     self.light_glass,
+                    &recipe,
+                    &mut self.noise_cache,
                 );
 
                 // 2a. Primary card rows & divider
@@ -978,7 +1047,7 @@ impl TrayMenuInner {
                         let label = match item {
                             TrayMenuItem::MediaBar => "媒体控制",
                             TrayMenuItem::MonitorBar => "系统监控",
-                            TrayMenuItem::TaskbarStyle => "任务栏风格",
+                            TrayMenuItem::TaskbarStyle => "整体风格",
                             TrayMenuItem::Autostart => "开机自启",
                             TrayMenuItem::Exit => "退出",
                         };
@@ -1226,15 +1295,15 @@ impl TrayMenuInner {
                 self.rt.PopLayer();
                 let _ = ManuallyDrop::into_inner(outer_params.geometricMask);
 
-                // 3. Shared outer specular glass rim highlight around unified contour
+                // 3. Restrained specular glass rim highlight around unified contour
                 draw_geometry_rim(
                     &self.rt,
-                    &clip_geo,
+                    &clip_geo_for_rim,
                     union_bounds.left,
                     union_bounds.top,
                     union_bounds.bottom,
                     s,
-                    self.light_glass,
+                    &recipe,
                 );
             }
 
@@ -1631,7 +1700,19 @@ unsafe extern "system" fn tray_menu_wnd_proc(
     match msg {
         WM_ACTIVATE => {
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
-                state.begin_close();
+                let other_hwnd = HWND(lparam.0 as *mut core::ffi::c_void);
+                let just_shown = state
+                    .shown_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(SHELL_DEACTIVATE_GRACE_MS));
+                if just_shown
+                    && !state.shell_focus_reclaimed
+                    && (other_hwnd.is_invalid() || is_shell_or_flyout_window(other_hwnd))
+                {
+                    state.shell_focus_reclaimed = true;
+                    let _ = SetForegroundWindow(hwnd);
+                } else {
+                    state.begin_close_from_deactivate();
+                }
             }
             LRESULT(0)
         }

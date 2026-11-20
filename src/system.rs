@@ -1,3 +1,21 @@
+use crate::ui::GlassSurfaceStyle;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+static ACTIVE_TASKBAR_SURFACE_STYLE: AtomicU8 =
+    AtomicU8::new(GlassSurfaceStyle::LiquidGlass.to_u8());
+
+/// Publishes the active taskbar visual style so all popup surfaces harmonize with the taskbar.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn set_active_taskbar_surface_style(style: GlassSurfaceStyle) {
+    ACTIVE_TASKBAR_SURFACE_STYLE.store(style.to_u8(), Ordering::Relaxed);
+}
+
+/// Returns the active taskbar visual style published by `TaskbarController`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn active_taskbar_surface_style() -> GlassSurfaceStyle {
+    GlassSurfaceStyle::from_u8(ACTIVE_TASKBAR_SURFACE_STYLE.load(Ordering::Relaxed))
+}
+
 /// Extracts the executable filename from a Windows/POSIX path.
 pub(crate) fn extract_exe_basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path).trim()
@@ -37,21 +55,69 @@ pub(crate) fn is_shell_flyout_process_name(exe_name: &str) -> bool {
         || name.eq_ignore_ascii_case("widgets.exe")
 }
 
+/// Returns `true` if `class_name` represents a transient desktop shell flyout or tooltip window
+/// that may vanish right after a popup activates and should be excluded from backdrop captures.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn is_transient_backdrop_occluder_class(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "TopLevelWindowForOverflowXamlIsland"
+            | "NotifyIconOverflowWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "ControlCenterWindow"
+            | "tooltips_class32"
+            | "Xaml_WindowedPopupClass"
+            | "TaskListThumbnailWnd"
+    )
+}
+
+/// Picks the lowest (largest `z_rank`) same-band window among the taskbar and visible taskbar
+/// overlay widgets on the same monitor so a behind-taskbar backdrop never jumps above widgets
+/// even when Windows temporarily elevates `Shell_TrayWnd` to a higher Z-order band (e.g. Start Menu).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn pick_lowest_backdrop_anchor(
+    taskbar_id: usize,
+    taskbar_band: Option<u32>,
+    backdrop_band: Option<u32>,
+    taskbar_z_rank: Option<usize>,
+    same_band_overlays_with_rank: &[(usize, usize)],
+) -> usize {
+    let mut best: Option<(usize, usize)> = None;
+    let tb_same_band = match (taskbar_band, backdrop_band) {
+        (Some(tb), Some(bg)) => tb == bg,
+        _ => true,
+    };
+    if tb_same_band {
+        if let Some(rank) = taskbar_z_rank {
+            best = Some((taskbar_id, rank));
+        }
+    }
+    for &(id, rank) in same_band_overlays_with_rank {
+        if best.is_none_or(|(_, best_rank)| rank > best_rank) {
+            best = Some((id, rank));
+        }
+    }
+    best.map(|(id, _)| id).unwrap_or(taskbar_id)
+}
+
 #[cfg(windows)]
 mod win {
     use crate::color::{derive_background_accent, Rgb};
     use std::cell::RefCell;
     use std::mem::size_of;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering as WinOrdering};
     use std::sync::{Mutex, OnceLock};
-    use windows::core::{w, PCWSTR, PWSTR};
+    use windows::core::{s, w, PCWSTR, PWSTR};
     use windows::UI::ViewManagement::{UIColorType, UISettings};
-    use windows::Win32::Foundation::{CloseHandle, HMODULE, HWND, RECT};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HMODULE, HWND, LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Dwm::{
         DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXCLUDED_FROM_PEEK,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
     };
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
     };
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
     use windows::Win32::System::Registry::{
         RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
         HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
@@ -65,14 +131,16 @@ mod win {
         SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetAncestor, GetClassNameW, GetDesktopWindow, GetForegroundWindow,
-        GetShellWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId,
-        IsIconic, IsWindow, IsWindowVisible, SetWindowPos, EVENT_OBJECT_FOCUS,
-        EVENT_OBJECT_REORDER, EVENT_SYSTEM_CAPTUREEND, EVENT_SYSTEM_CAPTURESTART,
+        EnumWindows, FindWindowW, GetAncestor, GetClassNameW, GetDesktopWindow,
+        GetForegroundWindow, GetShellWindow, GetTopWindow, GetWindow, GetWindowLongW,
+        GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
+        PostMessageW, SetWindowPos, EVENT_OBJECT_CLOAKED, EVENT_OBJECT_FOCUS, EVENT_OBJECT_HIDE,
+        EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_REORDER, EVENT_OBJECT_SHOW,
+        EVENT_OBJECT_UNCLOAKED, EVENT_SYSTEM_CAPTUREEND, EVENT_SYSTEM_CAPTURESTART,
         EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART, GA_ROOT,
-        GWL_EXSTYLE, GW_HWNDPREV, GW_OWNER, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOOWNERZORDER, SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-        WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+        GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_TOPMOST, SWP_NOACTIVATE,
+        SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
     };
 
     const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -109,6 +177,16 @@ mod win {
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
             w!("SystemUsesLightTheme"),
         ) == Some(1)
+    }
+
+    /// Returns `true` when Windows "Transparency effects" (`EnableTransparency`) is enabled.
+    /// Defaults to `true` if the registry value is absent.
+    pub fn is_transparency_enabled() -> bool {
+        read_reg_dword(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("EnableTransparency"),
+        ) != Some(0)
     }
 
     /// Reads the current Windows System Accent Color, falling back to classic Win11 blue.
@@ -212,6 +290,11 @@ mod win {
         }
     }
 
+    /// Returns `true` if `hwnd` belongs to Windows desktop shell or modern tray/start/search flyouts.
+    pub fn is_shell_or_flyout_window(hwnd: HWND) -> bool {
+        !hwnd.is_invalid() && (is_shell_or_flyout_class(hwnd) || is_shell_flyout_process(hwnd))
+    }
+
     fn is_shell_or_flyout_class(hwnd: HWND) -> bool {
         let mut buf = [0u16; 96];
         let len = unsafe { GetClassNameW(hwnd, &mut buf) };
@@ -250,16 +333,38 @@ mod win {
         }
     }
 
-    fn is_taskbar_above_window(bar_hwnd: HWND, taskbar_hwnd: HWND) -> bool {
-        if bar_hwnd.is_invalid() || taskbar_hwnd.is_invalid() {
+    type GetWindowBandFn = unsafe extern "system" fn(HWND, *mut u32) -> BOOL;
+
+    fn load_get_window_band() -> Option<GetWindowBandFn> {
+        static CACHE: OnceLock<Option<GetWindowBandFn>> = OnceLock::new();
+        *CACHE.get_or_init(|| unsafe {
+            let hmod = GetModuleHandleW(w!("user32.dll"))
+                .ok()
+                .or_else(|| LoadLibraryW(w!("user32.dll")).ok())?;
+            let proc = GetProcAddress(hmod, s!("GetWindowBand"))?;
+            Some(std::mem::transmute::<_, GetWindowBandFn>(proc))
+        })
+    }
+
+    fn window_band(hwnd: HWND) -> Option<u32> {
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let f = load_get_window_band()?;
+        let mut band = 0u32;
+        unsafe { f(hwnd, &mut band).as_bool().then_some(band) }
+    }
+
+    fn is_window_above(upper: HWND, lower: HWND) -> bool {
+        if upper.is_invalid() || lower.is_invalid() || upper == lower {
             return false;
         }
         unsafe {
-            let mut cur = bar_hwnd;
+            let mut cur = lower;
             for _ in 0..512 {
                 match GetWindow(cur, GW_HWNDPREV) {
                     Ok(prev) if !prev.is_invalid() => {
-                        if prev == taskbar_hwnd {
+                        if prev == upper {
                             return true;
                         }
                         cur = prev;
@@ -269,6 +374,10 @@ mod win {
             }
             false
         }
+    }
+
+    fn is_taskbar_above_window(bar_hwnd: HWND, taskbar_hwnd: HWND) -> bool {
+        is_window_above(taskbar_hwnd, bar_hwnd)
     }
 
     /// Detects whether a genuine fullscreen/presentation window is currently occluding `taskbar_hwnd`.
@@ -363,7 +472,8 @@ mod win {
     }
 
     /// Places `bar_hwnd` immediately above `taskbar_hwnd` without covering higher shell flyouts,
-    /// falling back to `HWND_TOPMOST` when needed.
+    /// falling back to `HWND_TOPMOST` when needed (and avoiding cross-band thrashing when the
+    /// taskbar is temporarily elevated by shell UI such as the Start Menu).
     pub fn ensure_window_above_taskbar(bar_hwnd: HWND, taskbar_hwnd: HWND) {
         unsafe {
             if bar_hwnd.is_invalid()
@@ -372,23 +482,62 @@ mod win {
             {
                 return;
             }
+
+            let bar_band = window_band(bar_hwnd);
+            let tb_band = window_band(taskbar_hwnd);
+            if matches!((bar_band, tb_band), (Some(bb), Some(tb)) if tb > bb) {
+                let is_topmost =
+                    (GetWindowLongW(bar_hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+                if is_topmost && !is_any_backdrop_above(bar_hwnd) {
+                    return;
+                }
+                let _ = SetWindowPos(
+                    bar_hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
+                return;
+            }
+
             if !is_taskbar_above_window(bar_hwnd, taskbar_hwnd) {
+                if !is_any_backdrop_above(bar_hwnd) {
+                    return;
+                }
+                let _ = SetWindowPos(
+                    bar_hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                );
                 return;
             }
 
             if let Ok(above_tb) = GetWindow(taskbar_hwnd, GW_HWNDPREV) {
                 if !above_tb.is_invalid() && above_tb != bar_hwnd {
-                    let _ = SetWindowPos(
-                        bar_hwnd,
-                        above_tb,
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                    );
-                    if !is_taskbar_above_window(bar_hwnd, taskbar_hwnd) {
-                        return;
+                    let same_band = match (bar_band, window_band(above_tb)) {
+                        (Some(bb), Some(ab)) => bb == ab,
+                        _ => true,
+                    };
+                    if same_band {
+                        let _ = SetWindowPos(
+                            bar_hwnd,
+                            above_tb,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        );
+                        if !is_taskbar_above_window(bar_hwnd, taskbar_hwnd) {
+                            return;
+                        }
                     }
                 }
             }
@@ -407,6 +556,7 @@ mod win {
 
     struct TaskbarOverlayGuard {
         widgets: Vec<HWND>,
+        backdrops: Vec<HWND>,
         in_callback: bool,
         global_fg_hook: HWINEVENTHOOK,
         global_min_hook: HWINEVENTHOOK,
@@ -420,6 +570,7 @@ mod win {
         fn default() -> Self {
             Self {
                 widgets: Vec::new(),
+                backdrops: Vec::new(),
                 in_callback: false,
                 global_fg_hook: HWINEVENTHOOK::default(),
                 global_min_hook: HWINEVENTHOOK::default(),
@@ -590,15 +741,26 @@ mod win {
             return;
         }
 
+        let tb_band = window_band(tb_hwnd);
         let any_below = widgets
             .iter()
             .copied()
             .any(|w| IsWindowVisible(w).as_bool() && is_taskbar_above_window(w, tb_hwnd));
         if any_below && !is_fullscreen_occluding_taskbar(tb_hwnd) {
             for w in widgets {
-                if IsWindowVisible(w).as_bool() {
-                    ensure_window_above_taskbar(w, tb_hwnd);
+                if !IsWindowVisible(w).as_bool() {
+                    continue;
                 }
+                if let (Some(wb), Some(tb)) = (window_band(w), tb_band) {
+                    if tb > wb {
+                        let is_topmost =
+                            (GetWindowLongW(w, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) != 0;
+                        if is_topmost && !is_any_backdrop_above(w) {
+                            continue;
+                        }
+                    }
+                }
+                ensure_window_above_taskbar(w, tb_hwnd);
             }
         }
 
@@ -616,6 +778,120 @@ mod win {
                     guard.rebind_taskbar_hooks(cur_pid, cur_tid);
                 }
             });
+        }
+    }
+
+    fn is_any_backdrop_above(bar_hwnd: HWND) -> bool {
+        if bar_hwnd.is_invalid() {
+            return false;
+        }
+        let backdrops = OVERLAY_GUARD.with(|cell| {
+            cell.try_borrow()
+                .map(|g| g.backdrops.clone())
+                .unwrap_or_default()
+        });
+        backdrops.into_iter().any(|bg| unsafe {
+            !bg.is_invalid()
+                && IsWindow(bg).as_bool()
+                && IsWindowVisible(bg).as_bool()
+                && is_window_above(bg, bar_hwnd)
+        })
+    }
+
+    /// Registers a behind-taskbar backdrop HWND so Z-order coordination keeps it below widgets.
+    pub fn register_taskbar_backdrop(hwnd: HWND) {
+        if hwnd.is_invalid() {
+            return;
+        }
+        OVERLAY_GUARD.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                guard
+                    .backdrops
+                    .retain(|&w| !w.is_invalid() && unsafe { IsWindow(w).as_bool() });
+                if !guard.backdrops.contains(&hwnd) {
+                    guard.backdrops.push(hwnd);
+                }
+            }
+        });
+    }
+
+    /// Unregisters a behind-taskbar backdrop HWND before destruction.
+    pub fn unregister_taskbar_backdrop(hwnd: HWND) {
+        OVERLAY_GUARD.with(|cell| {
+            if let Ok(mut guard) = cell.try_borrow_mut() {
+                guard
+                    .backdrops
+                    .retain(|&w| w != hwnd && !w.is_invalid() && unsafe { IsWindow(w).as_bool() });
+            }
+        });
+    }
+
+    /// Resolves the Z-order anchor (`insert_after`) for a behind-taskbar backdrop window on the
+    /// same monitor as `tb_hwnd`, placing it below all visible same-band taskbar widgets and the
+    /// taskbar itself even if Windows elevates `tb_hwnd` to a higher band.
+    pub fn taskbar_backdrop_anchor(tb_hwnd: HWND, backdrop_hwnd: HWND) -> HWND {
+        if tb_hwnd.is_invalid() {
+            return tb_hwnd;
+        }
+        unsafe {
+            let tb_mon = MonitorFromWindow(tb_hwnd, MONITOR_DEFAULTTONEAREST);
+            let tb_band = window_band(tb_hwnd);
+            let bg_band = window_band(backdrop_hwnd);
+
+            let candidates: Vec<HWND> = OVERLAY_GUARD.with(|cell| {
+                let Ok(guard) = cell.try_borrow() else {
+                    return Vec::new();
+                };
+                guard
+                    .widgets
+                    .iter()
+                    .copied()
+                    .filter(|&w| {
+                        !w.is_invalid()
+                            && w != backdrop_hwnd
+                            && IsWindow(w).as_bool()
+                            && IsWindowVisible(w).as_bool()
+                            && MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST) == tb_mon
+                            && match (bg_band, window_band(w)) {
+                                (Some(bg), Some(wb)) => bg == wb,
+                                _ => true,
+                            }
+                    })
+                    .collect()
+            });
+
+            if candidates.is_empty() {
+                return tb_hwnd;
+            }
+
+            let mut taskbar_z_rank: Option<usize> = None;
+            let mut matched_overlays: Vec<(usize, usize)> = Vec::with_capacity(candidates.len());
+            let mut rank = 0usize;
+            let mut cur = GetTopWindow(None).unwrap_or_default();
+            while !cur.is_invalid() && rank < 1024 {
+                if cur == tb_hwnd && taskbar_z_rank.is_none() {
+                    taskbar_z_rank = Some(rank);
+                }
+                if candidates.contains(&cur)
+                    && !matched_overlays.iter().any(|&(id, _)| id == cur.0 as usize)
+                {
+                    matched_overlays.push((cur.0 as usize, rank));
+                }
+                if taskbar_z_rank.is_some() && matched_overlays.len() == candidates.len() {
+                    break;
+                }
+                rank += 1;
+                cur = GetWindow(cur, GW_HWNDNEXT).unwrap_or_default();
+            }
+
+            let anchor_id = super::pick_lowest_backdrop_anchor(
+                tb_hwnd.0 as usize,
+                tb_band,
+                bg_band,
+                taskbar_z_rank,
+                &matched_overlays,
+            );
+            HWND(anchor_id as *mut core::ffi::c_void)
         }
     }
 
@@ -658,6 +934,258 @@ mod win {
                 guard.ensure_hooks();
             }
         });
+    }
+
+    /// Collects screen bounding rectangles (with a 16px DWM shadow margin) of visible transient
+    /// shell flyouts or tooltips intersecting `capture_rect`, so popup backdrop captures can
+    /// cleanly inpaint them out before they fade/dismiss on activation.
+    pub fn visible_transient_overlay_rects(capture_rect: RECT) -> Vec<RECT> {
+        struct CollectCtx {
+            capture: RECT,
+            rects: Vec<RECT>,
+        }
+
+        unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let ctx = &mut *(lparam.0 as *mut CollectCtx);
+            if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() {
+                return BOOL(1);
+            }
+            let mut cls_buf = [0u16; 96];
+            let len = GetClassNameW(hwnd, &mut cls_buf);
+            if len <= 0 {
+                return BOOL(1);
+            }
+            let class_name = String::from_utf16_lossy(&cls_buf[..len as usize]);
+            if !crate::system::is_transient_backdrop_occluder_class(&class_name) {
+                return BOOL(1);
+            }
+
+            let mut cloaked: u32 = 0;
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+            {
+                return BOOL(1);
+            }
+
+            let mut win_rect = RECT::default();
+            if GetWindowRect(hwnd, &mut win_rect).is_err() {
+                return BOOL(1);
+            }
+            let mut ext_rect = RECT::default();
+            let bounds = if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                (&mut ext_rect as *mut RECT).cast(),
+                size_of::<RECT>() as u32,
+            )
+            .is_ok()
+            {
+                RECT {
+                    left: win_rect.left.min(ext_rect.left),
+                    top: win_rect.top.min(ext_rect.top),
+                    right: win_rect.right.max(ext_rect.right),
+                    bottom: win_rect.bottom.max(ext_rect.bottom),
+                }
+            } else {
+                win_rect
+            };
+
+            let w = bounds.right - bounds.left;
+            let h = bounds.bottom - bounds.top;
+            if w <= 0 || h <= 0 || w > 960 || h > 720 {
+                return BOOL(1);
+            }
+
+            const SHADOW_PAD_PX: i32 = 16;
+            let inter = RECT {
+                left: (bounds.left - SHADOW_PAD_PX).max(ctx.capture.left),
+                top: (bounds.top - SHADOW_PAD_PX).max(ctx.capture.top),
+                right: (bounds.right + SHADOW_PAD_PX).min(ctx.capture.right),
+                bottom: (bounds.bottom + SHADOW_PAD_PX).min(ctx.capture.bottom),
+            };
+            if inter.right > inter.left && inter.bottom > inter.top {
+                ctx.rects.push(inter);
+            }
+            BOOL(1)
+        }
+
+        if capture_rect.right <= capture_rect.left || capture_rect.bottom <= capture_rect.top {
+            return Vec::new();
+        }
+        let mut ctx = CollectCtx {
+            capture: capture_rect,
+            rects: Vec::new(),
+        };
+        unsafe {
+            let _ = EnumWindows(Some(enum_proc), LPARAM((&mut ctx as *mut CollectCtx) as isize));
+        }
+            ctx.rects
+    }
+
+    static OVERFLOW_NOTIFY_HWND: AtomicUsize = AtomicUsize::new(0);
+    static OVERFLOW_NOTIFY_MSG: AtomicU32 = AtomicU32::new(0);
+    static OVERFLOW_NOTIFY_PENDING: AtomicBool = AtomicBool::new(false);
+
+    /// Clears the coalescing flag so subsequent overflow WinEvents can schedule another host sync.
+    pub fn clear_overflow_notify_pending() {
+        OVERFLOW_NOTIFY_PENDING.store(false, WinOrdering::Release);
+    }
+
+    unsafe extern "system" fn overflow_win_event_proc(
+        _hwineventhook: HWINEVENTHOOK,
+        _event: u32,
+        hwnd: HWND,
+        idobject: i32,
+        _idchild: i32,
+        _ideventthread: u32,
+        _dwmseventtime: u32,
+    ) {
+        if hwnd.is_invalid() || idobject != 0 {
+            return;
+        }
+        let target_raw = OVERFLOW_NOTIFY_HWND.load(WinOrdering::Acquire);
+        let notify_msg = OVERFLOW_NOTIFY_MSG.load(WinOrdering::Acquire);
+        if target_raw == 0 || notify_msg == 0 {
+            return;
+        }
+        let mut cls_buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut cls_buf);
+        if len <= 0 {
+            return;
+        }
+        let cls = String::from_utf16_lossy(&cls_buf[..len as usize]);
+        if matches!(
+            cls.as_str(),
+            "TopLevelWindowForOverflowXamlIsland" | "NotifyIconOverflowWindow"
+        ) && !OVERFLOW_NOTIFY_PENDING.swap(true, WinOrdering::AcqRel)
+        {
+            if PostMessageW(
+                HWND(target_raw as *mut core::ffi::c_void),
+                notify_msg,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .is_err()
+            {
+                OVERFLOW_NOTIFY_PENDING.store(false, WinOrdering::Release);
+            }
+        }
+    }
+
+    /// Resolves the Z-order anchor (`insert_after`) for the overflow flyout backdrop window.
+    /// Same-band overlays insert right after `ov_hwnd`; higher-band shell flyouts sit above
+    /// normal topmost windows via `HWND_TOPMOST` while staying underneath the flyout's own band.
+    pub fn overflow_backdrop_anchor(ov_hwnd: HWND, backdrop_hwnd: HWND) -> HWND {
+        if ov_hwnd.is_invalid() {
+            return HWND_TOPMOST;
+        }
+        match (window_band(ov_hwnd), window_band(backdrop_hwnd)) {
+            (Some(ob), Some(bb)) if ob == bb => ov_hwnd,
+            _ => HWND_TOPMOST,
+        }
+    }
+
+    /// RAII process-scoped WinEvent hook notifying the tray host immediately when the Explorer
+    /// system tray overflow flyout shows, moves/resizes, cloaks, or hides.
+    pub struct OverflowEventHook {
+        host_hwnd: HWND,
+        notify_msg: u32,
+        explorer_pid: u32,
+        show_hide_hook: HWINEVENTHOOK,
+        location_hook: HWINEVENTHOOK,
+        cloak_hook: HWINEVENTHOOK,
+    }
+
+    impl OverflowEventHook {
+        pub fn new(host_hwnd: HWND, notify_msg: u32) -> Self {
+            OVERFLOW_NOTIFY_PENDING.store(false, WinOrdering::Release);
+            OVERFLOW_NOTIFY_HWND.store(host_hwnd.0 as usize, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(notify_msg, WinOrdering::Release);
+            Self {
+                host_hwnd,
+                notify_msg,
+                explorer_pid: 0,
+                show_hide_hook: HWINEVENTHOOK::default(),
+                location_hook: HWINEVENTHOOK::default(),
+                cloak_hook: HWINEVENTHOOK::default(),
+            }
+        }
+
+        pub fn refresh_for_explorer_pid(&mut self, pid: u32) {
+            OVERFLOW_NOTIFY_HWND.store(self.host_hwnd.0 as usize, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(self.notify_msg, WinOrdering::Release);
+            if self.explorer_pid == pid
+                && (!self.show_hide_hook.is_invalid() || pid == 0)
+            {
+                return;
+            }
+            self.unhook_all();
+            self.explorer_pid = pid;
+            if pid == 0 {
+                return;
+            }
+            let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+            unsafe {
+                self.show_hide_hook = SetWinEventHook(
+                    EVENT_OBJECT_SHOW,
+                    EVENT_OBJECT_HIDE,
+                    HMODULE::default(),
+                    Some(overflow_win_event_proc),
+                    pid,
+                    0,
+                    flags,
+                );
+                self.location_hook = SetWinEventHook(
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    EVENT_OBJECT_LOCATIONCHANGE,
+                    HMODULE::default(),
+                    Some(overflow_win_event_proc),
+                    pid,
+                    0,
+                    flags,
+                );
+                self.cloak_hook = SetWinEventHook(
+                    EVENT_OBJECT_CLOAKED,
+                    EVENT_OBJECT_UNCLOAKED,
+                    HMODULE::default(),
+                    Some(overflow_win_event_proc),
+                    pid,
+                    0,
+                    flags,
+                );
+            }
+        }
+
+        fn unhook_all(&mut self) {
+            unsafe {
+                for hook in [
+                    &mut self.show_hide_hook,
+                    &mut self.location_hook,
+                    &mut self.cloak_hook,
+                ] {
+                    if !hook.is_invalid() {
+                        let _ = UnhookWinEvent(*hook);
+                        *hook = HWINEVENTHOOK::default();
+                    }
+                }
+            }
+            self.explorer_pid = 0;
+        }
+    }
+
+    impl Drop for OverflowEventHook {
+        fn drop(&mut self) {
+            self.unhook_all();
+            OVERFLOW_NOTIFY_PENDING.store(false, WinOrdering::Release);
+            OVERFLOW_NOTIFY_HWND.store(0, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(0, WinOrdering::Release);
+        }
     }
 }
 
@@ -711,5 +1239,71 @@ mod tests {
 
         assert!(!is_shell_flyout_process_name("explorer.exe"));
         assert!(!is_shell_flyout_process_name("chrome.exe"));
+    }
+
+    #[test]
+    fn backdrop_anchor_stays_below_widgets_when_taskbar_elevates_band() {
+        const TB: usize = 0x1001;
+        const MEDIA: usize = 0x2001;
+        const MONITOR: usize = 0x2002;
+        const SEC_TB: usize = 0x1002;
+
+        // Normal same-band state: MediaBar (5) & MonitorBar (6) above Shell_TrayWnd (7) -> anchor = Shell_TrayWnd.
+        assert_eq!(
+            pick_lowest_backdrop_anchor(TB, Some(1), Some(1), Some(7), &[(MEDIA, 5), (MONITOR, 6)]),
+            TB
+        );
+
+        // Start Menu open: Shell_TrayWnd elevated to band 16 while widgets & backdrop remain in band 1
+        // -> must anchor below the lowest visible widget (MonitorBar), NEVER Shell_TrayWnd.
+        assert_eq!(
+            pick_lowest_backdrop_anchor(TB, Some(16), Some(1), Some(1), &[(MEDIA, 5), (MONITOR, 6)]),
+            MONITOR
+        );
+
+        // Transient same-band reorder where Shell_TrayWnd (4) sits above widgets (5, 6)
+        // -> still picks lowest widget (MonitorBar) so backdrop stays beneath all widgets.
+        assert_eq!(
+            pick_lowest_backdrop_anchor(TB, Some(1), Some(1), Some(4), &[(MEDIA, 5), (MONITOR, 6)]),
+            MONITOR
+        );
+
+        // Secondary monitor with no widgets falls back to its own Shell_SecondaryTrayWnd.
+        assert_eq!(
+            pick_lowest_backdrop_anchor(SEC_TB, Some(16), Some(1), Some(2), &[]),
+            SEC_TB
+        );
+    }
+
+    #[test]
+    fn transient_backdrop_occluder_class_filter_matches_expected_windows() {
+        for cls in [
+            "TopLevelWindowForOverflowXamlIsland",
+            "NotifyIconOverflowWindow",
+            "XamlExplorerHostIslandWindow",
+            "ControlCenterWindow",
+            "tooltips_class32",
+            "Xaml_WindowedPopupClass",
+            "TaskListThumbnailWnd",
+        ] {
+            assert!(
+                is_transient_backdrop_occluder_class(cls),
+                "expected transient occluder match for {cls}"
+            );
+        }
+
+        for keep in [
+            "Progman",
+            "WorkerW",
+            "Shell_TrayWnd",
+            "Chrome_WidgetWin_1",
+            "CabinetWClass",
+            "PrettyWindowsTrayMenuWnd",
+        ] {
+            assert!(
+                !is_transient_backdrop_occluder_class(keep),
+                "should NOT mark {keep} as transient occluder"
+            );
+        }
     }
 }

@@ -108,7 +108,7 @@ impl MonitorBarInstance {
             let wireless = WirelessHandle::start(hwnd, WM_APP_MONITOR_WIRELESS_UPDATED);
             let brightness = BrightnessHandle::start(hwnd, WM_APP_MONITOR_BRIGHTNESS_UPDATED);
             let renderer =
-                MonitorRenderer::new_with_factories(d2d_factory.clone(), dwrite_factory.clone())?;
+                MonitorRenderer::new_with_factories(&d2d_factory, dwrite_factory.clone())?;
             let popup = MonitorPopup::new(
                 hwnd,
                 config_path.clone(),
@@ -265,10 +265,6 @@ impl AppState {
         let cfg = self.cfg_snapshot();
         let layout = MonitorLayout::compute(self.bar_h, self.dpi, &cfg);
         let snap = self.metrics.snapshot();
-        let popup_open_span_x = self
-            .popup
-            .attached_bar_span_screen_x()
-            .map(|(l, r)| (l - self.bar_x as f32, r - self.bar_x as f32));
         let input = MonitorRenderInput {
             layout: &layout,
             snapshot: snap,
@@ -277,7 +273,7 @@ impl AppState {
             accent: self.accent,
             hover_t: self.hover_t,
             dragging: self.dragging,
-            popup_open_span_x,
+            popup_open: self.popup.is_visible(),
         };
         if self.renderer.render(&input).is_ok() {
             self.renderer
@@ -372,10 +368,9 @@ impl AppState {
         self.hover_t = 1.0;
         let cfg = self.cfg_snapshot();
         let layout = MonitorLayout::compute(self.bar_h, self.dpi, &cfg);
-        let pill_overlap_px = (layout.bg_rect.top + 0.5 * layout.scale).round() as i32;
         let anchor_rect = RECT {
             left: self.bar_x + layout.bg_rect.left.round() as i32,
-            top: self.bar_y + pill_overlap_px,
+            top: self.bar_y,
             right: self.bar_x + layout.bg_rect.right.round() as i32,
             bottom: self.bar_y + self.bar_h,
         };
@@ -385,7 +380,6 @@ impl AppState {
             self.dpi,
             self.light_taskbar,
             self.accent,
-            pill_overlap_px,
         );
         self.render_now();
         self.popup.ensure_topmost();

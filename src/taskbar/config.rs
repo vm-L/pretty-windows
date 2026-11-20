@@ -29,7 +29,7 @@ impl TaskbarStyle {
         match self {
             Self::Default => "默认",
             Self::Transparent => "透明",
-            Self::Blur => "模糊",
+            Self::Blur => "毛玻璃",
             Self::Acrylic => "亚克力",
             Self::LiquidGlass => "液态玻璃",
         }
@@ -72,10 +72,22 @@ impl TaskbarStyle {
         match s.trim() {
             "default" => Some(Self::Default),
             "transparent" => Some(Self::Transparent),
-            "blur" => Some(Self::Blur),
+            "blur" | "frosted" => Some(Self::Blur),
             "acrylic" => Some(Self::Acrylic),
             "liquid_glass" => Some(Self::LiquidGlass),
             _ => None,
+        }
+    }
+}
+
+impl From<TaskbarStyle> for crate::ui::GlassSurfaceStyle {
+    fn from(style: TaskbarStyle) -> Self {
+        match style {
+            TaskbarStyle::Default => Self::Default,
+            TaskbarStyle::Transparent => Self::Transparent,
+            TaskbarStyle::Blur => Self::Blur,
+            TaskbarStyle::Acrylic => Self::Acrylic,
+            TaskbarStyle::LiquidGlass => Self::LiquidGlass,
         }
     }
 }
@@ -156,6 +168,8 @@ mod tests {
             assert_eq!(TaskbarStyle::from_str(style.as_str()), Some(style));
             assert!(!style.label().is_empty());
         }
+        assert_eq!(TaskbarStyle::Blur.label(), "毛玻璃");
+        assert_eq!(TaskbarStyle::from_str("frosted"), Some(TaskbarStyle::Blur));
         assert_eq!(TaskbarStyle::from_u8(99), None);
         assert_eq!(TaskbarStyle::from_str("invalid"), None);
     }

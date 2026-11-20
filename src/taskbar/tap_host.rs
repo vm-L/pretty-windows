@@ -197,7 +197,6 @@ mod win {
     const CMD_RESTORE: u8 = 0x00;
     const CMD_HIDE: u8 = 0x01;
     const CMD_PING: u8 = 0x02;
-    const CMD_SHUTDOWN: u8 = 0x03;
 
     const E_NOTFOUND_HR: HRESULT = HRESULT(0x80070490u32 as i32);
     const MAINTAIN_PING_INTERVAL: Duration = Duration::from_secs(2);
@@ -402,6 +401,31 @@ mod win {
             }
         }
 
+        /// Re-sends `CMD_HIDE` asynchronously if attached and hiding is desired (e.g. when the
+        /// overflow flyout opens and may need fresh VisualTree background brushes updated).
+        pub fn reassert_hide(&mut self, explorer_pid: u32) {
+            if explorer_pid == 0 {
+                return;
+            }
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                if st.desired_hidden
+                    && !st.guard.is_tripped()
+                    && st.attached_pid == Some(explorer_pid)
+                {
+                    st.wake_seq = st.wake_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                self.ensure_worker_started();
+                self.shared.1.notify_all();
+            }
+        }
+
         pub fn shutdown(&mut self) {
             let has_worker = self.worker.is_some();
             if let Ok(mut st) = self.shared.0.lock() {
@@ -472,8 +496,7 @@ mod win {
             if stop_worker {
                 let pid = attached_pid.unwrap_or(target_pid);
                 if pid != 0 && (attached_pid.is_some() || send_command(pid, CMD_PING, 30)) {
-                    let _ = send_command(pid, CMD_RESTORE, 200);
-                    let _ = send_command(pid, CMD_SHUTDOWN, 400);
+                    let _ = send_command(pid, CMD_RESTORE, 250);
                 }
                 if let Ok(mut st) = lock.lock() {
                     st.attached_pid = None;
@@ -490,18 +513,23 @@ mod win {
 
             let mut cur_attached = attached_pid.filter(|&p| p == target_pid);
             if let Some(pid) = cur_attached {
-                if send_command(pid, CMD_PING, 35) {
+                let latest_hide = lock
+                    .lock()
+                    .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
+                    .unwrap_or(false);
+                let cmd = if latest_hide { CMD_HIDE } else { CMD_RESTORE };
+                if send_command(pid, cmd, 250) {
                     if let Ok(mut st) = lock.lock() {
                         st.last_ping_ok = Some(Instant::now());
                         st.guard.record_success();
                     }
-                } else {
-                    cur_attached = None;
-                    if let Ok(mut st) = lock.lock() {
-                        if st.attached_pid == Some(pid) {
-                            st.attached_pid = None;
-                            st.last_ping_ok = None;
-                        }
+                    continue;
+                }
+                cur_attached = None;
+                if let Ok(mut st) = lock.lock() {
+                    if st.attached_pid == Some(pid) {
+                        st.attached_pid = None;
+                        st.last_ping_ok = None;
                     }
                 }
             }
@@ -600,7 +628,7 @@ mod win {
             let init_xaml: InitializeXamlDiagnosticsExFn = std::mem::transmute(proc);
 
             let mut connected = false;
-            for i in 1..=60 {
+            for i in 1..=128 {
                 let endpoint: Vec<u16> = format!("VisualDiagConnection{i}")
                     .encode_utf16()
                     .chain(std::iter::once(0))
@@ -638,10 +666,10 @@ mod win {
         false
     }
 
-    fn send_command(explorer_pid: u32, cmd: u8, wait_ms: u32) -> bool {
+    fn open_pipe(explorer_pid: u32, wait_ms: u32) -> Option<HANDLE> {
         let pipe_wide = pipe_name_wide(explorer_pid);
         unsafe {
-            let handle: HANDLE = match CreateFileW(
+            match CreateFileW(
                 PCWSTR(pipe_wide.as_ptr()),
                 GENERIC_READ.0 | GENERIC_WRITE.0,
                 FILE_SHARE_NONE,
@@ -650,11 +678,11 @@ mod win {
                 FILE_ATTRIBUTE_NORMAL,
                 None,
             ) {
-                Ok(h) if !h.is_invalid() && h != INVALID_HANDLE_VALUE => h,
+                Ok(h) if !h.is_invalid() && h != INVALID_HANDLE_VALUE => Some(h),
                 _ => {
                     if wait_ms == 0 || !WaitNamedPipeW(PCWSTR(pipe_wide.as_ptr()), wait_ms).as_bool()
                     {
-                        return false;
+                        return None;
                     }
                     match CreateFileW(
                         PCWSTR(pipe_wide.as_ptr()),
@@ -665,12 +693,19 @@ mod win {
                         FILE_ATTRIBUTE_NORMAL,
                         None,
                     ) {
-                        Ok(h) if !h.is_invalid() && h != INVALID_HANDLE_VALUE => h,
-                        _ => return false,
+                        Ok(h) if !h.is_invalid() && h != INVALID_HANDLE_VALUE => Some(h),
+                        _ => None,
                     }
                 }
-            };
+            }
+        }
+    }
 
+    fn send_command(explorer_pid: u32, cmd: u8, wait_ms: u32) -> bool {
+        let Some(handle) = open_pipe(explorer_pid, wait_ms) else {
+            return false;
+        };
+        unsafe {
             let host_pid = GetCurrentProcessId().to_le_bytes();
             let req = [cmd, host_pid[0], host_pid[1], host_pid[2], host_pid[3]];
             let mut written = 0u32;

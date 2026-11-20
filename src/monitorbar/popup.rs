@@ -11,20 +11,23 @@ use super::{
     WM_APP_MONITOR_POPUP_CLOSED, WM_APP_MONITOR_RESET_POS, WM_APP_MONITOR_TOGGLE_LOCK,
 };
 use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
-use crate::system::resolve_unified_accent;
+use crate::system::{
+    active_taskbar_surface_style, resolve_unified_accent, visible_transient_overlay_rects,
+};
 use crate::ui::glass::{
-    capture_blurred_desktop_backdrop, create_round_cap_stroke, create_text_format, d2d_color_rgb,
-    d2d_rect, danger_text_color, draw_divider, draw_glass_interior, draw_glass_slider,
-    draw_pill_switch, draw_row_highlight, draw_settings_icon, draw_text_in_rect,
-    draw_text_in_rect_measured, identity_matrix, muted_text_color, primary_text_color,
-    update_silk_bitmap, LayeredSurface,
+    capture_blurred_desktop_backdrop_excluding, create_round_cap_stroke, create_text_format,
+    d2d_color_rgb, d2d_rect, danger_text_color, draw_divider, draw_geometry_rim,
+    draw_glass_interior, draw_glass_slider, draw_pill_switch, draw_row_highlight,
+    draw_settings_icon, draw_text_in_rect, draw_text_in_rect_measured, identity_matrix,
+    muted_text_color, primary_text_color, update_silk_bitmap, LayeredSurface, PopupNoiseCache,
 };
 use crate::ui::{
-    compute_halo_pair, ease_out_cubic, ease_retract, row_stagger_dy, window_master_alpha,
-    PopupAnimPhase, RectF, Spring1D, CLOSE_ANIM_DUR_S, DIVIDER_H_DIP, INNER_PAD_DIP,
-    OPEN_SPRING_DAMPING, OPEN_SPRING_STIFFNESS, PANEL_RADIUS_DIP, POPUP_ANIM_INTERVAL_MS,
-    POPUP_FLOW_INTERVAL_MS, POPUP_REOPEN_DEBOUNCE_MS, ROW_GAP_DIP, ROW_H_DIP, SHADOW_PAD_DIP,
-    SILK_H, SILK_W, SUB_WIDTH_DAMPING, SUB_WIDTH_STIFFNESS,
+    compute_halo_pair, ease_out_cubic, ease_retract, popup_glass_recipe, rgb_luma, row_stagger_dy,
+    window_master_alpha, PopupAnimPhase, RectF, Spring1D, CLOSE_ANIM_DUR_S, DIVIDER_H_DIP,
+    INNER_PAD_DIP, OPEN_SPRING_DAMPING, OPEN_SPRING_STIFFNESS, PANEL_RADIUS_DIP,
+    POPUP_ANIM_INTERVAL_MS, POPUP_FLOAT_GAP_DIP, POPUP_FLOW_INTERVAL_MS, POPUP_REOPEN_DEBOUNCE_MS,
+    ROW_GAP_DIP, ROW_H_DIP, SHADOW_PAD_DIP, SILK_H, SILK_W, SUB_WIDTH_DAMPING,
+    SUB_WIDTH_STIFFNESS,
 };
 use std::mem::{size_of, ManuallyDrop};
 use std::path::{Path, PathBuf};
@@ -79,7 +82,6 @@ const SUB_SETTINGS_W_DIP: f32 = 172.0;
 const MAX_LIST_ROWS: usize = 6;
 const BRIGHTNESS_ROW_H_DIP: f32 = 46.0;
 const MAX_BRIGHTNESS_ROWS: usize = 5;
-const FOOT_MENISCUS_DIP: f32 = 10.0;
 const STEP_MENISCUS_DIP: f32 = 13.5;
 const SUB_VERT_STIFFNESS: f32 = 860.0;
 const SUB_VERT_DAMPING: f32 = 44.5;
@@ -218,7 +220,6 @@ struct MonitorPopupInner {
     round_stroke: Option<ID2D1StrokeStyle>,
     surface: LayeredSurface,
     dpi: u32,
-    pill_overlap_px: i32,
     win_x: i32,
     win_y: i32,
     win_w: i32,
@@ -230,6 +231,7 @@ struct MonitorPopupInner {
     halo_colors: [(f32, f32, f32); 2],
     halo_colors_ready: bool,
     backdrop_bmp: Option<ID2D1Bitmap>,
+    noise_cache: PopupNoiseCache,
     silk_bmp: Option<ID2D1Bitmap>,
     silk_buf: Vec<u8>,
     last_silk_tick: Option<Instant>,
@@ -332,7 +334,6 @@ impl MonitorPopup {
                 round_stroke,
                 surface,
                 dpi: 96,
-                pill_overlap_px: 4,
                 win_x: 0,
                 win_y: 0,
                 win_w: 1,
@@ -344,6 +345,7 @@ impl MonitorPopup {
                 halo_colors: [(0.76, 0.76, 0.78); 2],
                 halo_colors_ready: false,
                 backdrop_bmp: None,
+                noise_cache: PopupNoiseCache::default(),
                 silk_bmp: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
                 last_silk_tick: None,
@@ -419,18 +421,6 @@ impl MonitorPopup {
         }
     }
 
-    pub fn attached_bar_span_screen_x(&self) -> Option<(f32, f32)> {
-        if !self.is_visible() {
-            return None;
-        }
-        let primary = self.inner.primary_card_rect();
-        let foot_r = FOOT_MENISCUS_DIP * self.inner.scale();
-        Some((
-            self.inner.win_x as f32 + primary.left - foot_r,
-            self.inner.win_x as f32 + primary.right + foot_r,
-        ))
-    }
-
     pub fn update_wireless(&mut self, snapshot: WirelessSnapshot) {
         self.inner.wireless_snap = snapshot;
         self.inner.clamp_scrolls();
@@ -456,7 +446,6 @@ impl MonitorPopup {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
         anchor_rect: RECT,
@@ -464,12 +453,10 @@ impl MonitorPopup {
         dpi: u32,
         light_glass: bool,
         _accent: Rgb,
-        pill_overlap_px: i32,
     ) {
         self.inner.dpi = dpi.max(96);
         self.inner.light_glass = light_glass;
         self.inner.backdrop_rgb = NEUTRAL_BACKDROP_FALLBACK;
-        self.inner.pill_overlap_px = pill_overlap_px.max(0);
         self.inner.hover = None;
         self.inner.tracking_leave = false;
         self.inner.active_sub = None;
@@ -486,6 +473,7 @@ impl MonitorPopup {
 
         let s = self.inner.scale();
         let side_pad = (SHADOW_PAD_DIP * s).round() as i32;
+        let float_gap = (POPUP_FLOAT_GAP_DIP * s).round() as i32;
         let primary_w = (PRIMARY_W_DIP * s).round() as i32;
         let max_sub_w = (SUB_WIRELESS_W_DIP.max(SUB_BRIGHTNESS_W_DIP) * s).round() as i32;
         let max_reach = self.inner.max_popup_reach_px();
@@ -508,14 +496,15 @@ impl MonitorPopup {
             }
         };
 
-        let edge_margin = (FOOT_MENISCUS_DIP * s + 2.0 * s).round() as i32;
+        let edge_margin = (6.0 * s).round() as i32;
         let top_margin = (6.0 * s).round() as i32;
+        let desired_card_bottom = anchor_rect.top - float_gap;
         let win_w = side_pad * 2 + primary_w + max_sub_w;
-        let win_h =
-            (side_pad + max_reach).min((anchor_rect.top - work.top - top_margin).max(180));
+        let win_h = (side_pad * 2 + max_reach)
+            .min((desired_card_bottom + side_pad - work.top - top_margin).max(180));
 
-        // Center/align primary card horizontally on MonitorBar's flat pill top without panicking on narrow bars.
-        let pill_inset = ((7.5 + FOOT_MENISCUS_DIP) * s).round() as i32;
+        // Center/align primary card cleanly above MonitorBar without overhanging screen edges.
+        let pill_inset = (6.0 * s).round() as i32;
         let work_min = work.left + edge_margin;
         let work_max = (work.right - primary_w - edge_margin).max(work_min);
         let ideal_primary_left = if (anchor_rect.right - anchor_rect.left) >= primary_w + pill_inset * 2
@@ -544,16 +533,31 @@ impl MonitorPopup {
             (ideal_primary_left - side_pad).clamp(min_win_x, max_win_x)
         };
 
-        // Anchor bottom edge seamlessly onto the MonitorBar pill top edge (0px gap).
-        let win_y = (anchor_rect.top - win_h).max(work.top);
+        // Float the closed menu card `POPUP_FLOAT_GAP_DIP` cleanly above the taskbar top edge.
+        let win_y = (desired_card_bottom + side_pad - win_h).max(work.top);
 
         self.inner.win_x = win_x;
         self.inner.win_y = win_y;
         self.inner.win_w = win_w;
         self.inner.win_h = win_h;
 
-        let (bmp, sampled_bg) =
-            capture_blurred_desktop_backdrop(&self.inner.rt, win_x, win_y, win_w, win_h);
+        let capture_rect = RECT {
+            left: win_x,
+            top: win_y,
+            right: win_x + win_w,
+            bottom: win_y + win_h,
+        };
+        let occluders = visible_transient_overlay_rects(capture_rect);
+        let initial_recipe = popup_glass_recipe(active_taskbar_surface_style(), light_glass, 0.5);
+        let (bmp, sampled_bg) = capture_blurred_desktop_backdrop_excluding(
+            &self.inner.rt,
+            win_x,
+            win_y,
+            win_w,
+            win_h,
+            initial_recipe.blur_radius_4x,
+            &occluders,
+        );
         self.inner.backdrop_bmp = bmp;
         if let Some(bg) = sampled_bg {
             self.inner.backdrop_rgb = bg;
@@ -651,7 +655,7 @@ fn sub_bud_start_rect(
     open_left: bool,
     s: f32,
 ) -> RectF {
-    let min_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s).min(target_sub.width());
+    let min_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s).min(target_sub.width());
     let start_w = (target_sub.width() * 0.26).max(min_w).min(target_sub.width());
     let row_cy = ((row.top + row.bottom) * 0.5).clamp(
         target_sub.top + 20.0 * s,
@@ -681,7 +685,7 @@ fn clamp_sub_spring_rect(
     open_left: bool,
     s: f32,
 ) -> RectF {
-    let min_safe_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s)
+    let min_safe_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s)
         .min(target_sub.width().max(40.0 * s));
     let max_avail_w = if open_left {
         (seam_x - 5.0 * s).max(min_safe_w)
@@ -750,10 +754,10 @@ fn animated_closing_sub_rect(
     s: f32,
 ) -> RectF {
     let r = ease_retract(close_progress);
-    let min_w = ((FOOT_MENISCUS_DIP + 14.0 + PANEL_RADIUS_DIP).max(40.0) * s).min(sub.width());
+    let min_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s).min(sub.width());
     let cur_w = (sub.width() * (1.0 - 0.22 * r)).max(min_w);
     let drop = 12.0 * s * r;
-    let max_bot = bottom_limit.min(anim_primary.bottom - 2.0 * s);
+    let max_bot = bottom_limit.min(anim_primary.bottom);
     let cur_bot = (sub.bottom + drop).min(max_bot).max(44.0 * s);
     let min_h = (42.0 * s).min(sub.height());
     let cur_h = (sub.height() * (1.0 - 0.20 * r))
@@ -776,13 +780,8 @@ impl MonitorPopupInner {
         self.cfg.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    fn primary_overlap_px(&self) -> f32 {
-        let s = self.scale();
-        (self.pill_overlap_px as f32).max(2.0 * s)
-    }
-
     fn primary_height_px(&self) -> f32 {
-        primary_rows_height_dip() * self.scale() + self.primary_overlap_px()
+        primary_rows_height_dip() * self.scale()
     }
 
     fn sub_natural_size_px(&self, kind: SubmenuKind) -> (f32, f32) {
@@ -819,12 +818,11 @@ impl MonitorPopupInner {
 
     fn max_popup_reach_px(&self) -> i32 {
         let s = self.scale();
-        let overlap = self.primary_overlap_px();
         let max_sub_h = submenu_height_dip(MAX_LIST_ROWS)
             .max(brightness_submenu_height_dip(MAX_BRIGHTNESS_ROWS))
             * s;
         let pri_h = self.primary_height_px();
-        pri_h.max(overlap + max_sub_h).ceil() as i32
+        pri_h.max(max_sub_h).ceil() as i32
     }
 
     fn primary_card_rect(&self) -> RectF {
@@ -832,7 +830,7 @@ impl MonitorPopupInner {
         let pad = SHADOW_PAD_DIP * s;
         let pw = PRIMARY_W_DIP * s;
         let ph = self.primary_height_px();
-        let bottom = self.win_h as f32;
+        let bottom = ((self.win_h as f32) - pad).max(pad + 44.0 * s);
         let top = (bottom - ph).max(pad);
         let left = if self.open_left {
             (self.win_w as f32) - pad - pw
@@ -890,8 +888,7 @@ impl MonitorPopupInner {
         let row = self.category_row_rect(kind);
         let (sw, natural_sh) = self.sub_natural_size_px(kind);
 
-        let overlap = self.primary_overlap_px();
-        let bottom_limit = (primary.bottom - overlap).max(primary.top + 58.0 * s);
+        let bottom_limit = primary.bottom.max(primary.top + 58.0 * s);
         let top_limit = if self.win_h > 10 {
             pad
         } else {
@@ -928,8 +925,7 @@ impl MonitorPopupInner {
         } else {
             anim_primary.right
         };
-        let bottom_limit =
-            (target_primary.bottom - self.primary_overlap_px()).max(target_primary.top + 58.0 * s);
+        let bottom_limit = target_primary.bottom.max(target_primary.top + 58.0 * s);
         let base_sub = match self.sub_anim {
             Some(sa) => clamp_sub_spring_rect(
                 sa.top.pos,
@@ -1237,15 +1233,9 @@ impl MonitorPopupInner {
 
     fn point_inside_cards(&self, x: f32, y: f32) -> bool {
         let s = self.scale();
-        let foot = FOOT_MENISCUS_DIP * s;
         let step = STEP_MENISCUS_DIP * s;
         let primary = self.primary_card_rect();
-        if primary.contains(x, y)
-            || (y >= primary.bottom - foot
-                && y <= primary.bottom
-                && x >= primary.left - foot
-                && x <= primary.right + foot)
-        {
+        if primary.contains(x, y) {
             return true;
         }
         if let Some(kind) = self.active_sub {
@@ -1264,18 +1254,10 @@ impl MonitorPopupInner {
             {
                 return true;
             }
-            let bot_reach = if primary.bottom - sub.bottom < step + foot {
-                foot + 14.0 * s
-            } else {
-                step
-            };
-            let bot_max = (sub.bottom + step).min(primary.bottom);
-            let in_x = if self.open_left {
-                x >= seam_x - bot_reach && x <= seam_x
-            } else {
-                x >= seam_x && x <= seam_x + bot_reach
-            };
-            if in_x && y >= sub.bottom && y <= bot_max {
+            let bot_band_min = primary.bottom.min(sub.bottom) - step;
+            let bot_band_max = primary.bottom.max(sub.bottom);
+            if y >= bot_band_min && y <= bot_band_max && (x - seam_x).abs() <= step.max(14.0 * s)
+            {
                 return true;
             }
         }
@@ -1681,48 +1663,144 @@ impl MonitorPopupInner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn emit_bottom_seam_transition(
+        sink: &ID2D1GeometrySink,
+        seam_x: f32,
+        lb: f32,
+        rb: f32,
+        left_w: f32,
+        left_bl: f32,
+        right_w: f32,
+        right_br: f32,
+        r_c: f32,
+        step_r: f32,
+        s: f32,
+    ) {
+        let dy = lb - rb;
+        if dy.abs() < 1.0 * s {
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x,
+                y: (lb + rb) * 0.5,
+            });
+            return;
+        }
+        let max_left = (left_w - left_bl).max(2.0 * s);
+        let max_right = (right_w - right_br).max(2.0 * s);
+        if dy.abs() < r_c + step_r {
+            let span_r = (14.0 * s).min(max_right);
+            let span_l = (14.0 * s).min(max_left);
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x + span_r,
+                y: rb,
+            });
+            sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                point1: D2D_POINT_2F { x: seam_x, y: rb },
+                point2: D2D_POINT_2F { x: seam_x, y: lb },
+                point3: D2D_POINT_2F {
+                    x: seam_x - span_l,
+                    y: lb,
+                },
+            });
+        } else if dy > 0.0 {
+            let sr = step_r.min(max_right);
+            let cr = r_c.min(max_left);
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x + sr,
+                y: rb,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: D2D_POINT_2F {
+                    x: seam_x,
+                    y: rb + sr,
+                },
+                size: D2D_SIZE_F {
+                    width: sr,
+                    height: sr,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x,
+                y: lb - cr,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: D2D_POINT_2F {
+                    x: seam_x - cr,
+                    y: lb,
+                },
+                size: D2D_SIZE_F {
+                    width: cr,
+                    height: cr,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+        } else {
+            let cr = r_c.min(max_right);
+            let sr = step_r.min(max_left);
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x + cr,
+                y: rb,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: D2D_POINT_2F {
+                    x: seam_x,
+                    y: rb - cr,
+                },
+                size: D2D_SIZE_F {
+                    width: cr,
+                    height: cr,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: seam_x,
+                y: lb + sr,
+            });
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: D2D_POINT_2F {
+                    x: seam_x - sr,
+                    y: lb,
+                },
+                size: D2D_SIZE_F {
+                    width: sr,
+                    height: sr,
+                },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_SMALL,
+            });
+        }
+    }
+
     unsafe fn emit_unified_contour(
         sink: &ID2D1GeometrySink,
         primary: RectF,
         sub: Option<RectF>,
         open_left: bool,
         s: f32,
-        closed_fill: bool,
     ) {
-        let foot_r = FOOT_MENISCUS_DIP * s;
         let r_c = PANEL_RADIUS_DIP * s;
         let step_r = STEP_MENISCUS_DIP * s;
-        let bottom = primary.bottom;
-        let eff_p = r_c.min((primary.height() - foot_r - 2.0 * s).max(4.0 * s));
-
-        let fig_begin = if closed_fill {
-            D2D1_FIGURE_BEGIN_FILLED
-        } else {
-            D2D1_FIGURE_BEGIN_HOLLOW
-        };
+        let eff_p = r_c
+            .min((primary.height() * 0.45).max(4.0 * s))
+            .min((primary.width() * 0.45).max(4.0 * s));
 
         match sub {
             None => {
                 sink.BeginFigure(
                     D2D_POINT_2F {
-                        x: primary.left - foot_r,
-                        y: bottom,
-                    },
-                    fig_begin,
-                );
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F {
                         x: primary.left,
-                        y: bottom - foot_r,
+                        y: primary.bottom - eff_p,
                     },
-                    size: D2D_SIZE_F {
-                        width: foot_r,
-                        height: foot_r,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
                 sink.AddLine(D2D_POINT_2F {
                     x: primary.left,
                     y: primary.top + eff_p,
@@ -1759,19 +1837,36 @@ impl MonitorPopupInner {
                 });
                 sink.AddLine(D2D_POINT_2F {
                     x: primary.right,
-                    y: bottom - foot_r,
+                    y: primary.bottom - eff_p,
                 });
                 sink.AddArc(&D2D1_ARC_SEGMENT {
                     point: D2D_POINT_2F {
-                        x: primary.right + foot_r,
-                        y: bottom,
+                        x: primary.right - eff_p,
+                        y: primary.bottom,
                     },
                     size: D2D_SIZE_F {
-                        width: foot_r,
-                        height: foot_r,
+                        width: eff_p,
+                        height: eff_p,
                     },
                     rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+                sink.AddLine(D2D_POINT_2F {
+                    x: primary.left + eff_p,
+                    y: primary.bottom,
+                });
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F {
+                        x: primary.left,
+                        y: primary.bottom - eff_p,
+                    },
+                    size: D2D_SIZE_F {
+                        width: eff_p,
+                        height: eff_p,
+                    },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                     arcSize: D2D1_ARC_SIZE_SMALL,
                 });
             }
@@ -1779,28 +1874,15 @@ impl MonitorPopupInner {
                 let seam_x = primary.right;
                 let sub_r = r_c
                     .min((sub.height() * 0.45).max(4.0 * s))
-                    .min((sub.width() * 0.4).max(4.0 * s));
+                    .min((sub.width() * 0.45).max(4.0 * s));
 
                 sink.BeginFigure(
                     D2D_POINT_2F {
-                        x: primary.left - foot_r,
-                        y: bottom,
-                    },
-                    fig_begin,
-                );
-                sink.AddArc(&D2D1_ARC_SEGMENT {
-                    point: D2D_POINT_2F {
                         x: primary.left,
-                        y: bottom - foot_r,
+                        y: primary.bottom - eff_p,
                     },
-                    size: D2D_SIZE_F {
-                        width: foot_r,
-                        height: foot_r,
-                    },
-                    rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                    arcSize: D2D1_ARC_SIZE_SMALL,
-                });
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
                 sink.AddLine(D2D_POINT_2F {
                     x: primary.left,
                     y: primary.top + eff_p,
@@ -1868,143 +1950,51 @@ impl MonitorPopupInner {
                     arcSize: D2D1_ARC_SIZE_SMALL,
                 });
 
-                let dy_bot = bottom - sub.bottom;
-                if dy_bot >= step_r + foot_r {
-                    sink.AddLine(D2D_POINT_2F {
-                        x: seam_x + step_r,
-                        y: sub.bottom,
-                    });
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F {
-                            x: seam_x,
-                            y: sub.bottom + step_r,
-                        },
-                        size: D2D_SIZE_F {
-                            width: step_r,
-                            height: step_r,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                    sink.AddLine(D2D_POINT_2F {
-                        x: seam_x,
-                        y: bottom - foot_r,
-                    });
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F {
-                            x: seam_x + foot_r,
-                            y: bottom,
-                        },
-                        size: D2D_SIZE_F {
-                            width: foot_r,
-                            height: foot_r,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                } else {
-                    sink.AddLine(D2D_POINT_2F {
-                        x: seam_x + foot_r + 12.0 * s,
-                        y: sub.bottom,
-                    });
-                    sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                        point1: D2D_POINT_2F {
-                            x: seam_x + foot_r + 6.0 * s,
-                            y: sub.bottom,
-                        },
-                        point2: D2D_POINT_2F {
-                            x: seam_x + foot_r + 6.0 * s,
-                            y: bottom,
-                        },
-                        point3: D2D_POINT_2F {
-                            x: seam_x + foot_r,
-                            y: bottom,
-                        },
-                    });
-                }
-            }
-            Some(sub) => {
-                let seam_x = primary.left;
-                let sub_r = r_c
-                    .min((sub.height() * 0.45).max(4.0 * s))
-                    .min((sub.width() * 0.4).max(4.0 * s));
-
-                sink.BeginFigure(
-                    D2D_POINT_2F {
-                        x: seam_x - foot_r,
-                        y: bottom,
-                    },
-                    fig_begin,
+                Self::emit_bottom_seam_transition(
+                    sink,
+                    seam_x,
+                    primary.bottom,
+                    sub.bottom,
+                    primary.width(),
+                    eff_p,
+                    sub.width(),
+                    sub_r,
+                    r_c,
+                    step_r,
+                    s,
                 );
 
-                let dy_bot = bottom - sub.bottom;
-                if dy_bot >= step_r + foot_r {
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F {
-                            x: seam_x,
-                            y: bottom - foot_r,
-                        },
-                        size: D2D_SIZE_F {
-                            width: foot_r,
-                            height: foot_r,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                    sink.AddLine(D2D_POINT_2F {
-                        x: seam_x,
-                        y: sub.bottom + step_r,
-                    });
-                    sink.AddArc(&D2D1_ARC_SEGMENT {
-                        point: D2D_POINT_2F {
-                            x: seam_x - step_r,
-                            y: sub.bottom,
-                        },
-                        size: D2D_SIZE_F {
-                            width: step_r,
-                            height: step_r,
-                        },
-                        rotationAngle: 0.0,
-                        sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
-                        arcSize: D2D1_ARC_SIZE_SMALL,
-                    });
-                } else {
-                    sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                        point1: D2D_POINT_2F {
-                            x: seam_x - foot_r - 6.0 * s,
-                            y: bottom,
-                        },
-                        point2: D2D_POINT_2F {
-                            x: seam_x - foot_r - 6.0 * s,
-                            y: sub.bottom,
-                        },
-                        point3: D2D_POINT_2F {
-                            x: seam_x - foot_r - 12.0 * s,
-                            y: sub.bottom,
-                        },
-                    });
-                }
-
                 sink.AddLine(D2D_POINT_2F {
-                    x: sub.left + sub_r,
-                    y: sub.bottom,
+                    x: primary.left + eff_p,
+                    y: primary.bottom,
                 });
                 sink.AddArc(&D2D1_ARC_SEGMENT {
                     point: D2D_POINT_2F {
-                        x: sub.left,
-                        y: sub.bottom - sub_r,
+                        x: primary.left,
+                        y: primary.bottom - eff_p,
                     },
                     size: D2D_SIZE_F {
-                        width: sub_r,
-                        height: sub_r,
+                        width: eff_p,
+                        height: eff_p,
                     },
                     rotationAngle: 0.0,
                     sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                     arcSize: D2D1_ARC_SIZE_SMALL,
                 });
+            }
+            Some(sub) => {
+                let seam_x = primary.left;
+                let sub_r = r_c
+                    .min((sub.height() * 0.45).max(4.0 * s))
+                    .min((sub.width() * 0.45).max(4.0 * s));
+
+                sink.BeginFigure(
+                    D2D_POINT_2F {
+                        x: sub.left,
+                        y: sub.bottom - sub_r,
+                    },
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
                 sink.AddLine(D2D_POINT_2F {
                     x: sub.left,
                     y: sub.top + sub_r,
@@ -2056,29 +2046,57 @@ impl MonitorPopupInner {
                 });
                 sink.AddLine(D2D_POINT_2F {
                     x: primary.right,
-                    y: bottom - foot_r,
+                    y: primary.bottom - eff_p,
                 });
                 sink.AddArc(&D2D1_ARC_SEGMENT {
                     point: D2D_POINT_2F {
-                        x: primary.right + foot_r,
-                        y: bottom,
+                        x: primary.right - eff_p,
+                        y: primary.bottom,
                     },
                     size: D2D_SIZE_F {
-                        width: foot_r,
-                        height: foot_r,
+                        width: eff_p,
+                        height: eff_p,
                     },
                     rotationAngle: 0.0,
-                    sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+
+                Self::emit_bottom_seam_transition(
+                    sink,
+                    seam_x,
+                    sub.bottom,
+                    primary.bottom,
+                    sub.width(),
+                    sub_r,
+                    primary.width(),
+                    eff_p,
+                    r_c,
+                    step_r,
+                    s,
+                );
+
+                sink.AddLine(D2D_POINT_2F {
+                    x: sub.left + sub_r,
+                    y: sub.bottom,
+                });
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: D2D_POINT_2F {
+                        x: sub.left,
+                        y: sub.bottom - sub_r,
+                    },
+                    size: D2D_SIZE_F {
+                        width: sub_r,
+                        height: sub_r,
+                    },
+                    rotationAngle: 0.0,
+                    sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
                     arcSize: D2D1_ARC_SIZE_SMALL,
                 });
             }
         }
 
-        sink.EndFigure(if closed_fill {
-            D2D1_FIGURE_END_CLOSED
-        } else {
-            D2D1_FIGURE_END_OPEN
-        });
+        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
     }
 
     fn build_unified_menu_geometry(
@@ -2086,21 +2104,19 @@ impl MonitorPopupInner {
         primary: RectF,
         sub: Option<RectF>,
         s: f32,
-        closed_fill: bool,
     ) -> windows::core::Result<ID2D1PathGeometry> {
         unsafe {
             let geo = self.d2d_factory.CreatePathGeometry()?;
             let sink = geo.Open()?;
-            Self::emit_unified_contour(&sink, primary, sub, self.open_left, s, closed_fill);
+            Self::emit_unified_contour(&sink, primary, sub, self.open_left, s);
             sink.Close()?;
             Ok(geo.into())
         }
     }
 
     unsafe fn draw_unified_shadows(&self, primary_rect: RectF, sub_rect: Option<RectF>, s: f32) {
-        let foot_r = FOOT_MENISCUS_DIP * s;
         let max_w = self.win_w as f32;
-        let taskbar_y = primary_rect.bottom - self.primary_overlap_px();
+        let max_h = self.win_h as f32;
         let shadow_layers = if self.light_glass {
             [(7.5 * s, 0.022), (4.5 * s, 0.036), (2.0 * s, 0.058)]
         } else {
@@ -2114,37 +2130,35 @@ impl MonitorPopupInner {
                 if self.open_left && sub_rect.is_some() {
                     primary_rect.left
                 } else {
-                    (primary_rect.left - side_exp).max(foot_r)
+                    (primary_rect.left - side_exp).max(0.0)
                 },
                 (primary_rect.top - top_exp).max(0.0),
                 if !self.open_left && sub_rect.is_some() {
                     primary_rect.right
                 } else {
-                    (primary_rect.right + side_exp).min(max_w - foot_r)
+                    (primary_rect.right + side_exp).min(max_w)
                 },
-                primary_rect.bottom,
+                (primary_rect.bottom + bot_exp).min(max_h),
             );
             let sh_sub = sub_rect.map(|sr| {
                 RectF::new(
                     if !self.open_left {
                         sr.left
                     } else {
-                        (sr.left - side_exp).max(foot_r)
+                        (sr.left - side_exp).max(0.0)
                     },
                     (sr.top - top_exp).max(0.0),
                     if self.open_left {
                         sr.right
                     } else {
-                        (sr.right + side_exp).min(max_w - foot_r)
+                        (sr.right + side_exp).min(max_w)
                     },
-                    (sr.bottom + bot_exp + 1.5 * s)
-                        .min(taskbar_y)
-                        .max(sr.bottom),
+                    (sr.bottom + bot_exp).min(max_h),
                 )
             });
 
             if let (Ok(geo), Ok(sh_brush)) = (
-                self.build_unified_menu_geometry(sh_primary, sh_sub, s, true),
+                self.build_unified_menu_geometry(sh_primary, sh_sub, s),
                 self.rt.CreateSolidColorBrush(
                     &D2D1_COLOR_F {
                         r: 0.0,
@@ -2160,110 +2174,7 @@ impl MonitorPopupInner {
         }
     }
 
-    unsafe fn draw_unified_open_rim(&self, primary_rect: RectF, sub_rect: Option<RectF>, s: f32) {
-        let mut rim_primary = primary_rect;
-        rim_primary.bottom -= 0.5 * s;
-        let Ok(rim_geo) = self.build_unified_menu_geometry(rim_primary, sub_rect, s, false) else {
-            return;
-        };
-        let top_min = sub_rect.map_or(rim_primary.top, |r| rim_primary.top.min(r.top));
-
-        if self.light_glass {
-            let def_col = D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.09,
-            };
-            if let Ok(def_brush) = self.rt.CreateSolidColorBrush(&def_col, None) {
-                self.rt.DrawGeometry(&rim_geo, &def_brush, 1.3 * s, None);
-            }
-        }
-
-        let rim_stops = if self.light_glass {
-            [
-                D2D1_GRADIENT_STOP {
-                    position: 0.0,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.82,
-                    },
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.55,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.42,
-                    },
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 1.0,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.22,
-                    },
-                },
-            ]
-        } else {
-            [
-                D2D1_GRADIENT_STOP {
-                    position: 0.0,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.48,
-                    },
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 0.55,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.18,
-                    },
-                },
-                D2D1_GRADIENT_STOP {
-                    position: 1.0,
-                    color: D2D1_COLOR_F {
-                        r: 1.0,
-                        g: 1.0,
-                        b: 1.0,
-                        a: 0.13,
-                    },
-                },
-            ]
-        };
-        let stroke_w = if self.light_glass { 1.0 * s } else { 1.15 * s };
-        if let Ok(sc) = self.rt.CreateGradientStopCollection(
-            &rim_stops,
-            D2D1_GAMMA_2_2,
-            D2D1_EXTEND_MODE_CLAMP,
-        ) {
-            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
-                startPoint: D2D_POINT_2F {
-                    x: rim_primary.left,
-                    y: top_min,
-                },
-                endPoint: D2D_POINT_2F {
-                    x: rim_primary.left,
-                    y: rim_primary.bottom,
-                },
-            };
-            if let Ok(rim_brush) = self.rt.CreateLinearGradientBrush(&props, None, &sc) {
-                self.rt.DrawGeometry(&rim_geo, &rim_brush, stroke_w, None);
-            }
-        }
-    }
-
-    fn update_silk_and_accent(&mut self, pri_rect: RectF, s: f32) {
+    fn update_silk_and_accent(&mut self, pri_rect: RectF, s: f32, draw_silk: bool) {
         let now = Instant::now();
         let dt_color = now
             .duration_since(self.last_color_tick)
@@ -2294,21 +2205,23 @@ impl MonitorPopupInner {
             self.ui_accent.2 += (ui_target.2 - self.ui_accent.2) * k_ui;
         }
 
-        update_silk_bitmap(
-            &self.rt,
-            &mut self.silk_bmp,
-            &mut self.silk_buf,
-            &mut self.last_silk_tick,
-            !was_ready,
-            self.win_w,
-            self.win_h,
-            pri_rect.left,
-            pri_rect.bottom,
-            s,
-            self.flow_phase,
-            &self.halo_colors,
-            self.light_glass,
-        );
+        if draw_silk {
+            update_silk_bitmap(
+                &self.rt,
+                &mut self.silk_bmp,
+                &mut self.silk_buf,
+                &mut self.last_silk_tick,
+                !was_ready,
+                self.win_w,
+                self.win_h,
+                pri_rect.left,
+                pri_rect.bottom,
+                s,
+                self.flow_phase,
+                &self.halo_colors,
+                self.light_glass,
+            );
+        }
     }
 
     fn render(&mut self) -> windows::core::Result<()> {
@@ -2317,7 +2230,12 @@ impl MonitorPopupInner {
         self.ensure_formats(s)?;
 
         let target_primary = self.primary_card_rect();
-        self.update_silk_and_accent(target_primary, s);
+        let recipe = popup_glass_recipe(
+            active_taskbar_surface_style(),
+            self.light_glass,
+            rgb_luma(self.backdrop_rgb),
+        );
+        self.update_silk_and_accent(target_primary, s, recipe.silk_alpha > 0.002);
 
         let accent = Rgb::new(
             (self.ui_accent.0 * 255.0).round().clamp(0.0, 255.0) as u8,
@@ -2348,16 +2266,17 @@ impl MonitorPopupInner {
             }
         };
 
-        let foot_r = FOOT_MENISCUS_DIP * s;
         let left_bound = anim_sub_opt.map_or(anim_primary.left, |sr| anim_primary.left.min(sr.left));
         let right_bound =
             anim_sub_opt.map_or(anim_primary.right, |sr| anim_primary.right.max(sr.right));
         let top_bound = anim_sub_opt.map_or(anim_primary.top, |sr| anim_primary.top.min(sr.top));
+        let bottom_bound =
+            anim_sub_opt.map_or(anim_primary.bottom, |sr| anim_primary.bottom.max(sr.bottom));
         let union_bounds = RectF::new(
-            (left_bound - foot_r).max(0.0),
-            (top_bound - 1.0 * s).max(0.0),
-            (right_bound + foot_r).min(self.win_w as f32),
-            anim_primary.bottom,
+            left_bound.max(0.0),
+            top_bound.max(0.0),
+            right_bound.min(self.win_w as f32),
+            bottom_bound.min(self.win_h as f32),
         );
 
         let bind_rect = RECT {
@@ -2378,14 +2297,14 @@ impl MonitorPopupInner {
                 a: 0.0,
             }));
 
-            // 1. Unified liquid ambient shadows
+            // 1. Standalone ambient shadows
             self.draw_unified_shadows(anim_primary, anim_sub_opt, s);
 
-            // 2. Unified silhouette clipping layer
-            if let Ok(unified_geo) =
-                self.build_unified_menu_geometry(anim_primary, anim_sub_opt, s, true)
+            // 2. Closed fused silhouette clipping layer
+            if let Ok(unified_geo) = self.build_unified_menu_geometry(anim_primary, anim_sub_opt, s)
             {
                 let geom: ID2D1Geometry = unified_geo.cast()?;
+                let geom_for_rim = geom.clone();
                 let outer_params = D2D1_LAYER_PARAMETERS {
                     contentBounds: d2d_rect(union_bounds),
                     geometricMask: ManuallyDrop::new(Some(geom)),
@@ -2405,6 +2324,8 @@ impl MonitorPopupInner {
                     self.backdrop_bmp.as_ref(),
                     self.silk_bmp.as_ref(),
                     self.light_glass,
+                    &recipe,
+                    &mut self.noise_cache,
                 );
 
                 // 2a. Primary card rows & divider
@@ -2578,10 +2499,18 @@ impl MonitorPopupInner {
                 self.rt.PopLayer();
                 let _ = ManuallyDrop::into_inner(outer_params.geometricMask);
                 let _ = ManuallyDrop::into_inner(outer_params.opacityBrush);
-            }
 
-            // 3. Open upper rim stroke (omits bottom edge so menu fuses seamlessly into MonitorBar)
-            self.draw_unified_open_rim(anim_primary, anim_sub_opt, s);
+                // 3. Restrained closed glass rim stroke harmonized with taskbar style
+                draw_geometry_rim(
+                    &self.rt,
+                    &geom_for_rim,
+                    union_bounds.left,
+                    union_bounds.top,
+                    union_bounds.bottom,
+                    s,
+                    &recipe,
+                );
+            }
 
             let res = self.rt.EndDraw(None, None);
             if res.is_ok() {

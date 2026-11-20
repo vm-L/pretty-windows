@@ -407,7 +407,7 @@ impl AppState {
             vol_hud_dragging: self.vol_hud_dragging,
             master_volume: self.master_vol,
             master_muted: self.master_muted,
-            popup_open_span_x: None,
+            popup_open: false,
             bar_levels: &self.last_bars,
             title_marquee: &mut self.title_marquee,
             artist_marquee: &mut self.artist_marquee,
@@ -465,10 +465,7 @@ impl AppState {
         if !self.visible || self.hidden_by_guard {
             return;
         }
-        let popup_open_span_x = self
-            .popup
-            .attached_bar_span_screen_x()
-            .map(|(l, r)| (l - self.win_x as f32, r - self.win_x as f32));
+        let popup_open = self.popup.is_visible();
         let (is_idle, is_playing, title, artist, cover, accent) = self.frame_metadata();
         let mut frame = RenderFrame {
             hwnd: self.hwnd,
@@ -492,7 +489,7 @@ impl AppState {
             vol_hud_dragging: self.vol_hud_dragging,
             master_volume: self.master_vol,
             master_muted: self.master_muted,
-            popup_open_span_x,
+            popup_open,
             bar_levels: &self.last_bars,
             title_marquee: &mut self.title_marquee,
             artist_marquee: &mut self.artist_marquee,
@@ -755,10 +752,9 @@ impl AppState {
         self.hover_t = 1.0;
         self.target_hover_t = 1.0;
         let layout = self.current_layout();
-        let pill_overlap_px = (layout.bg_rect.top + 0.5 * layout.scale).round() as i32;
         let anchor = RECT {
             left: self.win_x + layout.bg_rect.left.round() as i32,
-            top: self.win_y + pill_overlap_px,
+            top: self.win_y,
             right: self.win_x + layout.bg_rect.right.round() as i32,
             bottom: self.win_y + self.win_h,
         };
@@ -773,7 +769,6 @@ impl AppState {
             self.active_id.clone(),
             self.config.locked,
             self.config.auto_color,
-            pill_overlap_px,
         );
         self.dirty = true;
         self.render_now();
