@@ -1047,7 +1047,7 @@ impl TrayMenuInner {
                         let label = match item {
                             TrayMenuItem::MediaBar => "媒体控制",
                             TrayMenuItem::MonitorBar => "系统监控",
-                            TrayMenuItem::TaskbarStyle => "整体风格",
+                            TrayMenuItem::TaskbarStyle => "美化风格",
                             TrayMenuItem::Autostart => "开机自启",
                             TrayMenuItem::Exit => "退出",
                         };
