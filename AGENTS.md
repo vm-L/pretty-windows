@@ -99,6 +99,6 @@ cargo check --workspace --tests --target x86_64-pc-windows-msvc
 ### 新增代码注意点
 - 新增非 Win32 逻辑（布局计算、配置解析、物理曲线、色彩/DSP 算法）应保持跨平台可编译并附带单元测试，以便在 Linux 环境通过 `cargo test` 即时验证。
 - 所有 Win32 窗口消息常量（`WM_APP + N`）需在模块内明确命名与分段，避免宿主/菜单/子模块之间产生消息编号冲突：
-  - `mediabar`：`WM_APP + 1` .. `WM_APP + 5`
+  - `mediabar`：`WM_APP + 1` .. `WM_APP + 6`（当前已占用 `+1`..`+6`）
   - `tray`：`WM_APP + 20` .. `WM_APP + 29`（当前已占用 `+20`..`+28`）
-  - `monitorbar`：`WM_APP + 40` .. `WM_APP + 49`（当前已占用 `+40`..`+48`）
+  - `monitorbar`：`WM_APP + 40` .. `WM_APP + 49`（当前已占用 `+40`..`+49`）

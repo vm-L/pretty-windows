@@ -42,3 +42,5 @@ pub(crate) const WM_APP_MONITOR_PICK_CUSTOM_APP: u32 = WM_APP + 46;
 pub(crate) const WM_APP_MONITOR_CLOSE_SELF: u32 = WM_APP + 47;
 #[cfg(windows)]
 pub(crate) const WM_APP_MONITOR_BRIGHTNESS_UPDATED: u32 = WM_APP + 48;
+#[cfg(windows)]
+pub(crate) const WM_APP_MONITOR_RESYNC_POS: u32 = WM_APP + 49;

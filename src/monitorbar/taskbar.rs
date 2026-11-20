@@ -88,13 +88,27 @@ pub fn query_taskbar_state() -> Option<TaskbarState> {
     }
 }
 
-/// Computes `(x, y, width, height)` for MonitorBar anchored directly left of `TrayNotifyWnd`.
+/// Default right-anchored screen X coordinate for MonitorBar (directly left of `TrayNotifyWnd`).
+#[cfg(windows)]
+pub fn default_monitor_bar_x(state: &TaskbarState, desired_width_dip: f32) -> i32 {
+    let scale = (state.dpi as f32) / 96.0;
+    let margin = (4.0 * scale).round() as i32;
+    let bar_w = (desired_width_dip * scale).round() as i32;
+    let min_x = state.tray_rect.left + margin;
+    (state.tray_notify_left - margin - bar_w).max(min_x)
+}
+
+/// Computes `(x, y, width, height, resolved_offset_x)` for MonitorBar anchored directly left of
+/// `TrayNotifyWnd` while avoiding overlap with any active peer bar.
 #[cfg(windows)]
 pub fn compute_monitor_bar_rect(
     state: &TaskbarState,
     desired_width_dip: f32,
     offset_x: i32,
-) -> (i32, i32, i32, i32) {
+    current_x: Option<i32>,
+    peer_span: Option<(i32, i32)>,
+    mode: crate::system::BarCollisionMode,
+) -> (i32, i32, i32, i32, i32) {
     let scale = (state.dpi as f32) / 96.0;
     let margin = (4.0 * scale).round() as i32;
     let bar_w = (desired_width_dip * scale).round() as i32;
@@ -102,26 +116,25 @@ pub fn compute_monitor_bar_rect(
     let y = state.tray_rect.top;
 
     let min_x = state.tray_rect.left + margin;
-    let max_x = (state.tray_notify_left - margin - bar_w).max(min_x);
+    let max_x = default_monitor_bar_x(state, desired_width_dip);
     let default_x = max_x;
-    let clamped_x = (default_x + offset_x).clamp(min_x, max_x);
+    let gap_px = (crate::system::TASKBAR_BAR_GAP_DIP * scale).round() as i32;
+    let hysteresis_px = (crate::system::TASKBAR_BAR_SWAP_HYSTERESIS_DIP * scale).round() as i32;
 
-    (clamped_x, y, bar_w, bar_h)
-}
+    let resolved_x = crate::system::resolve_taskbar_bar_x(
+        default_x + offset_x,
+        bar_w,
+        min_x,
+        max_x,
+        current_x,
+        peer_span,
+        gap_px,
+        hysteresis_px,
+        mode,
+    );
+    let resolved_offset = resolved_x - default_x;
 
-#[cfg(windows)]
-pub fn compute_clamped_offset(
-    state: &TaskbarState,
-    desired_width_dip: f32,
-    raw_offset_x: i32,
-) -> i32 {
-    let scale = (state.dpi as f32) / 96.0;
-    let margin = (4.0 * scale).round() as i32;
-    let bar_w = (desired_width_dip * scale).round() as i32;
-    let min_x = state.tray_rect.left + margin;
-    let max_x = (state.tray_notify_left - margin - bar_w).max(min_x);
-    let default_x = max_x;
-    (default_x + raw_offset_x).clamp(min_x, max_x) - default_x
+    (resolved_x, y, bar_w, bar_h, resolved_offset)
 }
 
 /// Detects whether a genuine fullscreen or presentation window is occluding the taskbar.

@@ -69,12 +69,16 @@
 
 ## 3. 色彩与语义 Token 规范
 
-### 3.1 强调色主题校准（`color::adjust_accent_for_theme`）
-任何来源（专辑封面主色或 Windows `UIColorType::Accent`，默认蓝 `Rgb(0, 120, 212)`）用于 UI 高亮、频谱条、进度填充前，必须经过 HSL 校准：
+### 3.1 强调色主题校准与相近色死区保护（`color::adjust_accent_for_theme` / `color::enforce_ui_accent_deadzone`）
+任何来源（专辑封面主色、背景采样色或 Windows `UIColorType::Accent`，默认蓝 `Rgb(0, 120, 212)`）用于 UI 高亮、频谱条、进度填充前，必须经过 HSL 校准；同时所有 UI 交互高亮颜色（三处悬浮菜单的选中胶囊、描边、左侧指示条、滑块、开关、播放中徽章，以及 `MediaBar` 频谱柱与内联音量条）在展示前必须经 `color::enforce_ui_accent_deadzone` 进行静态深浅主题灰区死区校验与外推（**液态丝绸光带保留柔和原生色相，不接入死区外推**）：
 - **低饱和 / 灰阶色**（`s < 0.08`）：保持原有色相/低饱和，深色目标亮度 `L = 0.76`，浅色目标亮度 `L = 0.37`。
 - **有彩色**：`min_s = s.min(0.20)`：
   - **深色模式**：`S = (s * 1.10).clamp(min_s, 0.84)`，`L = l.clamp(0.58, 0.74)`
   - **浅色模式**：`S = (s * 1.08).clamp(min_s, 0.82)`，`L = l.clamp(0.32, 0.48)`
+- **静态深浅主题灰区死区与外推**：
+  - **深色模式死区**：感知亮度 `Y < 0.36`，或与中性灰区间 `Y ∈ [0.16, 0.62]` 处于椭圆死区（`y_margin = 0.22`、`chroma_margin = 0.42`）以内。
+  - **浅色模式死区**：感知亮度 `Y > 0.60`，或与中性灰区间 `Y ∈ [0.54, 0.96]` 处于椭圆死区（`y_margin = 0.24`、`chroma_margin = 0.42`）以内。
+  - **外推规则**：原本鲜明且位于死区外的颜色零改动透传；低饱和中性灰（`s < 0.10 || chroma < 0.06`）保留中性特征（`s <= 0.08`）推至高辨识度珠白（深色 `L >= 0.89`）或深炭灰（浅色 `L <= 0.22`）；其余有彩色严格保留原色相 `H`，迭代微调饱和度与明度至刚好离开死区边界即止。
 
 ### 3.2 文本、图标与分隔线 Token
 
@@ -167,7 +171,7 @@
 - **级联子菜单形变**：宽弹簧 `(920.0, 46.0)`、垂直弹簧 `(860.0, 44.5)`；连续切换分类时继承当前位置与速度，不归零重来。托盘级联菜单（`整体风格` → `148 DIP` 二级菜单）复用同一宽弹簧与融合几何管线，通过 `CombineWithGeometry(D2D1_COMBINE_MODE_UNION)` 消除接缝内凹角并绘制羽化竖向分隔线，未展开子菜单的透明预留区域通过 `WM_NCHITTEST -> HTTRANSPARENT` 保持点击穿透。
 - **弹窗收起（Closing）**：时长 `CLOSE_ANIM_DUR_S = 0.095s`（95ms），采用回缩曲线 `ease_retract(t) = t * (0.45 + 0.55 * t)`，窗口透明度 `(1.0 - progress)^1.25`，内容微落 `5.0 * s * r` 且透明度降 `30%`（当托盘菜单向下展开时向顶部锚边同步镜像回缩 `-5.0 * s * r`）。关闭期间 `WM_NCHITTEST` 返回 `HTTRANSPARENT`，避免遮挡或吞掉用户下一次点击。
 - **离散功能项执行后自动收起**：托盘菜单（`MediaBar` / `整体风格` 子项 / `开机自启`）与 MediaBar 级联菜单（播放源选择、播放/录音设备切换、`锁定位置`、`重置位置`）在点击生效后立即触发上述 `95ms` 平滑回缩关闭；连续/多步调节项（如主音量/应用静音、滑块拖拽与滚轮调音）保持菜单开启；`退出`/`关闭` 保持立即隐藏（托盘退出时自动恢复默认任务栏与溢出栏外观）。
-- **全宽任务栏与托盘溢出栏联动风格（`默认` / `透明` / `毛玻璃` / `亚克力` / `液态玻璃`）**：系统透明开启时，在所有显示器任务栏及可见系统托盘溢出栏（`TopLevelWindowForOverflowXamlIsland` / `NotifyIconOverflowWindow`）正后方叠置原生 `Windows.UI.Composition` 实时 GPU 模糊底层（`CreateHostBackdropBrush` + `GaussianBlur(Hard)` + `Saturation`）+ Direct2D 材质表层（任务栏全宽；溢出栏采用 `DWMWCP_ROUND` 与 `8 DIP` 圆角裁剪及克制圆角描边，在 `透明` 档保留极轻清透玻璃底与细腻圆角边界以保证图标辨识度，完整保留系统原生图标悬停高亮）；系统关闭透明时自动切换纯半透明 `WS_EX_LAYERED` 回退，自动隐藏与全屏应用下按显示器独立隐退，最大化窗口时保持常驻。
+- **全宽任务栏、托盘溢出栏、`Alt + Tab` 切换器、任务栏悬停预览浮窗、系统硬件 OSD 胶囊与任务栏/托盘悬浮提示胶囊联动风格（`默认` / `透明` / `毛玻璃` / `亚克力` / `液态玻璃`）**：系统透明开启时，在所有显示器任务栏、可见系统托盘溢出栏（`TopLevelWindowForOverflowXamlIsland` / `NotifyIconOverflowWindow`，裁切 `13 DIP` 外围阴影留白）、可见 `Alt + Tab` 任务切换器卡片、同源 `Taskbar.FlyoutFrame` 浮窗（单/多窗口悬停缩略图预览、纵向滚动列表与任务栏 `...` 溢出浮窗；于任务栏独立 UI 线程的 `XamlExplorerHostIslandWindow` 中由 TAP 通过 `IUIElement::get_RenderSize` + `TransformToVisual(null)` 实时测算 `Border#HoverFlyoutBackground` 的动态边界，并与 `Alt + Tab` 全工作区宿主做线程与尺寸隔离）、系统硬件 OSD 胶囊（`HWConfirmatorUI` 音量 / 亮度 / 键盘背光 / 飞行模式 / 隐私开关浮窗；由 TAP 清除 `Grid#ConfirmatorMainGrid` 的原生亚克力背景、边框与 `ConfirmatorPageShadow` 阴影并精确测算动态轮廓，保留内部滑块、音量强调色及提示图标交互），以及任务栏/系统托盘/托盘溢出栏全部 XAML 悬浮提示胶囊（`ToolTip > ContentPresenter#LayoutRoot`，承载于 `band=1` `Xaml_WindowedPopupClass`；仅在 TAP 验证 `IToolTip::IsOpen == true` 且尺寸吻合时接管以严格隔离右键 `MenuFlyout` 等非提示浮窗，清除 `ContentPresenter` 与父级 `ToolTip` 的原生底色、描边与 `ThemeShadow`）正后方叠置原生 `Windows.UI.Composition` 实时 GPU 模糊底层（`CreateHostBackdropBrush` + `GaussianBlur(Hard)` + `Saturation`，禁用 `DWMWA_BORDER_COLOR` 系统灰边）+ Direct2D 材质表层（任务栏全宽；溢出栏、`Alt + Tab`、`FlyoutFrame`、OSD 胶囊与悬浮提示胶囊均采用 `DWMWCP_ROUND` 与 `8 DIP` 圆角裁剪及克制圆角描边，OSD 胶囊外侧保留 `10 DIP`、悬浮提示胶囊外侧保留 `6 DIP` 透明边距按比例绘制仅限于卡片外部环域的 3 遍柔和环境投影以替代原生厚重阴影；在 `透明` 档保留极轻清透玻璃底与细腻圆角边界以保证图标、标题与控件辨识度，卡片淡出或尺寸异常时立刻隐藏防残影；普通无边框全屏应用/视频仍保留完整 `band=1` 背板渲染，仅在 D3D 独占全屏/演示模式或上层外部 `WS_EX_TOPMOST` 置顶窗口覆盖卡片区域时自动隐退背板并将 `band=18` OSD 容器或 `ToolTip > ContentPresenter#LayoutRoot` 原地切换为随 5 档风格与深浅色校准的半透明内联玻璃底、`8 DIP` 圆角与细腻描边，始终保持无阴影透感而不回退为原生不透明灰底，仅在切回 `默认` 档或退出时无损还原原生外观）；同步将 `Alt + Tab` 窗口缩略图卡片标题条（`Border#BackgroundBorder`）随 5 档整体风格与系统深浅色联动为轻透玻璃底 + 细腻玻璃描边并拦截悬停实心灰块与 `FocusVisualSecondaryBrush` 内黑边，切回 `默认` 档无损恢复系统原生外观；系统关闭透明时自动切换纯半透明 `WS_EX_LAYERED` 回退，自动隐藏与全屏应用下任务栏按显示器独立隐退，最大化窗口时保持常驻。
 
 ---
 

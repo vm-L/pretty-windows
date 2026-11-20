@@ -1,12 +1,14 @@
 use super::config::TaskbarStyle;
 use super::swca::{
-    backdrop_layer_plan, generate_acrylic_noise_bgra, gpu_backdrop_recipe,
-    inset_overflow_card_rect, overflow_backdrop_layer_plan,
+    backdrop_layer_plan, expand_card_rect_for_shadow, generate_acrylic_noise_bgra,
+    gpu_backdrop_recipe, inset_overflow_card_rect, overflow_backdrop_layer_plan,
+    OSD_SHADOW_PAD_DIP, TOOLTIP_SHADOW_PAD_DIP,
 };
 use crate::color::NEUTRAL_BACKDROP_FALLBACK;
 use crate::system::{
-    overflow_backdrop_anchor, register_taskbar_backdrop, resolve_unified_accent,
-    taskbar_backdrop_anchor, unregister_taskbar_backdrop,
+    exclude_from_peek, is_occluded_by_same_band_topmost, overflow_backdrop_anchor,
+    register_taskbar_backdrop, resolve_unified_accent, taskbar_backdrop_anchor,
+    unregister_taskbar_backdrop,
 };
 use crate::ui::glass::{
     d2d_rect, draw_rounded_card_rim, identity_matrix, update_silk_bitmap, LayeredSurface,
@@ -42,10 +44,11 @@ use windows::Win32::Graphics::Direct2D::{
     ID2D1DCRenderTarget, ID2D1Factory1, ID2D1Geometry, ID2D1Layer,
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_BRUSH_PROPERTIES,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_BITMAP_PROPERTIES, D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2,
-    D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
+    D2D1_BITMAP_PROPERTIES, D2D1_COMBINE_MODE_EXCLUDE, D2D1_EXTEND_MODE_CLAMP,
+    D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2, D2D1_GAUSSIANBLUR_OPTIMIZATION_BALANCED,
+    D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWCP_DONOTROUND, DWMWCP_ROUND,
@@ -69,12 +72,12 @@ use windows::Win32::System::WinRT::{
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETSTATE, ABS_AUTOHIDE, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowW, GetWindow, GetWindowLongW,
-    GetWindowRect, IsWindowVisible, RegisterClassExW, SetWindowPos, ShowWindow, GWL_EXSTYLE,
-    GW_HWNDNEXT, HWND_TOPMOST, HTTRANSPARENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, FindWindowW, GetWindow,
+    GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, RegisterClassExW,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_HWNDNEXT, GW_OWNER, HWND_TOPMOST, HTTRANSPARENT,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_HIDE, WM_ERASEBKGND, WM_NCHITTEST,
+    WM_PAINT, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
 const GLASS_BLUR_CLASS: PCWSTR = w!("PrettyWindowsTaskbarBlurWnd");
@@ -343,7 +346,7 @@ impl Drop for MonitorGlassBackdrop {
     }
 }
 
-struct OverflowGlassBackdrop {
+struct ShellCardGlassBackdrop {
     blur_hwnd: HWND,
     comp_target: Option<DesktopWindowTarget>,
     comp_visual: Option<SpriteVisual>,
@@ -359,13 +362,14 @@ struct OverflowGlassBackdrop {
     last_silk_tick: Option<Instant>,
     noise_cache: PopupNoiseCache,
     last_rect: RECT,
+    last_shadow_pad: i32,
     blur_visible: bool,
     glass_visible: bool,
     blur_policy_dirty: bool,
     glass_dirty: bool,
 }
 
-impl Drop for OverflowGlassBackdrop {
+impl Drop for ShellCardGlassBackdrop {
     fn drop(&mut self) {
         if let Some(ref visual) = self.comp_visual {
             let _ = visual.SetBrush(None::<&CompositionBrush>);
@@ -387,7 +391,8 @@ impl Drop for OverflowGlassBackdrop {
 }
 
 /// Manages full-width real-time GPU blur / Acrylic / Liquid Glass backdrop windows behind every
-/// monitor's taskbar as well as the rounded system tray overflow flyout.
+/// monitor's taskbar as well as rounded shell cards (system tray overflow flyout, Alt+Tab switcher,
+/// taskbar hover flyout previews, and hardware Confirmator OSD capsules).
 pub struct LiquidGlassManager {
     d2d_factory: ID2D1Factory1,
     comp: Option<CompositionEngine>,
@@ -400,7 +405,26 @@ pub struct LiquidGlassManager {
     last_flow_tick: Instant,
     last_color_tick: Instant,
     backdrops: HashMap<isize, MonitorGlassBackdrop>,
-    overflow: Option<OverflowGlassBackdrop>,
+    overflow: Option<ShellCardGlassBackdrop>,
+    alt_tab: Option<ShellCardGlassBackdrop>,
+    hover_flyout: Option<ShellCardGlassBackdrop>,
+    osd: Option<ShellCardGlassBackdrop>,
+    tooltip: Option<ShellCardGlassBackdrop>,
+}
+
+fn hide_card_backdrop(slot: &mut Option<ShellCardGlassBackdrop>) {
+    if let Some(ref mut card) = *slot {
+        unsafe {
+            if card.glass_visible {
+                let _ = ShowWindow(card.glass_hwnd, SW_HIDE);
+                card.glass_visible = false;
+            }
+            if card.blur_visible {
+                let _ = ShowWindow(card.blur_hwnd, SW_HIDE);
+                card.blur_visible = false;
+            }
+        }
+    }
 }
 
 impl LiquidGlassManager {
@@ -422,6 +446,10 @@ impl LiquidGlassManager {
             last_color_tick: Instant::now(),
             backdrops: HashMap::new(),
             overflow: None,
+            alt_tab: None,
+            hover_flyout: None,
+            osd: None,
+            tooltip: None,
         }
     }
 
@@ -429,21 +457,42 @@ impl LiquidGlassManager {
         self.overflow
             .as_ref()
             .is_some_and(|ov| ov.glass_visible || ov.blur_visible)
+            || self
+                .alt_tab
+                .as_ref()
+                .is_some_and(|at| at.glass_visible || at.blur_visible)
+            || self
+                .hover_flyout
+                .as_ref()
+                .is_some_and(|hf| hf.glass_visible || hf.blur_visible)
+            || self
+                .osd
+                .as_ref()
+                .is_some_and(|os| os.glass_visible || os.blur_visible)
+            || self
+                .tooltip
+                .as_ref()
+                .is_some_and(|tt| tt.glass_visible || tt.blur_visible)
     }
 
     pub fn hide_overflow_backdrop(&mut self) {
-        if let Some(ref mut ov) = self.overflow {
-            unsafe {
-                if ov.glass_visible {
-                    let _ = ShowWindow(ov.glass_hwnd, SW_HIDE);
-                    ov.glass_visible = false;
-                }
-                if ov.blur_visible {
-                    let _ = ShowWindow(ov.blur_hwnd, SW_HIDE);
-                    ov.blur_visible = false;
-                }
-            }
-        }
+        hide_card_backdrop(&mut self.overflow);
+    }
+
+    pub fn hide_alt_tab_backdrop(&mut self) {
+        hide_card_backdrop(&mut self.alt_tab);
+    }
+
+    pub fn hide_hover_flyout_backdrop(&mut self) {
+        hide_card_backdrop(&mut self.hover_flyout);
+    }
+
+    pub fn hide_osd_backdrop(&mut self) {
+        hide_card_backdrop(&mut self.osd);
+    }
+
+    pub fn hide_tooltip_backdrop(&mut self) {
+        hide_card_backdrop(&mut self.tooltip);
     }
 
     pub fn set_style(&mut self, style: TaskbarStyle, taskbars: &[HWND]) {
@@ -456,6 +505,10 @@ impl LiquidGlassManager {
         }
         if !ov_plan.use_gpu_blur && !ov_plan.use_layered_surface {
             self.overflow = None;
+            self.alt_tab = None;
+            self.hover_flyout = None;
+            self.osd = None;
+            self.tooltip = None;
         }
         if style_changed {
             if style == TaskbarStyle::LiquidGlass {
@@ -470,11 +523,20 @@ impl LiquidGlassManager {
                     b.last_silk_tick = None;
                 }
             }
-            if let Some(ref mut ov) = self.overflow {
-                ov.blur_policy_dirty = true;
-                ov.glass_dirty = true;
+            for card in [
+                &mut self.overflow,
+                &mut self.alt_tab,
+                &mut self.hover_flyout,
+                &mut self.osd,
+                &mut self.tooltip,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                card.blur_policy_dirty = true;
+                card.glass_dirty = true;
                 if style != TaskbarStyle::LiquidGlass {
-                    ov.last_silk_tick = None;
+                    card.last_silk_tick = None;
                 }
             }
         }
@@ -494,10 +556,19 @@ impl LiquidGlassManager {
                 b.blur_policy_dirty = true;
                 b.glass_dirty = true;
             }
-            if let Some(ref mut ov) = self.overflow {
-                ov.last_silk_tick = None;
-                ov.blur_policy_dirty = true;
-                ov.glass_dirty = true;
+            for card in [
+                &mut self.overflow,
+                &mut self.alt_tab,
+                &mut self.hover_flyout,
+                &mut self.osd,
+                &mut self.tooltip,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                card.last_silk_tick = None;
+                card.blur_policy_dirty = true;
+                card.glass_dirty = true;
             }
         }
     }
@@ -510,10 +581,19 @@ impl LiquidGlassManager {
                 b.glass_dirty = true;
                 b.last_silk_tick = None;
             }
-            if let Some(ref mut ov) = self.overflow {
-                ov.blur_policy_dirty = true;
-                ov.glass_dirty = true;
-                ov.last_silk_tick = None;
+            for card in [
+                &mut self.overflow,
+                &mut self.alt_tab,
+                &mut self.hover_flyout,
+                &mut self.osd,
+                &mut self.tooltip,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                card.blur_policy_dirty = true;
+                card.glass_dirty = true;
+                card.last_silk_tick = None;
             }
         }
     }
@@ -521,6 +601,10 @@ impl LiquidGlassManager {
     pub fn reset_windows(&mut self) {
         self.backdrops.clear();
         self.overflow = None;
+        self.alt_tab = None;
+        self.hover_flyout = None;
+        self.osd = None;
+        self.tooltip = None;
     }
 
     fn advance_liquid_glass_clock(&mut self) {
@@ -745,134 +829,302 @@ impl LiquidGlassManager {
         };
 
         self.advance_liquid_glass_clock();
+        sync_shell_card_backdrop(
+            &self.d2d_factory,
+            self.comp.as_ref(),
+            &mut self.overflow,
+            w!("Pretty Windows Overflow Blur"),
+            w!("Pretty Windows Overflow Glass"),
+            self.style,
+            self.light_glass,
+            self.transparency_enabled,
+            self.flow_phase,
+            &self.halo_colors,
+            ov_hwnd,
+            ov_rect,
+            dpi,
+            0.0,
+        )
+    }
 
-        if self.overflow.is_none() {
-            let Ok(ov) = create_overflow_backdrop(&self.d2d_factory, self.comp.as_ref()) else {
-                return false;
-            };
-            self.overflow = Some(ov);
+    /// Synchronizes the rounded behind-Alt+Tab-switcher card backdrop with `Border#BackgroundElement`.
+    pub fn sync_alt_tab(&mut self, host_hwnd: HWND, card_rect: RECT, dpi: u32) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if !plan.use_gpu_blur && !plan.use_layered_surface {
+            self.hide_alt_tab_backdrop();
+            return false;
         }
-        let Some(ov) = self.overflow.as_mut() else {
+
+        self.advance_liquid_glass_clock();
+        sync_shell_card_backdrop(
+            &self.d2d_factory,
+            self.comp.as_ref(),
+            &mut self.alt_tab,
+            w!("Pretty Windows AltTab Blur"),
+            w!("Pretty Windows AltTab Glass"),
+            self.style,
+            self.light_glass,
+            self.transparency_enabled,
+            self.flow_phase,
+            &self.halo_colors,
+            host_hwnd,
+            card_rect,
+            dpi,
+            0.0,
+        )
+    }
+
+    /// Synchronizes the rounded behind-taskbar-hover-flyout card backdrop with `Border#HoverFlyoutBackground`.
+    pub fn sync_hover_flyout(&mut self, host_hwnd: HWND, card_rect: RECT, dpi: u32) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if !plan.use_gpu_blur && !plan.use_layered_surface {
+            self.hide_hover_flyout_backdrop();
+            return false;
+        }
+
+        self.advance_liquid_glass_clock();
+        sync_shell_card_backdrop(
+            &self.d2d_factory,
+            self.comp.as_ref(),
+            &mut self.hover_flyout,
+            w!("Pretty Windows HoverFlyout Blur"),
+            w!("Pretty Windows HoverFlyout Glass"),
+            self.style,
+            self.light_glass,
+            self.transparency_enabled,
+            self.flow_phase,
+            &self.halo_colors,
+            host_hwnd,
+            card_rect,
+            dpi,
+            0.0,
+        )
+    }
+
+    /// Synchronizes the rounded behind-OSD card backdrop with `HWConfirmatorUI`'s `Grid#ConfirmatorMainGrid`,
+    /// reserving a 10 DIP outer transparent margin on the layered glass surface for 3-pass ambient shadows.
+    pub fn sync_osd(&mut self, host_hwnd: HWND, card_rect: RECT, dpi: u32) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if !plan.use_gpu_blur && !plan.use_layered_surface {
+            self.hide_osd_backdrop();
+            return false;
+        }
+
+        self.advance_liquid_glass_clock();
+        sync_shell_card_backdrop(
+            &self.d2d_factory,
+            self.comp.as_ref(),
+            &mut self.osd,
+            w!("Pretty Windows OSD Blur"),
+            w!("Pretty Windows OSD Glass"),
+            self.style,
+            self.light_glass,
+            self.transparency_enabled,
+            self.flow_phase,
+            &self.halo_colors,
+            host_hwnd,
+            card_rect,
+            dpi,
+            OSD_SHADOW_PAD_DIP,
+        )
+    }
+
+    /// Synchronizes the rounded behind-ToolTip card backdrop with `ToolTip > ContentPresenter#LayoutRoot`
+    /// inside `Xaml_WindowedPopupClass`, reserving a 6 DIP outer transparent margin for 3-pass ambient shadows.
+    pub fn sync_tooltip(&mut self, host_hwnd: HWND, card_rect: RECT, dpi: u32) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if !plan.use_gpu_blur && !plan.use_layered_surface {
+            self.hide_tooltip_backdrop();
+            return false;
+        }
+
+        self.advance_liquid_glass_clock();
+        sync_shell_card_backdrop(
+            &self.d2d_factory,
+            self.comp.as_ref(),
+            &mut self.tooltip,
+            w!("Pretty Windows ToolTip Blur"),
+            w!("Pretty Windows ToolTip Glass"),
+            self.style,
+            self.light_glass,
+            self.transparency_enabled,
+            self.flow_phase,
+            &self.halo_colors,
+            host_hwnd,
+            card_rect,
+            dpi,
+            TOOLTIP_SHADOW_PAD_DIP,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_shell_card_backdrop(
+    d2d_factory: &ID2D1Factory1,
+    comp: Option<&CompositionEngine>,
+    slot: &mut Option<ShellCardGlassBackdrop>,
+    blur_title: PCWSTR,
+    glass_title: PCWSTR,
+    style: TaskbarStyle,
+    light_glass: bool,
+    transparency_enabled: bool,
+    flow_phase: f64,
+    halo_colors: &[(f32, f32, f32); 2],
+    host_hwnd: HWND,
+    card_rect: RECT,
+    dpi: u32,
+    shadow_pad_dip: f32,
+) -> bool {
+    let plan = overflow_backdrop_layer_plan(style, transparency_enabled);
+    if !plan.use_gpu_blur && !plan.use_layered_surface {
+        hide_card_backdrop(slot);
+        return false;
+    }
+    if slot.is_none() {
+        let Ok(card) = create_shell_card_backdrop(d2d_factory, comp, blur_title, glass_title)
+        else {
             return false;
         };
+        *slot = Some(card);
+    }
+    let Some(ov) = slot.as_mut() else {
+        return false;
+    };
 
-        let w = (ov_rect.right - ov_rect.left).max(1);
-        let h = (ov_rect.bottom - ov_rect.top).max(1);
-        let scale = (dpi.max(96) as f32) / 96.0;
-        let size_changed = ov.last_rect.left != ov_rect.left
-            || ov.last_rect.top != ov_rect.top
-            || ov.last_rect.right != ov_rect.right
-            || ov.last_rect.bottom != ov_rect.bottom;
+    let w = (card_rect.right - card_rect.left).max(1);
+    let h = (card_rect.bottom - card_rect.top).max(1);
+    let ([gl, gt, gr, gb], pad_px) = expand_card_rect_for_shadow(
+        [
+            card_rect.left,
+            card_rect.top,
+            card_rect.right,
+            card_rect.bottom,
+        ],
+        dpi,
+        shadow_pad_dip,
+    );
+    let glass_rect = RECT {
+        left: gl,
+        top: gt,
+        right: gr,
+        bottom: gb,
+    };
+    let glass_w = (glass_rect.right - glass_rect.left).max(1);
+    let glass_h = (glass_rect.bottom - glass_rect.top).max(1);
+    let scale = (dpi.max(96) as f32) / 96.0;
+    let size_changed = ov.last_rect.left != card_rect.left
+        || ov.last_rect.top != card_rect.top
+        || ov.last_rect.right != card_rect.right
+        || ov.last_rect.bottom != card_rect.bottom
+        || ov.last_shadow_pad != pad_px;
 
-        let recipe = if plan.use_gpu_blur {
-            gpu_backdrop_recipe(self.style, self.light_glass)
-        } else {
-            None
-        };
-        let prev_live_blur = ov.has_live_blur;
-        let mut live_blur_ready = false;
-        if let (Some(rec), Some(engine), Some(visual)) =
-            (recipe, self.comp.as_ref(), ov.comp_visual.as_ref())
-        {
-            let blur_key = (self.style, self.light_glass, dpi);
-            if ov.blur_policy_dirty || ov.last_blur_key != Some(blur_key) {
-                if let Some(brush) =
-                    engine.build_backdrop_brush(rec.blur_sigma_dip * scale, rec.saturation)
-                {
-                    if visual.SetBrush(&brush).is_ok() {
-                        ov.last_blur_key = Some(blur_key);
-                        ov.blur_policy_dirty = false;
-                        live_blur_ready = true;
-                    } else {
-                        ov.last_blur_key = None;
-                    }
+    let recipe = if plan.use_gpu_blur {
+        gpu_backdrop_recipe(style, light_glass)
+    } else {
+        None
+    };
+    let prev_live_blur = ov.has_live_blur;
+    let mut live_blur_ready = false;
+    if let (Some(rec), Some(engine), Some(visual)) = (recipe, comp, ov.comp_visual.as_ref()) {
+        let blur_key = (style, light_glass, dpi);
+        if ov.blur_policy_dirty || ov.last_blur_key != Some(blur_key) {
+            if let Some(brush) =
+                engine.build_backdrop_brush(rec.blur_sigma_dip * scale, rec.saturation)
+            {
+                if visual.SetBrush(&brush).is_ok() {
+                    ov.last_blur_key = Some(blur_key);
+                    ov.blur_policy_dirty = false;
+                    live_blur_ready = true;
                 } else {
                     ov.last_blur_key = None;
                 }
             } else {
-                live_blur_ready = true;
+                ov.last_blur_key = None;
+            }
+        } else {
+            live_blur_ready = true;
+        }
+    }
+    ov.has_live_blur = live_blur_ready;
+    if ov.has_live_blur != prev_live_blur {
+        ov.glass_dirty = true;
+    }
+
+    let reveal_glass = plan.use_layered_surface && !ov.glass_visible;
+    if plan.use_layered_surface {
+        let anchor = overflow_backdrop_anchor(host_hwnd, ov.glass_hwnd);
+        unsafe {
+            sync_window_placement(
+                ov.glass_hwnd,
+                anchor,
+                glass_rect,
+                glass_w,
+                glass_h,
+                reveal_glass,
+                size_changed,
+            );
+        }
+        ov.glass_visible = true;
+    } else if ov.glass_visible {
+        unsafe {
+            let _ = ShowWindow(ov.glass_hwnd, SW_HIDE);
+        }
+        ov.glass_visible = false;
+    }
+
+    let mut reveal_blur = false;
+    if ov.has_live_blur {
+        reveal_blur = !ov.blur_visible;
+        if reveal_blur || size_changed || ov.blur_size != (w, h) {
+            if let Some(ref visual) = ov.comp_visual {
+                let _ = visual.SetSize(Vector2 {
+                    X: w as f32,
+                    Y: h as f32,
+                });
+                ov.blur_size = (w, h);
             }
         }
-        ov.has_live_blur = live_blur_ready;
-        if ov.has_live_blur != prev_live_blur {
-            ov.glass_dirty = true;
-        }
-
-        let reveal_glass = plan.use_layered_surface && !ov.glass_visible;
-        if plan.use_layered_surface {
-            let anchor = overflow_backdrop_anchor(ov_hwnd, ov.glass_hwnd);
-            unsafe {
-                sync_window_placement(
-                    ov.glass_hwnd,
-                    anchor,
-                    ov_rect,
-                    w,
-                    h,
-                    reveal_glass,
-                    size_changed,
-                );
-            }
-            ov.glass_visible = true;
-        } else if ov.glass_visible {
-            unsafe {
-                let _ = ShowWindow(ov.glass_hwnd, SW_HIDE);
-            }
-            ov.glass_visible = false;
-        }
-
-        let mut reveal_blur = false;
-        if ov.has_live_blur {
-            reveal_blur = !ov.blur_visible;
-            if reveal_blur || size_changed || ov.blur_size != (w, h) {
-                if let Some(ref visual) = ov.comp_visual {
-                    let _ = visual.SetSize(Vector2 {
-                        X: w as f32,
-                        Y: h as f32,
-                    });
-                    ov.blur_size = (w, h);
-                }
-            }
-            unsafe {
-                sync_window_placement(
-                    ov.blur_hwnd,
-                    ov.glass_hwnd,
-                    ov_rect,
-                    w,
-                    h,
-                    reveal_blur,
-                    size_changed,
-                );
-            }
-            ov.blur_visible = true;
-        } else if ov.blur_visible {
-            unsafe {
-                let _ = ShowWindow(ov.blur_hwnd, SW_HIDE);
-            }
-            ov.blur_visible = false;
-        }
-
-        ov.last_rect = ov_rect;
-
-        if plan.use_layered_surface
-            && (self.style == TaskbarStyle::LiquidGlass || ov.glass_dirty || size_changed || reveal_glass)
-        {
-            let _ = render_overflow_layered_backdrop(
-                &self.d2d_factory,
-                ov,
-                self.style,
-                ov_rect,
+        unsafe {
+            sync_window_placement(
+                ov.blur_hwnd,
+                ov.glass_hwnd,
+                card_rect,
                 w,
                 h,
-                dpi,
-                self.flow_phase,
-                &self.halo_colors,
-                self.light_glass,
+                reveal_blur,
+                size_changed,
             );
-            ov.glass_dirty = false;
         }
-
-        reveal_glass || reveal_blur
+        ov.blur_visible = true;
+    } else if ov.blur_visible {
+        unsafe {
+            let _ = ShowWindow(ov.blur_hwnd, SW_HIDE);
+        }
+        ov.blur_visible = false;
     }
+
+    ov.last_rect = card_rect;
+    ov.last_shadow_pad = pad_px;
+
+    if plan.use_layered_surface
+        && (style == TaskbarStyle::LiquidGlass || ov.glass_dirty || size_changed || reveal_glass)
+    {
+        let _ = render_shell_card_layered_backdrop(
+            d2d_factory,
+            ov,
+            style,
+            glass_rect,
+            card_rect,
+            pad_px,
+            dpi,
+            flow_phase,
+            halo_colors,
+            light_glass,
+        );
+        ov.glass_dirty = false;
+    }
+
+    reveal_glass || reveal_blur
 }
 
 unsafe fn sync_window_placement(
@@ -893,6 +1145,7 @@ unsafe fn sync_window_placement(
     }
     let need_z = if insert_after == HWND_TOPMOST {
         (GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) == 0
+            || is_occluded_by_same_band_topmost(hwnd)
     } else {
         GetWindow(insert_after, GW_HWNDNEXT) != Ok(hwnd)
     };
@@ -1032,6 +1285,7 @@ fn create_backdrop_pair(
             (&enable_host_backdrop as *const BOOL).cast(),
             size_of::<BOOL>() as u32,
         );
+        exclude_from_peek(blur_hwnd);
 
         let (comp_target, comp_visual) = match comp.and_then(|c| c.create_target_and_visual(blur_hwnd)) {
             Some((target, visual)) => (Some(target), Some(visual)),
@@ -1059,6 +1313,7 @@ fn create_backdrop_pair(
             (&no_round as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
             size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
+        exclude_from_peek(glass_hwnd);
 
         let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
@@ -1121,19 +1376,21 @@ fn create_backdrop(
     })
 }
 
-fn create_overflow_backdrop(
+fn create_shell_card_backdrop(
     d2d_factory: &ID2D1Factory1,
     comp: Option<&CompositionEngine>,
-) -> windows::core::Result<OverflowGlassBackdrop> {
+    blur_title: PCWSTR,
+    glass_title: PCWSTR,
+) -> windows::core::Result<ShellCardGlassBackdrop> {
     let pair = create_backdrop_pair(
         d2d_factory,
         comp,
-        w!("Pretty Windows Overflow Blur"),
-        w!("Pretty Windows Overflow Glass"),
+        blur_title,
+        glass_title,
         DWMWCP_ROUND,
     )?;
     let layer = unsafe { pair.rt.CreateLayer(None)? };
-    Ok(OverflowGlassBackdrop {
+    Ok(ShellCardGlassBackdrop {
         blur_hwnd: pair.blur_hwnd,
         comp_target: pair.comp_target,
         comp_visual: pair.comp_visual,
@@ -1149,11 +1406,439 @@ fn create_overflow_backdrop(
         last_silk_tick: None,
         noise_cache: PopupNoiseCache::default(),
         last_rect: RECT::default(),
+        last_shadow_pad: 0,
         blur_visible: false,
         glass_visible: false,
         blur_policy_dirty: true,
         glass_dirty: true,
     })
+}
+
+fn inspect_visible_explorer_window(
+    hwnd: HWND,
+    target_pid: u32,
+    min_w: i32,
+    min_h: i32,
+) -> Option<(RECT, u32, u32)> {
+    unsafe {
+        if hwnd.is_invalid() || !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+        let mut pid = 0u32;
+        let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != target_pid {
+            return None;
+        }
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return None;
+        }
+        let mut rect = RECT::default();
+        let got_ext = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut rect as *mut RECT).cast(),
+            size_of::<RECT>() as u32,
+        )
+        .is_ok();
+        if !got_ext && GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        if w < min_w || h < min_h {
+            return None;
+        }
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        Some((rect, dpi, tid))
+    }
+}
+
+/// Locates the active uncloaked host window belonging to `explorer_pid` for the `Alt + Tab` switcher,
+/// scanning across all ZBID bands via `FindWindowExW`, preferring `preferred_tid`, and isolating
+/// taskbar / hover-flyout / OSD threads.
+pub fn find_visible_alttab_host_window(
+    explorer_pid: u32,
+    preferred_tid: Option<u32>,
+    excluded_tids: &[u32],
+    taskbar_tids: &[u32],
+) -> Option<(HWND, RECT, u32, u32)> {
+    if explorer_pid == 0 {
+        return None;
+    }
+    let mut found: Option<(HWND, RECT, u32, u32)> = None;
+    for cls in [
+        w!("XamlExplorerHostIslandWindow"),
+        w!("XamlExplorerHostIslandWindow_WASDK"),
+    ] {
+        let mut prev = HWND::default();
+        for _ in 0..256 {
+            let Ok(hwnd) = (unsafe { FindWindowExW(None, prev, cls, None) }) else {
+                break;
+            };
+            if hwnd.is_invalid() || hwnd == prev {
+                break;
+            }
+            prev = hwnd;
+            let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, explorer_pid, 300, 200)
+            else {
+                continue;
+            };
+            if excluded_tids.contains(&tid) {
+                continue;
+            }
+            if preferred_tid != Some(tid) && taskbar_tids.contains(&tid) {
+                continue;
+            }
+            let matched = preferred_tid == Some(tid);
+            if matched || found.is_none() {
+                found = Some((hwnd, rect, dpi, tid));
+            }
+            if matched {
+                return found;
+            }
+        }
+    }
+    found
+}
+
+/// Locates the active uncloaked host window belonging to `explorer_pid` for `Taskbar.FlyoutFrame`
+/// (hover thumbnail previews & taskbar overflow), enumerating across all ZBID bands via `FindWindowExW`
+/// (including `ZBID_IMMERSIVE_INACTIVEMOBILITY`), preferring `XamlExplorerHostIslandWindow*` and known
+/// taskbar UI threads while excluding `Alt + Tab` switcher and OSD hosts.
+pub fn find_visible_hover_flyout_host_window(
+    explorer_pid: u32,
+    preferred_tid: Option<u32>,
+    excluded_tids: &[u32],
+    taskbar_tids: &[u32],
+) -> Option<(HWND, RECT, u32, u32)> {
+    if explorer_pid == 0 {
+        return None;
+    }
+    let mut best: Option<(u8, i64, HWND, RECT, u32, u32)> = None;
+    for (cls, class_bonus, require_taskbar_or_pref) in [
+        (w!("XamlExplorerHostIslandWindow"), 4u8, false),
+        (w!("XamlExplorerHostIslandWindow_WASDK"), 4u8, false),
+        (w!("Xaml_WindowedPopupClass"), 0u8, true),
+    ] {
+        let mut prev = HWND::default();
+        for _ in 0..256 {
+            let Ok(hwnd) = (unsafe { FindWindowExW(None, prev, cls, None) }) else {
+                break;
+            };
+            if hwnd.is_invalid() || hwnd == prev {
+                break;
+            }
+            prev = hwnd;
+            let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, explorer_pid, 48, 36)
+            else {
+                continue;
+            };
+            if excluded_tids.contains(&tid) {
+                continue;
+            }
+            if require_taskbar_or_pref && preferred_tid != Some(tid) && !taskbar_tids.contains(&tid) {
+                continue;
+            }
+            let thread_bonus = if preferred_tid == Some(tid) {
+                2u8
+            } else if taskbar_tids.contains(&tid) {
+                1u8
+            } else {
+                0u8
+            };
+            let priority = class_bonus + thread_bonus;
+            let w = rect.right - rect.left;
+            let h = rect.bottom - rect.top;
+            let area = i64::from(w) * i64::from(h);
+            let take = match best {
+                None => true,
+                Some((best_prio, best_area, _, _, _, _)) => {
+                    priority > best_prio || (priority == best_prio && area > best_area)
+                }
+            };
+            if take {
+                best = Some((priority, area, hwnd, rect, dpi, tid));
+            }
+        }
+    }
+    best.map(|(_, _, h, r, d, t)| (h, r, d, t))
+}
+
+/// Locates the active uncloaked `HWConfirmatorUI` host window belonging to `explorer_pid`,
+/// excluding taskbar, `Alt + Tab`, and hover-flyout threads and bounding unlearned hosts to compact OSD dimensions.
+pub fn find_visible_osd_host_window(
+    explorer_pid: u32,
+    preferred_tid: Option<u32>,
+    excluded_tids: &[u32],
+    taskbar_tids: &[u32],
+) -> Option<(HWND, RECT, u32, u32)> {
+    if explorer_pid == 0 {
+        return None;
+    }
+    let mut found: Option<(HWND, RECT, u32, u32)> = None;
+    for cls in [
+        w!("XamlExplorerHostIslandWindow"),
+        w!("XamlExplorerHostIslandWindow_WASDK"),
+    ] {
+        let mut prev = HWND::default();
+        for _ in 0..256 {
+            let Ok(hwnd) = (unsafe { FindWindowExW(None, prev, cls, None) }) else {
+                break;
+            };
+            if hwnd.is_invalid() || hwnd == prev {
+                break;
+            }
+            prev = hwnd;
+            let Some((rect, dpi, tid)) =
+                inspect_visible_explorer_window(hwnd, explorer_pid, 80, 36)
+            else {
+                continue;
+            };
+            if excluded_tids.contains(&tid) {
+                continue;
+            }
+            if preferred_tid != Some(tid) && taskbar_tids.contains(&tid) {
+                continue;
+            }
+            let matched = preferred_tid == Some(tid);
+            if !matched {
+                let scale = (dpi.max(96) as f32) / 96.0;
+                let w = rect.right - rect.left;
+                let h = rect.bottom - rect.top;
+                let max_w = (560.0 * scale).round() as i32;
+                let max_h = (220.0 * scale).round() as i32;
+                if w > max_w || h > max_h {
+                    continue;
+                }
+            }
+            if matched || found.is_none() {
+                found = Some((hwnd, rect, dpi, tid));
+            }
+            if matched {
+                return found;
+            }
+        }
+    }
+    found
+}
+
+/// Locates the active uncloaked `Xaml_WindowedPopupClass` host window belonging to `explorer_pid`
+/// for a system/taskbar/overflow `ToolTip`, preferring matching dimensions and known/taskbar UI threads.
+pub fn find_visible_tooltip_host_window(
+    explorer_pid: u32,
+    preferred_tid: Option<u32>,
+    taskbar_tids: &[u32],
+    expected_size_dip: Option<(f32, f32)>,
+) -> Option<(HWND, RECT, u32, u32)> {
+    if explorer_pid == 0 {
+        return None;
+    }
+    let mut best: Option<(u8, f32, HWND, RECT, u32, u32)> = None;
+    let mut prev = HWND::default();
+    for _ in 0..256 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev, w!("Xaml_WindowedPopupClass"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev {
+            break;
+        }
+        prev = hwnd;
+        let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, explorer_pid, 20, 16)
+        else {
+            continue;
+        };
+        let scale = (dpi.max(96) as f32) / 96.0;
+        let w_dip = ((rect.right - rect.left) as f32) / scale;
+        let h_dip = ((rect.bottom - rect.top) as f32) / scale;
+        if !(20.0..=680.0).contains(&w_dip) || !(16.0..=420.0).contains(&h_dip) {
+            continue;
+        }
+
+        let (thread_prio, metric) = if let Some((ew, eh)) = expected_size_dip {
+            if w_dip < ew - 4.0
+                || h_dip < eh - 4.0
+                || w_dip > ew + 64.0
+                || h_dip > eh + 64.0
+            {
+                continue;
+            }
+            let prio = if preferred_tid == Some(tid) {
+                2u8
+            } else if taskbar_tids.contains(&tid) {
+                1u8
+            } else {
+                0u8
+            };
+            (prio, (w_dip - ew).abs() + (h_dip - eh).abs())
+        } else {
+            if preferred_tid != Some(tid) && !taskbar_tids.contains(&tid) {
+                continue;
+            }
+            if w_dip > 560.0 || h_dip > 240.0 {
+                continue;
+            }
+            let prio = if preferred_tid == Some(tid) { 2u8 } else { 1u8 };
+            (prio, w_dip * h_dip)
+        };
+
+        let take = match best {
+            None => true,
+            Some((best_prio, best_metric, _, _, _, _)) => {
+                thread_prio > best_prio || (thread_prio == best_prio && metric < best_metric)
+            }
+        };
+        if take {
+            best = Some((thread_prio, metric, hwnd, rect, dpi, tid));
+        }
+    }
+    best.map(|(_, _, h, r, d, t)| (h, r, d, t))
+}
+
+unsafe fn xaml_island_screen_origin(hwnd: HWND) -> Option<[i32; 2]> {
+    if hwnd.is_invalid() {
+        return None;
+    }
+    if let Ok(bridge) = FindWindowExW(
+        hwnd,
+        None,
+        w!("Windows.UI.Composition.DesktopWindowContentBridge"),
+        None,
+    ) {
+        if !bridge.is_invalid() {
+            let mut rect = RECT::default();
+            if GetWindowRect(bridge, &mut rect).is_ok()
+                && rect.right > rect.left
+                && rect.bottom > rect.top
+            {
+                return Some([rect.left, rect.top]);
+            }
+        }
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(hwnd, &mut rect).is_ok()
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+    {
+        Some([rect.left, rect.top])
+    } else {
+        None
+    }
+}
+
+/// Collects candidate screen origins `[x, y]` for the XAML Island hosting `host_hwnd`
+/// (owner window, un-inset overflow island, and primary/secondary taskbars) so island-relative
+/// `TransformToVisual(null)` coordinates map without symmetric-centering bias.
+pub fn collect_tooltip_island_origins(
+    host_hwnd: HWND,
+    explorer_pid: u32,
+    host_tid: u32,
+) -> Vec<[i32; 2]> {
+    if explorer_pid == 0 {
+        return Vec::new();
+    }
+    let mut origins = Vec::new();
+    let push_unique = |list: &mut Vec<[i32; 2]>, pt: [i32; 2]| {
+        if !list.contains(&pt) {
+            list.push(pt);
+        }
+    };
+
+    unsafe {
+        if !host_hwnd.is_invalid() {
+            if let Ok(owner) = GetWindow(host_hwnd, GW_OWNER) {
+                if !owner.is_invalid() {
+                    let mut pid = 0u32;
+                    let _ = GetWindowThreadProcessId(owner, Some(&mut pid));
+                    if pid == explorer_pid {
+                        if let Some(pt) = xaml_island_screen_origin(owner) {
+                            push_unique(&mut origins, pt);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut prev_ov = HWND::default();
+        for _ in 0..16 {
+            let Ok(hwnd) =
+                FindWindowExW(None, prev_ov, w!("TopLevelWindowForOverflowXamlIsland"), None)
+            else {
+                break;
+            };
+            if hwnd.is_invalid() || hwnd == prev_ov {
+                break;
+            }
+            prev_ov = hwnd;
+            if !IsWindowVisible(hwnd).as_bool() {
+                continue;
+            }
+            let mut pid = 0u32;
+            let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid != explorer_pid {
+                continue;
+            }
+            let mut cloaked: u32 = 0;
+            if DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CLOAKED,
+                (&mut cloaked as *mut u32).cast(),
+                size_of::<u32>() as u32,
+            )
+            .is_ok()
+                && cloaked != 0
+            {
+                continue;
+            }
+            if let Some(pt) = xaml_island_screen_origin(hwnd) {
+                push_unique(&mut origins, pt);
+            }
+        }
+
+        let mut other_taskbars = Vec::new();
+        for cls in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
+            let mut prev_tb = HWND::default();
+            for _ in 0..32 {
+                let Ok(hwnd) = FindWindowExW(None, prev_tb, cls, None) else {
+                    break;
+                };
+                if hwnd.is_invalid() || hwnd == prev_tb {
+                    break;
+                }
+                prev_tb = hwnd;
+                if !IsWindowVisible(hwnd).as_bool() {
+                    continue;
+                }
+                let mut pid = 0u32;
+                let tid = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid != explorer_pid {
+                    continue;
+                }
+                if let Some(pt) = xaml_island_screen_origin(hwnd) {
+                    if tid == host_tid {
+                        push_unique(&mut origins, pt);
+                    } else if !other_taskbars.contains(&pt) {
+                        other_taskbars.push(pt);
+                    }
+                }
+            }
+        }
+        for pt in other_taskbars {
+            push_unique(&mut origins, pt);
+        }
+    }
+
+    origins
 }
 
 fn inspect_overflow_candidate(hwnd: HWND, is_xaml_island: bool) -> Option<(HWND, RECT, u32)> {
@@ -1906,24 +2591,31 @@ fn render_layered_backdrop(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_overflow_layered_backdrop(
+fn render_shell_card_layered_backdrop(
     d2d_factory: &ID2D1Factory1,
-    ov: &mut OverflowGlassBackdrop,
+    ov: &mut ShellCardGlassBackdrop,
     style: TaskbarStyle,
-    ov_rect: RECT,
-    w: i32,
-    h: i32,
+    glass_rect: RECT,
+    card_rect: RECT,
+    pad_px: i32,
     dpi: u32,
     flow_phase: f64,
     halo_colors: &[(f32, f32, f32); 2],
     light_glass: bool,
 ) -> windows::core::Result<()> {
-    ov.surface.ensure_size(w, h)?;
+    let glass_w = (glass_rect.right - glass_rect.left).max(1);
+    let glass_h = (glass_rect.bottom - glass_rect.top).max(1);
+    let card_w = (card_rect.right - card_rect.left).max(1);
+    let card_h = (card_rect.bottom - card_rect.top).max(1);
+    ov.surface.ensure_size(glass_w, glass_h)?;
+
     let s = (dpi.max(96) as f32) / 96.0;
-    let wf = w as f32;
-    let hf = h as f32;
+    let pad_f = pad_px.max(0) as f32;
+    let wf = card_w as f32;
+    let hf = card_h as f32;
     let radius = (8.0 * s).min((wf.min(hf) * 0.45).max(2.0));
-    let card_rect = RectF::new(0.0, 0.0, wf, hf);
+    let card_local = RectF::new(pad_f, pad_f, pad_f + wf, pad_f + hf);
+    let card_d2d = d2d_rect(card_local);
     let has_live_blur = ov.has_live_blur;
     let recipe = popup_glass_recipe(GlassSurfaceStyle::from(style), light_glass, 0.5);
 
@@ -1935,8 +2627,8 @@ fn render_overflow_layered_backdrop(
             &mut ov.silk_buf,
             &mut ov.last_silk_tick,
             force_silk,
-            w,
-            h,
+            card_w,
+            card_h,
             0.0,
             hf,
             s,
@@ -1952,7 +2644,6 @@ fn render_overflow_layered_backdrop(
         right: ov.surface.width(),
         bottom: ov.surface.height(),
     };
-    let full = d2d_rect(card_rect);
 
     unsafe {
         ov.rt.BindDC(ov.surface.dc(), &bind_rect)?;
@@ -1965,14 +2656,78 @@ fn render_overflow_layered_backdrop(
         }));
 
         let rr = D2D1_ROUNDED_RECT {
-            rect: full,
+            rect: card_d2d,
             radiusX: radius,
             radiusY: radius,
         };
         if let Ok(clip_raw) = d2d_factory.CreateRoundedRectangleGeometry(&rr) {
             let clip_geo: ID2D1Geometry = clip_raw.cast()?;
+
+            if pad_px > 0 {
+                let shadow_scale = (pad_f / (10.0 * s)).clamp(0.55, 1.0);
+                let shadow_layers: [(f32, f32); 3] = if light_glass {
+                    [(7.5, 0.022), (4.5, 0.036), (2.0, 0.058)]
+                } else {
+                    [(7.5, 0.035), (4.5, 0.055), (2.0, 0.090)]
+                };
+                let mult = if style == TaskbarStyle::Transparent {
+                    0.65
+                } else {
+                    1.0
+                };
+                let gf_w = glass_w as f32;
+                let gf_h = glass_h as f32;
+                for (expand_dip, base_alpha) in shadow_layers {
+                    let expand = expand_dip * shadow_scale * s;
+                    let side_exp = expand * 0.55;
+                    let top_exp = expand * 0.45;
+                    let bot_exp = expand * 0.65;
+                    let sh_rect = RectF::new(
+                        (card_local.left - side_exp).max(0.0),
+                        (card_local.top - top_exp).max(0.0),
+                        (card_local.right + side_exp).min(gf_w),
+                        (card_local.bottom + bot_exp).min(gf_h),
+                    );
+                    let sh_rr = D2D1_ROUNDED_RECT {
+                        rect: d2d_rect(sh_rect),
+                        radiusX: radius + side_exp * 0.45,
+                        radiusY: radius + side_exp * 0.45,
+                    };
+                    if let Ok(outer_raw) = d2d_factory.CreateRoundedRectangleGeometry(&sh_rr) {
+                        let outer_geo: ID2D1Geometry = outer_raw.cast()?;
+                        if let Ok(ring) = d2d_factory.CreatePathGeometry() {
+                            if let Ok(sink) = ring.Open() {
+                                if outer_geo
+                                    .CombineWithGeometry(
+                                        &clip_geo,
+                                        D2D1_COMBINE_MODE_EXCLUDE,
+                                        None,
+                                        0.25,
+                                        &sink,
+                                    )
+                                    .is_ok()
+                                    && sink.Close().is_ok()
+                                {
+                                    let ring_geo: ID2D1Geometry = ring.cast()?;
+                                    let sh_col = D2D1_COLOR_F {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: base_alpha * mult,
+                                    };
+                                    if let Ok(sh_brush) = ov.rt.CreateSolidColorBrush(&sh_col, None)
+                                    {
+                                        ov.rt.FillGeometry(&ring_geo, &sh_brush, None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let outer_params = D2D1_LAYER_PARAMETERS {
-                contentBounds: full,
+                contentBounds: card_d2d,
                 geometricMask: ManuallyDrop::new(Some(clip_geo)),
                 maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                 maskTransform: identity_matrix(),
@@ -2007,7 +2762,7 @@ fn render_overflow_layered_backdrop(
                 a: base_a,
             };
             if let Ok(base_brush) = ov.rt.CreateSolidColorBrush(&base_col, None) {
-                ov.rt.FillRectangle(&full, &base_brush);
+                ov.rt.FillRectangle(&card_d2d, &base_brush);
             }
 
             if recipe.frost_veil_top_alpha > 0.002 {
@@ -2042,9 +2797,15 @@ fn render_overflow_layered_backdrop(
                 ];
                 fill_linear_gradient(
                     &ov.rt,
-                    full,
-                    D2D_POINT_2F { x: 0.0, y: 0.0 },
-                    D2D_POINT_2F { x: 0.0, y: hf },
+                    card_d2d,
+                    D2D_POINT_2F {
+                        x: card_local.left,
+                        y: card_local.top,
+                    },
+                    D2D_POINT_2F {
+                        x: card_local.left,
+                        y: card_local.bottom,
+                    },
                     &veil_stops,
                 );
             }
@@ -2052,7 +2813,7 @@ fn render_overflow_layered_backdrop(
             if recipe.grain_max_alpha > 0 {
                 if let Some(noise_brush) = ov.noise_cache.ensure_brush(&ov.rt, recipe.grain_max_alpha)
                 {
-                    ov.rt.FillRectangle(&full, noise_brush);
+                    ov.rt.FillRectangle(&card_d2d, noise_brush);
                 }
             }
 
@@ -2060,7 +2821,7 @@ fn render_overflow_layered_backdrop(
                 if let Some(ref silk) = ov.silk_bmp {
                     ov.rt.DrawBitmap(
                         silk,
-                        Some(&full),
+                        Some(&card_d2d),
                         recipe.silk_alpha,
                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                         None,
@@ -2101,9 +2862,15 @@ fn render_overflow_layered_backdrop(
                 ];
                 fill_linear_gradient(
                     &ov.rt,
-                    full,
-                    D2D_POINT_2F { x: 0.0, y: 0.0 },
-                    D2D_POINT_2F { x: wf, y: hf },
+                    card_d2d,
+                    D2D_POINT_2F {
+                        x: card_local.left,
+                        y: card_local.top,
+                    },
+                    D2D_POINT_2F {
+                        x: card_local.right,
+                        y: card_local.bottom,
+                    },
                     &sheen_stops,
                 );
             }
@@ -2112,7 +2879,12 @@ fn render_overflow_layered_backdrop(
             let _ = ManuallyDrop::into_inner(outer_params.geometricMask);
 
             let inset = 0.5 * s;
-            let rim_rect = RectF::new(inset, inset, (wf - inset).max(inset + 1.0), (hf - inset).max(inset + 1.0));
+            let rim_rect = RectF::new(
+                card_local.left + inset,
+                card_local.top + inset,
+                (card_local.right - inset).max(card_local.left + inset + 1.0),
+                (card_local.bottom - inset).max(card_local.top + inset + 1.0),
+            );
             let rim_r = (radius - inset).max(1.0);
             draw_rounded_card_rim(&ov.rt, rim_rect, rim_r, s, &recipe);
         }
@@ -2120,6 +2892,6 @@ fn render_overflow_layered_backdrop(
         ov.rt.EndDraw(None, None)?;
     }
 
-    ov.surface.commit(ov.glass_hwnd, ov_rect.left, ov_rect.top);
+    ov.surface.commit(ov.glass_hwnd, glass_rect.left, glass_rect.top);
     Ok(())
 }

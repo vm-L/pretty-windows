@@ -9,7 +9,9 @@ use super::volume::{
     enumerate_app_volumes, format_volume_pct, slider_ratio_from_x, step_volume_by_wheel,
     AppVolumeEntry, MasterVolumeControl,
 };
-use crate::color::{derive_background_accent, Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::color::{
+    derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK,
+};
 use crate::system::{active_taskbar_surface_style, visible_transient_overlay_rects};
 use crate::ui::glass::{
     capture_blurred_desktop_backdrop_excluding, create_round_cap_stroke, create_text_format,
@@ -1449,7 +1451,7 @@ impl PopupInner {
                 self.light_glass,
             )
         } else {
-            bg_ui
+            enforce_ui_accent_deadzone(bg_ui, self.light_glass)
         }
         .to_normalized();
 
@@ -2978,11 +2980,12 @@ impl PopupInner {
                 src.cover
                     .as_ref()
                     .map(|c| {
-                        if self.light_glass {
+                        let raw = if self.light_glass {
                             c.accent_light
                         } else {
                             c.accent_dark
-                        }
+                        };
+                        enforce_ui_accent_deadzone(raw, self.light_glass)
                     })
                     .unwrap_or(auto_accent)
             } else {
@@ -3542,11 +3545,12 @@ impl PopupInner {
             src.cover
                 .as_ref()
                 .map(|c| {
-                    if self.light_glass {
+                    let raw = if self.light_glass {
                         c.accent_light
                     } else {
                         c.accent_dark
-                    }
+                    };
+                    enforce_ui_accent_deadzone(raw, self.light_glass)
                 })
                 .unwrap_or(fallback_accent)
         } else {
@@ -3735,7 +3739,7 @@ fn resolve_dynamic_menu_accent(
         .and_then(|aid| sources.iter().find(|src| src.id == aid))
         .and_then(|src| src.cover.as_deref())
         .or_else(|| sources.iter().find_map(|src| src.cover.as_deref()));
-    cover
+    let raw = cover
         .map(|cov| {
             if light_theme {
                 cov.accent_light
@@ -3743,7 +3747,8 @@ fn resolve_dynamic_menu_accent(
                 cov.accent_dark
             }
         })
-        .unwrap_or(fallback_ui)
+        .unwrap_or(fallback_ui);
+    enforce_ui_accent_deadzone(raw, light_theme)
 }
 
 /// Computes two soft, restrained silk-tint colors derived from the active cover's purified accent color.
@@ -4234,6 +4239,61 @@ mod tests {
             resolve_dynamic_menu_accent(&plain_sources, Some("no_cover"), fallback, true),
             fallback
         );
+    }
+
+    #[test]
+    fn dynamic_menu_accent_pushes_muted_cover_while_halo_stays_soft() {
+        use std::sync::Arc;
+
+        let muted_cover = Arc::new(MediaCover {
+            hash: 30,
+            thumb_w: 2,
+            thumb_h: 2,
+            thumb_pbgra: vec![255; 16],
+            accent_dark: Rgb::new(125, 167, 171),
+            accent_light: Rgb::new(97, 145, 149),
+        });
+        let sources = vec![SourceItem {
+            id: "muted".to_string(),
+            app_name: "muted".to_string(),
+            title: "muted".to_string(),
+            artist: String::new(),
+            status: PlaybackState::Playing,
+            pid: None,
+            cover: Some(muted_cover.clone()),
+        }];
+        let fallback = Rgb::new(0, 120, 212);
+        let rgb_chroma =
+            |c: Rgb| f32::from(c.r.max(c.g).max(c.b) - c.r.min(c.g).min(c.b)) / 255.0;
+
+        for (light_theme, orig) in [
+            (false, muted_cover.accent_dark),
+            (true, muted_cover.accent_light),
+        ] {
+            let ui_accent =
+                resolve_dynamic_menu_accent(&sources, Some("muted"), fallback, light_theme);
+            assert_ne!(ui_accent, orig);
+            assert!(
+                rgb_chroma(ui_accent) > rgb_chroma(orig),
+                "expected pushed chroma for muted cover (light={light_theme}): {orig:?} -> {ui_accent:?}"
+            );
+            let (orig_h, _, _) = rgb_to_hsl(orig);
+            let (out_h, _, _) = rgb_to_hsl(ui_accent);
+            let diff = (orig_h - out_h).abs().rem_euclid(360.0);
+            assert!(diff.min(360.0 - diff) <= 4.0);
+
+            let halo = compute_cover_halo_pair(Some(&muted_cover), fallback, light_theme);
+            let (_, halo_s0, _) = rgb_to_hsl(halo[0]);
+            let (_, halo_s1, _) = rgb_to_hsl(halo[1]);
+            assert!(
+                halo_s0 < 0.30,
+                "halo ribbon 0 should remain soft, got s={halo_s0}"
+            );
+            assert!(
+                halo_s1 < 0.30,
+                "halo ribbon 1 should remain soft, got s={halo_s1}"
+            );
+        }
     }
 
     #[test]

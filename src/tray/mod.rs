@@ -133,7 +133,8 @@ mod win {
                     None
                 };
 
-                let taskbar = TaskbarController::new(d2d_factory.clone(), light_taskbar, accent);
+                let mut taskbar = TaskbarController::new(d2d_factory.clone(), light_taskbar, accent);
+                taskbar.set_overlay_notify_target(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 let mut overflow_hook = OverflowEventHook::new(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 overflow_hook.refresh_for_explorer_pid(taskbar.explorer_pid());
 

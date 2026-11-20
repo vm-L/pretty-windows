@@ -16,13 +16,30 @@ pub mod tree_match {
     pub const CMD_SHUTDOWN: u8 = 0x03;
     pub const CMD_STATUS: u8 = 0x04;
     pub const CMD_VERSION: u8 = 0x05;
-    pub const TAP_PROTOCOL_VERSION: u8 = 2;
+    pub const CMD_ALTTAB_RECT: u8 = 0x06;
+    pub const CMD_SET_ALTTAB_ITEM_STYLE: u8 = 0x07;
+    pub const CMD_HOVER_FLYOUT_RECT: u8 = 0x08;
+    pub const CMD_OSD_RECT: u8 = 0x09;
+    pub const CMD_SET_OSD_SUPPRESS: u8 = 0x0A;
+    pub const CMD_SET_OSD_FALLBACK_STYLE: u8 = 0x0B;
+    pub const CMD_TOOLTIP_RECT: u8 = 0x0C;
+    pub const CMD_SET_TOOLTIP_SUPPRESS: u8 = 0x0D;
+    pub const CMD_SET_TOOLTIP_FALLBACK_STYLE: u8 = 0x0E;
+    pub const TAP_PROTOCOL_VERSION: u8 = 8;
+    pub const ALTTAB_ITEM_OVERLAY_NAME: &str = "PrettyWindowsAltTabItemBg";
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum TargetKind {
         ShapeElement,
         OverflowBorder,
         OverflowPanel,
+        AltTabBorder,
+        AltTabItemBorder,
+        AltTabItemFocus,
+        HoverFlyoutBorder,
+        HoverFlyoutShape,
+        OsdPanel,
+        ToolTipPresenter,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -106,7 +123,7 @@ pub mod tree_match {
             let Some(node) = self.nodes.get(&handle) else {
                 return false;
             };
-            let mut seen = [0u64; 32];
+            let mut seen = [0u64; 48];
             let mut seen_len = 0usize;
             let mut cur = node.parent;
             let mut has_taskbar_frame = false;
@@ -167,66 +184,318 @@ pub mod tree_match {
                 || meta.type_name.contains("OverflowView")
         }
 
-        pub fn has_forbidden_overflow_ancestor(&self, handle: u64) -> bool {
+        fn has_ancestor_matching(
+            &self,
+            handle: u64,
+            forbid: fn(&NodeMeta) -> bool,
+            container: fn(&NodeMeta) -> bool,
+            require_container: bool,
+        ) -> bool {
             let Some(node) = self.nodes.get(&handle) else {
-                return true;
+                return false;
             };
-            if Self::is_forbidden_overflow_node(node) {
-                return true;
+            if forbid(node) {
+                return false;
             }
-            let mut seen = [0u64; 32];
+            let mut seen = [0u64; 48];
             let mut seen_len = 0usize;
             let mut cur = node.parent;
+            let mut has_container = !require_container;
             while cur != 0 && seen_len < seen.len() {
                 if cur == handle || seen[..seen_len].contains(&cur) {
-                    return true;
+                    return false;
                 }
                 seen[seen_len] = cur;
                 seen_len += 1;
                 let Some(meta) = self.nodes.get(&cur) else {
                     break;
                 };
-                if Self::is_forbidden_overflow_node(meta) {
-                    return true;
+                if forbid(meta) {
+                    return false;
+                }
+                if require_container && container(meta) {
+                    has_container = true;
                 }
                 cur = meta.parent;
             }
-            false
+            has_container
+        }
+
+        pub fn has_forbidden_overflow_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_overflow_node,
+                Self::is_overflow_container_node,
+                false,
+            )
         }
 
         pub fn has_valid_overflow_ancestor(&self, handle: u64) -> bool {
-            let Some(node) = self.nodes.get(&handle) else {
-                return false;
-            };
-            if Self::is_forbidden_overflow_node(node) {
-                return false;
-            }
-            let mut seen = [0u64; 32];
-            let mut seen_len = 0usize;
-            let mut cur = node.parent;
-            let mut has_overflow = false;
-            while cur != 0 && seen_len < seen.len() {
-                if cur == handle || seen[..seen_len].contains(&cur) {
-                    return false;
-                }
-                seen[seen_len] = cur;
-                seen_len += 1;
-                let Some(meta) = self.nodes.get(&cur) else {
-                    break;
-                };
-                if Self::is_forbidden_overflow_node(meta) {
-                    return false;
-                }
-                if Self::is_overflow_container_node(meta) {
-                    has_overflow = true;
-                }
-                cur = meta.parent;
-            }
-            has_overflow
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_overflow_node,
+                Self::is_overflow_container_node,
+                true,
+            )
+        }
+
+        fn is_forbidden_alttab_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("TaskView")
+                || n.contains("TaskView")
+                || t.contains("SnapAssist")
+                || n.contains("SnapAssist")
+                || t.contains("GamingTaskView")
+                || n.contains("GamingTaskView")
+                || t.contains("VirtualDesktop")
+                || n.contains("VirtualDesktop")
+                || t.contains("SwitchItemList")
+                || n.contains("SwitchItemList")
+                || t.contains("SwitchItemControl")
+                || n.contains("SwitchItemControl")
+                || t.contains("SwitchItemElement")
+                || n.contains("SwitchItemElement")
+                || t.contains("SwitchItemListViewItem")
+                || n.contains("SwitchItemListViewItem")
+                || t.contains("SwitchItemThumbnail")
+                || n.contains("SwitchItemThumbnail")
+                || t.contains("ScrollViewer")
+                || n.contains("ScrollViewer")
+                || t.contains("Button")
+                || n.contains("Button")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("MenuFlyout")
+                || n.contains("MenuFlyout")
+                || t.contains("StartMenu")
+                || n.contains("StartMenu")
+        }
+
+        fn is_alttab_container_node(meta: &NodeMeta) -> bool {
+            meta.name == "ModalRootGrid"
+                || meta.name == "AltTabRoot"
+                || meta.type_name.contains("Switcher.AltTab")
+        }
+
+        pub fn has_forbidden_alttab_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_alttab_node,
+                Self::is_alttab_container_node,
+                false,
+            )
+        }
+
+        pub fn has_valid_alttab_ancestor(&self, handle: u64) -> bool {
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_alttab_node,
+                Self::is_alttab_container_node,
+                true,
+            )
+        }
+
+        fn is_forbidden_alttab_item_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("TaskView")
+                || n.contains("TaskView")
+                || t.contains("SnapAssist")
+                || n.contains("SnapAssist")
+                || t.contains("GamingTaskView")
+                || n.contains("GamingTaskView")
+                || t.contains("VirtualDesktop")
+                || n.contains("VirtualDesktop")
+                || t.contains("TaskbarSwitcher")
+                || n.contains("TaskbarSwitcher")
+                || t.contains("SwitchItemElement")
+                || n.contains("SwitchItemElement")
+                || t.contains("SwitchItemControl")
+                || n.contains("SwitchItemControl")
+                || t.contains("SwitchItemThumbnail")
+                || n.contains("SwitchItemThumbnail")
+                || t.contains("Button")
+                || n.contains("Button")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("MenuFlyout")
+                || n.contains("MenuFlyout")
+                || t.contains("StartMenu")
+                || n.contains("StartMenu")
+        }
+
+        pub fn has_valid_alttab_item_ancestor(&self, handle: u64) -> bool {
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_alttab_item_node,
+                Self::is_alttab_container_node,
+                true,
+            )
+        }
+
+        fn is_forbidden_hover_flyout_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("HoverFlyoutContent")
+                || n.contains("HoverFlyoutContent")
+                || t.contains("TaskItemThumbnail")
+                || n.contains("TaskItemThumbnail")
+                || t.contains("OverflowFlyoutList")
+                || n.contains("OverflowFlyoutList")
+                || t.contains("AppTaskHoverCard")
+                || n.contains("AppTaskHoverCard")
+                || t.contains("RecoHoverCard")
+                || n.contains("RecoHoverCard")
+                || t.contains("ItemsRepeater")
+                || n.contains("ItemsRepeater")
+                || t.contains("Button")
+                || n.contains("Button")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("ToolTip")
+                || n.contains("ToolTip")
+                || t.contains("MenuFlyout")
+                || n.contains("MenuFlyout")
+                || t.contains("StartMenu")
+                || n.contains("StartMenu")
+                || t.contains("ScrollViewer")
+                || n.contains("ScrollViewer")
+                || t.contains("ScrollBar")
+                || n.contains("ScrollBar")
+        }
+
+        fn is_hover_flyout_container_node(meta: &NodeMeta) -> bool {
+            meta.type_name.contains("FlyoutFrame")
+                || matches!(
+                    meta.name.as_str(),
+                    "HoverFlyoutCanvas"
+                        | "HoverFlyoutGrid"
+                        | "HoverFlyoutBackground"
+                        | "HoverFlyoutBackgroundControl"
+                )
+        }
+
+        pub fn has_forbidden_hover_flyout_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_hover_flyout_node,
+                Self::is_hover_flyout_container_node,
+                false,
+            )
+        }
+
+        pub fn has_valid_hover_flyout_ancestor(&self, handle: u64) -> bool {
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_hover_flyout_node,
+                Self::is_hover_flyout_container_node,
+                true,
+            )
+        }
+
+        fn is_forbidden_osd_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("Button")
+                || n.contains("Button")
+                || t.contains("Slider")
+                || n.contains("Slider")
+                || t.contains("Thumb")
+                || n.contains("Thumb")
+                || t.contains("TextBlock")
+                || n.contains("TextBlock")
+                || t.contains("AnimatedIcon")
+                || n.contains("AnimatedIcon")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("ToolTip")
+                || n.contains("ToolTip")
+                || t.contains("MenuFlyout")
+                || n.contains("MenuFlyout")
+                || t.contains("StartMenu")
+                || n.contains("StartMenu")
+                || t.contains("TaskView")
+                || n.contains("TaskView")
+                || t.contains("ScrollViewer")
+                || n.contains("ScrollViewer")
+                || t.contains("ScrollBar")
+                || n.contains("ScrollBar")
+        }
+
+        fn is_osd_container_node(meta: &NodeMeta) -> bool {
+            meta.type_name.contains("HWConfirmatorUI")
+                || meta.type_name.contains("ConfirmatorHostControl")
+                || meta.name == "ConfirmatorFrameCanvas"
+        }
+
+        pub fn has_forbidden_osd_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_osd_node,
+                Self::is_osd_container_node,
+                false,
+            )
+        }
+
+        fn is_forbidden_tooltip_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("StartMenu")
+                || n.contains("StartMenu")
+                || t.contains("MenuFlyout")
+                || n.contains("MenuFlyout")
+                || t.contains("ComboBox")
+                || n.contains("ComboBox")
+                || t.contains("TeachingTip")
+                || n.contains("TeachingTip")
+                || t.contains("FlyoutPresenter")
+                || n.contains("FlyoutPresenter")
+        }
+
+        pub fn has_forbidden_tooltip_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_tooltip_node,
+                |_| false,
+                false,
+            )
+        }
+
+        pub fn thread_has_alttab_container(&self, tid: u32) -> bool {
+            self.nodes.iter().any(|(&h, meta)| {
+                meta.thread_id == tid
+                    && (meta.name == "AltTabRoot"
+                        || meta.type_name.contains("Switcher.AltTab")
+                        || (meta.name == "ModalRootGrid"
+                            && self.has_ancestor_matching(
+                                h,
+                                Self::is_forbidden_alttab_item_node,
+                                Self::is_alttab_container_node,
+                                false,
+                            )))
+            })
         }
 
         pub fn classify_target(&self, handle: u64) -> Option<TargetKind> {
             let node = self.nodes.get(&handle)?;
+            if node.name == ALTTAB_ITEM_OVERLAY_NAME {
+                return None;
+            }
+            if node.name == "ConfirmatorMainGrid" && !self.has_forbidden_osd_ancestor(handle) {
+                return Some(TargetKind::OsdPanel);
+            }
+            if node.name == "LayoutRoot"
+                && (node.type_name.ends_with(".ContentPresenter")
+                    || node.type_name == "ContentPresenter")
+                && self
+                    .nodes
+                    .get(&node.parent)
+                    .is_some_and(|p| p.type_name.ends_with(".ToolTip") || p.type_name == "ToolTip")
+                && !self.has_forbidden_tooltip_ancestor(handle)
+            {
+                return Some(TargetKind::ToolTipPresenter);
+            }
             if matches!(
                 node.name.as_str(),
                 "BackgroundFill" | "BackgroundStroke" | "ScreenEdgeStroke"
@@ -235,7 +504,16 @@ pub mod tree_match {
                 {
                     return Some(TargetKind::ShapeElement);
                 }
+                if self.has_valid_hover_flyout_ancestor(handle) {
+                    return Some(TargetKind::HoverFlyoutShape);
+                }
                 return None;
+            }
+            if node.name == "HoverFlyoutBackground"
+                && (node.type_name.ends_with(".Border") || node.type_name == "Border")
+                && !self.has_forbidden_hover_flyout_ancestor(handle)
+            {
+                return Some(TargetKind::HoverFlyoutBorder);
             }
             if node.name == "OverflowRootGrid" && !self.has_forbidden_overflow_ancestor(handle) {
                 return Some(TargetKind::OverflowPanel);
@@ -257,6 +535,29 @@ pub mod tree_match {
                 {
                     return Some(TargetKind::OverflowBorder);
                 }
+            }
+            if !self.has_forbidden_alttab_ancestor(handle) && self.has_valid_alttab_ancestor(handle)
+            {
+                if node.name == "BackgroundElement" {
+                    return Some(TargetKind::AltTabBorder);
+                }
+                if (node.type_name.ends_with(".Border") || node.type_name == "Border")
+                    && self.nodes.get(&node.parent).is_some_and(|p| {
+                        matches!(p.name.as_str(), "ModalRootGrid" | "AltTabRootGrid")
+                    })
+                {
+                    return Some(TargetKind::AltTabBorder);
+                }
+            }
+            if (node.type_name.ends_with(".Border") || node.type_name == "Border")
+                && node.name == "BackgroundBorder"
+                && self.has_valid_alttab_item_ancestor(handle)
+            {
+                return Some(TargetKind::AltTabItemBorder);
+            }
+            if node.type_name.contains("ListViewItem") && self.has_valid_alttab_item_ancestor(handle)
+            {
+                return Some(TargetKind::AltTabItemFocus);
             }
             None
         }
@@ -616,16 +917,714 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn classifies_alttab_background_element_and_excludes_items_and_taskview() {
+        let mut idx = VisualTreeIndex::new();
+        // 1. Alt+Tab visual tree: AltTab > Grid#ModalRootGrid > Border#BackgroundElement
+        idx.on_add(
+            0,
+            400,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.AltTab".into(),
+            "AltTabRoot".into(),
+        );
+        idx.on_add(
+            400,
+            401,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+        );
+        idx.on_add(
+            401,
+            402,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundElement".into(),
+        );
+        // Item cards inside SwitchItemList / SwitchItemControl must NEVER be touched
+        idx.on_add(
+            402,
+            410,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemList".into(),
+            "SwitchItemListControl".into(),
+        );
+        idx.on_add(
+            410,
+            411,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemControl".into(),
+            "".into(),
+        );
+        idx.on_add(
+            411,
+            412,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+        );
+
+        // 2. Out-of-order add: BackgroundElement arrives before AltTabRoot attaches above
+        idx.on_add(
+            420,
+            421,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+        );
+        idx.on_add(
+            421,
+            422,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundElement".into(),
+        );
+        assert_eq!(idx.classify_target(422), Some(TargetKind::AltTabBorder));
+
+        // 3. TaskView and SnapAssist with identically named borders must NOT match
+        idx.on_add(
+            0,
+            450,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.TaskView".into(),
+            "TaskViewRoot".into(),
+        );
+        idx.on_add(
+            450,
+            451,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+        );
+        idx.on_add(
+            451,
+            452,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundElement".into(),
+        );
+        idx.on_add(
+            0,
+            460,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SnapAssist".into(),
+            "SnapAssistRoot".into(),
+        );
+        idx.on_add(
+            460,
+            461,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+        );
+        idx.on_add(
+            461,
+            462,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundElement".into(),
+        );
+
+        assert_eq!(idx.classify_target(402), Some(TargetKind::AltTabBorder));
+        assert_eq!(idx.classify_target(412), None);
+        assert_eq!(idx.classify_target(452), None);
+        assert_eq!(idx.classify_target(462), None);
+    }
+
+    #[test]
+    fn classifies_alttab_item_background_border_while_excluding_focus_and_taskview() {
+        let mut idx = VisualTreeIndex::new();
+        // Alt+Tab item container visual tree:
+        // AltTabRoot -> ModalRootGrid -> BackgroundElement -> SwitchItemList -> ScrollViewer
+        // -> SwitchItemListViewItem -> Grid#Root -> Border#BackgroundBorder / Border#FocusRect
+        idx.on_add_on_thread(
+            0,
+            500,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.AltTab".into(),
+            "AltTabRoot".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            500,
+            501,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            501,
+            502,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundElement".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            502,
+            503,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemList".into(),
+            "SwitchItemListControl".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            503,
+            504,
+            "Windows.UI.Xaml.Controls.ScrollViewer".into(),
+            "".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            504,
+            505,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemListViewItem".into(),
+            "".into(),
+            77,
+        );
+        idx.on_add_on_thread(505, 506, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 77);
+        idx.on_add_on_thread(
+            506,
+            507,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            506,
+            508,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "FocusRect".into(),
+            77,
+        );
+
+        // TaskView / SnapAssist / TaskbarSwitcher SwitchItemElement must NOT match AltTabItemBorder.
+        idx.on_add_on_thread(
+            0,
+            600,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.TaskView".into(),
+            "TaskViewRoot".into(),
+            88,
+        );
+        idx.on_add_on_thread(
+            600,
+            601,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+            88,
+        );
+        idx.on_add_on_thread(
+            601,
+            602,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemElement".into(),
+            "".into(),
+            88,
+        );
+        idx.on_add_on_thread(
+            602,
+            603,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            88,
+        );
+        idx.on_add_on_thread(
+            505,
+            604,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.TaskbarSwitcher".into(),
+            "TaskbarSwitcherRoot".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            604,
+            605,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            601,
+            606,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemListViewItem".into(),
+            "".into(),
+            88,
+        );
+
+        // Out-of-order subtree addition: BackgroundBorder arrives before SwitchItemListViewItem attaches to thread container.
+        idx.on_add_on_thread(
+            700,
+            701,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "Root".into(),
+            77,
+        );
+        idx.on_add_on_thread(
+            701,
+            702,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            77,
+        );
+        assert_eq!(idx.classify_target(702), None);
+        idx.on_add_on_thread(
+            504,
+            700,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemListViewItem".into(),
+            "".into(),
+            77,
+        );
+
+        assert!(idx.thread_has_alttab_container(77));
+        assert!(!idx.thread_has_alttab_container(88));
+        assert_eq!(idx.classify_target(502), Some(TargetKind::AltTabBorder));
+        assert_eq!(idx.classify_target(505), Some(TargetKind::AltTabItemFocus));
+        assert_eq!(idx.classify_target(507), Some(TargetKind::AltTabItemBorder));
+        assert_eq!(idx.classify_target(508), None);
+        assert_eq!(idx.classify_target(603), None);
+        assert_eq!(idx.classify_target(605), None);
+        assert_eq!(idx.classify_target(606), None);
+        assert_eq!(idx.classify_target(700), Some(TargetKind::AltTabItemFocus));
+        assert_eq!(idx.classify_target(702), Some(TargetKind::AltTabItemBorder));
+    }
+
+    #[test]
+    fn classifies_hover_flyout_background_and_shapes_while_excluding_thumbnail_items() {
+        let mut idx = VisualTreeIndex::new();
+        // 1. Standard Win11 FlyoutFrame visual tree
+        idx.on_add_on_thread(0, 800, "Taskbar.FlyoutFrame".into(), "FlyoutFrame".into(), 4060);
+        idx.on_add_on_thread(
+            800,
+            801,
+            "Windows.UI.Xaml.Controls.Canvas".into(),
+            "HoverFlyoutCanvas".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            801,
+            802,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "HoverFlyoutGrid".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            802,
+            803,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "HoverFlyoutBackground".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            803,
+            804,
+            "Taskbar.TaskbarBackground".into(),
+            "HoverFlyoutBackgroundControl".into(),
+            4060,
+        );
+        idx.on_add_on_thread(804, 805, "Windows.UI.Xaml.Controls.Grid".into(), "".into(), 4060);
+        idx.on_add_on_thread(
+            805,
+            806,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            805,
+            807,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundStroke".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            805,
+            808,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "ScreenEdgeStroke".into(),
+            4060,
+        );
+
+        // 2. Content inside HoverFlyoutContent (thumbnail cards & overflow list) must NEVER be touched
+        idx.on_add_on_thread(
+            803,
+            810,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "HoverFlyoutContent".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            810,
+            811,
+            "Taskbar.TaskItemThumbnailList".into(),
+            "TaskItemThumbnailList".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            811,
+            812,
+            "Taskbar.TaskItemThumbnailView".into(),
+            "".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            812,
+            813,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            812,
+            814,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            810,
+            815,
+            "Taskbar.OverflowFlyoutList".into(),
+            "".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            815,
+            816,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+
+        // 3. Out-of-order add: BackgroundFill under HoverFlyoutBackgroundControl arrives before FlyoutFrame
+        idx.on_add_on_thread(
+            820,
+            821,
+            "Taskbar.TaskbarBackground".into(),
+            "HoverFlyoutBackgroundControl".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            821,
+            822,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+        assert_eq!(idx.classify_target(822), Some(TargetKind::HoverFlyoutShape));
+        assert!(!idx.is_taskbar_bg_target(822));
+
+        // 4. Generic MenuFlyout / ToolTip with identically named rectangles must NOT match
+        idx.on_add_on_thread(
+            0,
+            830,
+            "Windows.UI.Xaml.Controls.MenuFlyout".into(),
+            "".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            830,
+            831,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            0,
+            832,
+            "Windows.UI.Xaml.Controls.ToolTip".into(),
+            "".into(),
+            4060,
+        );
+        idx.on_add_on_thread(
+            832,
+            833,
+            "Windows.UI.Xaml.Shapes.Rectangle".into(),
+            "BackgroundFill".into(),
+            4060,
+        );
+
+        assert_eq!(idx.classify_target(803), Some(TargetKind::HoverFlyoutBorder));
+        assert_eq!(idx.classify_target(806), Some(TargetKind::HoverFlyoutShape));
+        assert_eq!(idx.classify_target(807), Some(TargetKind::HoverFlyoutShape));
+        assert_eq!(idx.classify_target(808), Some(TargetKind::HoverFlyoutShape));
+        assert!(!idx.is_taskbar_bg_target(806));
+        assert_eq!(idx.classify_target(813), None);
+        assert_eq!(idx.classify_target(814), None);
+        assert_eq!(idx.classify_target(816), None);
+        assert_eq!(idx.classify_target(831), None);
+        assert_eq!(idx.classify_target(833), None);
+    }
+
+    #[test]
+    fn ignores_alttab_item_overlay_border_while_classifying_native_background_border() {
+        let mut idx = VisualTreeIndex::new();
+        idx.on_add_on_thread(
+            0,
+            900,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.AltTab".into(),
+            "AltTabRoot".into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            900,
+            901,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ModalRootGrid".into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            901,
+            902,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.SwitchItemList".into(),
+            "SwitchItemList".into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            902,
+            903,
+            "Windows.UI.Xaml.Controls.ListViewItem".into(),
+            "".into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            903,
+            904,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "Root".into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            904,
+            905,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            ALTTAB_ITEM_OVERLAY_NAME.into(),
+            1234,
+        );
+        idx.on_add_on_thread(
+            904,
+            906,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            1234,
+        );
+
+        assert_eq!(idx.classify_target(905), None);
+        assert_eq!(idx.classify_target(906), Some(TargetKind::AltTabItemBorder));
+    }
+
+    #[test]
+    fn classifies_osd_main_grid_and_excludes_inner_controls() {
+        let mut idx = VisualTreeIndex::new();
+        // 1. Standard Win11 HWConfirmatorUI tree:
+        // ConfirmatorHostControl > Canvas#ConfirmatorFrameCanvas > Grid > Grid#ConfirmatorMainGrid
+        idx.on_add_on_thread(
+            0,
+            1000,
+            "HWConfirmatorUI.ConfirmatorHostControl".into(),
+            "".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1000,
+            1001,
+            "Windows.UI.Xaml.Controls.Canvas".into(),
+            "ConfirmatorFrameCanvas".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1001,
+            1002,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1002,
+            1003,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ConfirmatorMainGrid".into(),
+            5724,
+        );
+        // Inner OSD controls must never be matched
+        idx.on_add_on_thread(
+            1003,
+            1004,
+            "HWConfirmatorUI.CustomThumbSlider".into(),
+            "volumeSlider".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1003,
+            1005,
+            "Windows.UI.Xaml.Controls.Button".into(),
+            "MuteButton".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1003,
+            1006,
+            "Windows.UI.Xaml.Controls.TextBlock".into(),
+            "volumeLevelText".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1005,
+            1007,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            5724,
+        );
+
+        // 2. Out-of-order add: ConfirmatorMainGrid arrives before ConfirmatorFrameCanvas attaches
+        idx.on_add_on_thread(
+            1020,
+            1021,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ConfirmatorMainGrid".into(),
+            5724,
+        );
+        assert_eq!(idx.classify_target(1021), Some(TargetKind::OsdPanel));
+        idx.on_add_on_thread(
+            0,
+            1020,
+            "Windows.UI.Xaml.Controls.Canvas".into(),
+            "ConfirmatorFrameCanvas".into(),
+            5724,
+        );
+
+        // 3. Nested under forbidden node (e.g. StartMenu) or unrelated Grid must NOT match
+        idx.on_add_on_thread(
+            0,
+            1030,
+            "StartMenu.StartInnerFrame".into(),
+            "StartMenu".into(),
+            5724,
+        );
+        idx.on_add_on_thread(
+            1030,
+            1031,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ConfirmatorMainGrid".into(),
+            5724,
+        );
+
+        assert_eq!(idx.classify_target(1002), None);
+        assert_eq!(idx.classify_target(1003), Some(TargetKind::OsdPanel));
+        assert_eq!(idx.classify_target(1004), None);
+        assert_eq!(idx.classify_target(1005), None);
+        assert_eq!(idx.classify_target(1006), None);
+        assert_eq!(idx.classify_target(1007), None);
+        assert_eq!(idx.classify_target(1021), Some(TargetKind::OsdPanel));
+        assert_eq!(idx.classify_target(1031), None);
+    }
+
+    #[test]
+    fn classifies_tooltip_layout_root_and_rejects_menuflyout_or_non_tooltip_presenters() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Standard Win11 XAML ToolTip > ContentPresenter#LayoutRoot > TextBlock
+        idx.on_add_on_thread(
+            0,
+            2000,
+            "Windows.UI.Xaml.Controls.Primitives.PopupRoot".into(),
+            "PopupRoot".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2000,
+            2001,
+            "Windows.UI.Xaml.Controls.ToolTip".into(),
+            "".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2001,
+            2002,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "LayoutRoot".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2002,
+            2003,
+            "Windows.UI.Xaml.Controls.TextBlock".into(),
+            "".into(),
+            25024,
+        );
+
+        // 2. Out-of-order add: LayoutRoot arrives before parent ToolTip
+        idx.on_add_on_thread(
+            2020,
+            2021,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "LayoutRoot".into(),
+            25024,
+        );
+        assert_eq!(idx.classify_target(2021), None);
+        idx.on_add_on_thread(
+            0,
+            2020,
+            "Windows.UI.Xaml.Controls.ToolTip".into(),
+            "TrayToolTip".into(),
+            25024,
+        );
+        assert_eq!(idx.classify_target(2021), Some(TargetKind::ToolTipPresenter));
+
+        // 3. ContentPresenter#LayoutRoot under MenuFlyoutPresenter, Button, or StartMenu must NEVER match
+        idx.on_add_on_thread(
+            0,
+            2030,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2030,
+            2031,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "LayoutRoot".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            0,
+            2040,
+            "Windows.UI.Xaml.Controls.Button".into(),
+            "".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2040,
+            2041,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "LayoutRoot".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            0,
+            2050,
+            "StartMenu.StartInnerFrame".into(),
+            "StartMenu".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2050,
+            2051,
+            "Windows.UI.Xaml.Controls.ToolTip".into(),
+            "".into(),
+            25024,
+        );
+        idx.on_add_on_thread(
+            2051,
+            2052,
+            "Windows.UI.Xaml.Controls.ContentPresenter".into(),
+            "LayoutRoot".into(),
+            25024,
+        );
+
+        assert_eq!(idx.classify_target(2001), None);
+        assert_eq!(idx.classify_target(2002), Some(TargetKind::ToolTipPresenter));
+        assert_eq!(idx.classify_target(2003), None);
+        assert_eq!(idx.classify_target(2031), None);
+        assert_eq!(idx.classify_target(2041), None);
+        assert_eq!(idx.classify_target(2052), None);
+    }
 }
 
 #[cfg(windows)]
 mod win {
     use super::tree_match::{
-        pipe_name_for_pid, TargetKind, VisualTreeIndex, CLSID_PRETTY_WINDOWS_TAP_U128, CMD_HIDE,
-        CMD_PING, CMD_RESTORE, CMD_SHUTDOWN, CMD_STATUS, CMD_VERSION, TAP_PROTOCOL_VERSION,
+        pipe_name_for_pid, TargetKind, VisualTreeIndex, ALTTAB_ITEM_OVERLAY_NAME,
+        CLSID_PRETTY_WINDOWS_TAP_U128, CMD_ALTTAB_RECT, CMD_HIDE, CMD_HOVER_FLYOUT_RECT,
+        CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE,
+        CMD_SET_OSD_FALLBACK_STYLE, CMD_SET_OSD_SUPPRESS, CMD_SET_TOOLTIP_FALLBACK_STYLE,
+        CMD_SET_TOOLTIP_SUPPRESS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT, CMD_VERSION,
+        TAP_PROTOCOL_VERSION,
     };
     use std::cell::{Cell, RefCell};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::ptr::null_mut;
@@ -656,7 +1655,7 @@ mod win {
         CreateEventW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, ResetEvent, SetEvent,
         WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
     };
-    use windows::Win32::System::WinRT::RoGetActivationFactory;
+    use windows::Win32::System::WinRT::{RoActivateInstance, RoGetActivationFactory};
 
     const DLL_PROCESS_ATTACH_CODE: u32 = 1;
     const E_FAIL_HR: HRESULT = HRESULT(0x80004005u32 as i32);
@@ -679,6 +1678,12 @@ mod win {
     const IID_IVISUALTREESERVICE: GUID = GUID::from_u128(0xA593B11A_D17F_48BB_8F66_83910731C8A5);
     const IID_IXAMLDIAGNOSTICS: GUID = GUID::from_u128(0x18C9E2B6_3F43_4116_9F2B_FF935D7770D2);
     const IID_IUIELEMENT: GUID = GUID::from_u128(0x676D0BE9_B65C_41C6_BA40_58CF87F201C1);
+    const IID_IUIELEMENT10: GUID = GUID::from_u128(0xD531C629_AD2C_5F6B_ADCF_FB87287D18D7);
+    const IID_IUIELEMENTSTATICS10: GUID = GUID::from_u128(0x60D25362_4B3E_53DA_8B78_38DB94AE8F26);
+    const IID_IFRAMEWORKELEMENT: GUID = GUID::from_u128(0xA391D09B_4A99_4B7C_9D8D_6FA5D01F6FBF);
+    const IID_IFRAMEWORKELEMENT4: GUID = GUID::from_u128(0x6B765BB3_FBA3_4404_BDEE_1A45D1CA5F21);
+    const IID_IFRAMEWORKELEMENTSTATICS4: GUID =
+        GUID::from_u128(0x9C41B155_C5D8_4663_BFF2_D8D54FB5DBB3);
     const IID_IDEPENDENCYOBJECT: GUID = GUID::from_u128(0x5C526665_F60E_4912_AF59_5FE0680F089D);
     const IID_IDEPENDENCYOBJECT2: GUID = GUID::from_u128(0x29FED85D_3D22_43A1_ADD0_17027C08B212);
     const IID_IDEPENDENCYPROPERTYCHANGEDCALLBACK: GUID =
@@ -687,14 +1692,28 @@ mod win {
     const IID_IDISPATCHEDHANDLER: GUID = GUID::from_u128(0xD1F276C4_98D8_4636_BF49_EB79507548E9);
     const IID_IBORDER: GUID = GUID::from_u128(0x797C4539_45BD_4633_A044_BFB02EF5170F);
     const IID_IBORDERSTATICS: GUID = GUID::from_u128(0xB81D1639_E911_4FD7_A4C4_B9C7F008B7FC);
+    const IID_ICONTENTPRESENTER4: GUID = GUID::from_u128(0x997B1B17_3BF8_432B_8FD9_68C7BAB21F9D);
+    const IID_ICONTENTPRESENTERSTATICS4: GUID =
+        GUID::from_u128(0xFF8BE292_AF28_47EB_A5C3_DC44CED40FD2);
+    const IID_ICONTROL: GUID = GUID::from_u128(0xA8912263_2951_4F58_A9C5_5A134EAA7F07);
+    const IID_ICONTROL7: GUID = GUID::from_u128(0x3550DBE1_E561_5934_A3EF_7DB8BF6E3B45);
+    const IID_ICONTROLSTATICS: GUID = GUID::from_u128(0x473B305B_877D_4C35_8FCA_46A05F96607A);
+    const IID_ICONTROLSTATICS7: GUID = GUID::from_u128(0xAEE1CA45_C910_5DAB_A266_FDF50C0BEDD2);
+    const IID_ITOOLTIP: GUID = GUID::from_u128(0x7DE5D75F_4415_429F_B523_699BDB8C30DB);
     const IID_IPANEL: GUID = GUID::from_u128(0xA50A4BBD_8361_469C_90DA_E9A40C7474DF);
     const IID_IPANELSTATICS: GUID = GUID::from_u128(0xF23D6B5D_8330_47A6_A046_25F509B25232);
+    const IID_IGRID2: GUID = GUID::from_u128(0xF76EFA41_380E_45DB_BE87_9E1326BA4B57);
+    const IID_IGRIDSTATICS2: GUID = GUID::from_u128(0x2D666658_58B6_4A1B_841B_875BA93B5D6A);
     const IID_IBRUSH: GUID = GUID::from_u128(0x8806A321_1E06_422C_A1CC_01696559E021);
     const IID_ISOLIDCOLORBRUSH: GUID = GUID::from_u128(0x9D850850_66F3_48DF_9A8F_824BD5E070AF);
     const IID_ISOLIDCOLORBRUSHFACTORY: GUID =
         GUID::from_u128(0xD935CE0C_86F5_4DA6_8A27_B1619EF7F92B);
     const IID_IDEPENDENCYPROPERTYSTATICS: GUID =
         GUID::from_u128(0x49E5F28F_8259_4D5C_AAE0_83D56DBB68D9);
+    const IID_IVISUALTREEHELPERSTATICS: GUID =
+        GUID::from_u128(0xE75758C4_D25D_4B1D_971F_596F17F12BAA);
+    const IID_IELEMENTCOMPOSITIONPREVIEWSTATICS: GUID =
+        GUID::from_u128(0x08C92B38_EC99_4C55_BC85_A1C180B27646);
 
     static ACTIVE_OBJECTS: AtomicU32 = AtomicU32::new(0);
 
@@ -781,6 +1800,39 @@ mod win {
     }
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawSize {
+        width: f32,
+        height: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct RawPoint {
+        x: f32,
+        y: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, PartialEq)]
+    struct RawThickness {
+        left: f64,
+        top: f64,
+        right: f64,
+        bottom: f64,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default, PartialEq)]
+    struct RawCornerRadius {
+        top_left: f64,
+        top_right: f64,
+        bottom_right: f64,
+        bottom_left: f64,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
     struct RawIUIElementVtbl {
         query_interface:
             unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
@@ -802,11 +1854,359 @@ mod win {
         put_projection: unsafe extern "system" fn(*mut c_void),
         get_render_transform_origin: unsafe extern "system" fn(*mut c_void),
         put_render_transform_origin: unsafe extern "system" fn(*mut c_void),
-        get_is_hit_test_visible: unsafe extern "system" fn(*mut c_void),
-        put_is_hit_test_visible: unsafe extern "system" fn(*mut c_void),
+        get_is_hit_test_visible: unsafe extern "system" fn(*mut c_void, *mut u8) -> HRESULT,
+        put_is_hit_test_visible: unsafe extern "system" fn(*mut c_void, u8) -> HRESULT,
         get_visibility: unsafe extern "system" fn(*mut c_void, *mut i32) -> HRESULT,
         put_visibility: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT,
+        get_render_size: unsafe extern "system" fn(*mut c_void, *mut RawSize) -> HRESULT,
+        _pad24_97: [*const c_void; 74],
+        transform_to_visual:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
     }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIGeneralTransformVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_inverse: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        transform_point:
+            unsafe extern "system" fn(*mut c_void, RawPoint, *mut RawPoint) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIGeneralTransform {
+        lp_vtbl: *const RawIGeneralTransformVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIVisualTreeHelperStaticsVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_9: [*const c_void; 4],
+        get_child:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, i32, *mut *mut c_void) -> HRESULT,
+        get_children_count: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
+        get_parent:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIVisualTreeHelperStatics {
+        lp_vtbl: *const RawIVisualTreeHelperStaticsVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIInspectableVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void, *mut HSTRING) -> HRESULT,
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+    }
+
+    #[repr(C)]
+    struct RawIInspectable {
+        lp_vtbl: *const RawIInspectableVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIFrameworkElementVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_30: [*const c_void; 25],
+        get_margin: unsafe extern "system" fn(*mut c_void, *mut RawThickness) -> HRESULT,
+        put_margin: unsafe extern "system" fn(*mut c_void, RawThickness) -> HRESULT,
+        get_name: unsafe extern "system" fn(*mut c_void, *mut HSTRING) -> HRESULT,
+        put_name: unsafe extern "system" fn(*mut c_void, core::mem::MaybeUninit<HSTRING>) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIFrameworkElement {
+        lp_vtbl: *const RawIFrameworkElementVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIFrameworkElement4Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_9: [*const c_void; 4],
+        get_focus_visual_secondary_thickness:
+            unsafe extern "system" fn(*mut c_void, *mut RawThickness) -> HRESULT,
+        put_focus_visual_secondary_thickness:
+            unsafe extern "system" fn(*mut c_void, RawThickness) -> HRESULT,
+        _pad12_13: [*const c_void; 2],
+        get_focus_visual_secondary_brush:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_focus_visual_secondary_brush:
+            unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIFrameworkElement4 {
+        lp_vtbl: *const RawIFrameworkElement4Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIFrameworkElementStatics4Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_7: [*const c_void; 2],
+        get_focus_visual_secondary_thickness_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        _pad9: *const c_void,
+        get_focus_visual_secondary_brush_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIFrameworkElementStatics4 {
+        lp_vtbl: *const RawIFrameworkElementStatics4Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIUIElement10Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_10: [*const c_void; 5],
+        get_shadow: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_shadow: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIUIElement10 {
+        lp_vtbl: *const RawIUIElement10Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIUIElementStatics10Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_shadow_property: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIUIElementStatics10 {
+        lp_vtbl: *const RawIUIElementStatics10Vtbl,
+    }
+
+    const _: () = {
+        assert!(size_of::<RawSize>() == 8);
+        assert!(size_of::<RawPoint>() == 8);
+        assert!(size_of::<RawThickness>() == 32);
+        assert!(size_of::<RawCornerRadius>() == 32);
+        assert!(size_of::<HSTRING>() == size_of::<usize>());
+        assert!(
+            core::mem::offset_of!(RawIUIElementVtbl, put_is_hit_test_visible)
+                == 20 * size_of::<usize>()
+        );
+        assert!(core::mem::offset_of!(RawIUIElementVtbl, get_render_size) == 23 * size_of::<usize>());
+        assert!(
+            core::mem::offset_of!(RawIUIElementVtbl, transform_to_visual) == 98 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElement10Vtbl, get_shadow) == 11 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElement10Vtbl, put_shadow) == 12 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElementStatics10Vtbl, get_shadow_property)
+                == 6 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIVisualTreeHelperStaticsVtbl, get_child)
+                == 10 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIVisualTreeHelperStaticsVtbl, get_children_count)
+                == 11 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIVisualTreeHelperStaticsVtbl, get_parent)
+                == 12 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIFrameworkElementVtbl, get_margin) == 31 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIFrameworkElementVtbl, put_margin) == 32 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIFrameworkElementVtbl, get_name) == 33 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIFrameworkElementVtbl, put_name) == 34 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElement4Vtbl,
+                get_focus_visual_secondary_thickness
+            ) == 10 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElement4Vtbl,
+                put_focus_visual_secondary_thickness
+            ) == 11 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElement4Vtbl,
+                get_focus_visual_secondary_brush
+            ) == 14 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElement4Vtbl,
+                put_focus_visual_secondary_brush
+            ) == 15 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElementStatics4Vtbl,
+                get_focus_visual_secondary_thickness_property
+            ) == 8 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(
+                RawIFrameworkElementStatics4Vtbl,
+                get_focus_visual_secondary_brush_property
+            ) == 10 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIBorderVtbl, get_border_thickness) == 8 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIBorderVtbl, put_border_thickness) == 9 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIBorderVtbl, get_corner_radius) == 12 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIBorderVtbl, put_corner_radius) == 13 * size_of::<usize>()
+        );
+        assert!(core::mem::offset_of!(RawIPanelVtbl, get_children) == 6 * size_of::<usize>());
+        assert!(
+            core::mem::offset_of!(RawIUIElementVectorVtbl, get_at) == 6 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElementVectorVtbl, get_size) == 7 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElementVectorVtbl, insert_at) == 11 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIUIElementVectorVtbl, remove_at) == 12 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIElementCompositionPreviewStaticsVtbl, get_element_visual)
+                == 6 * size_of::<usize>()
+        );
+        assert!(core::mem::offset_of!(RawIVisualVtbl, get_is_visible) == 18 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIVisualVtbl, put_is_visible) == 19 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIGrid2Vtbl, get_border_brush) == 6 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIGrid2Vtbl, put_border_brush) == 7 * size_of::<usize>());
+        assert!(
+            core::mem::offset_of!(RawIGridStatics2Vtbl, get_border_brush_property)
+                == 6 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, get_border_brush)
+                == 14 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, put_border_brush)
+                == 15 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, get_corner_radius)
+                == 18 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, put_corner_radius)
+                == 19 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, get_background)
+                == 22 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenter4Vtbl, put_background)
+                == 23 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenterStatics4Vtbl, get_border_brush_property)
+                == 10 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIContentPresenterStatics4Vtbl, get_background_property)
+                == 14 * size_of::<usize>()
+        );
+        assert!(core::mem::offset_of!(RawIControlVtbl, get_background) == 36 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIControlVtbl, put_background) == 37 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIControlVtbl, get_border_brush) == 40 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIControlVtbl, put_border_brush) == 41 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIControl7Vtbl, get_corner_radius) == 8 * size_of::<usize>());
+        assert!(core::mem::offset_of!(RawIControl7Vtbl, put_corner_radius) == 9 * size_of::<usize>());
+        assert!(
+            core::mem::offset_of!(RawIControlStaticsVtbl, get_background_property)
+                == 21 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIControlStaticsVtbl, get_border_brush_property)
+                == 23 * size_of::<usize>()
+        );
+        assert!(
+            core::mem::offset_of!(RawIControlStatics7Vtbl, get_corner_radius_property)
+                == 7 * size_of::<usize>()
+        );
+        assert!(core::mem::offset_of!(RawIToolTipVtbl, get_is_open) == 8 * size_of::<usize>());
+    };
 
     const VISIBILITY_VISIBLE: i32 = 0;
     const VISIBILITY_COLLAPSED: i32 = 1;
@@ -824,6 +2224,15 @@ mod win {
     const DIAG_INSERTED_TARGET: u32 = 1 << 10;
     const DIAG_APPLY_RAN: u32 = 1 << 11;
     const DIAG_OVERFLOW_APPLIED: u32 = 1 << 12;
+    const DIAG_ALTTAB_APPLIED: u32 = 1 << 13;
+    const DIAG_ALTTAB_ITEM_APPLIED: u32 = 1 << 14;
+    const DIAG_ALTTAB_FOCUS_APPLIED: u32 = 1 << 15;
+    const DIAG_HOVER_FLYOUT_APPLIED: u32 = 1 << 16;
+    const DIAG_HOVER_FLYOUT_SHADOW_APPLIED: u32 = 1 << 17;
+    const DIAG_OSD_APPLIED: u32 = 1 << 18;
+    const DIAG_OSD_SHADOW_APPLIED: u32 = 1 << 19;
+    const DIAG_TOOLTIP_APPLIED: u32 = 1 << 20;
+    const DIAG_TOOLTIP_SHADOW_APPLIED: u32 = 1 << 21;
 
     #[repr(C)]
     struct RawIUIElement {
@@ -831,12 +2240,37 @@ mod win {
     }
 
     #[repr(C)]
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     struct RawUiColor {
         a: u8,
         r: u8,
         g: u8,
         b: u8,
+    }
+
+    impl RawUiColor {
+        const TRANSPARENT: Self = Self {
+            a: 0,
+            r: 0,
+            g: 0,
+            b: 0,
+        };
+
+        const fn from_argb(argb: u32) -> Self {
+            Self {
+                a: ((argb >> 24) & 0xFF) as u8,
+                r: ((argb >> 16) & 0xFF) as u8,
+                g: ((argb >> 8) & 0xFF) as u8,
+                b: (argb & 0xFF) as u8,
+            }
+        }
+
+        const fn to_argb(self) -> u32 {
+            ((self.a as u32) << 24)
+                | ((self.r as u32) << 16)
+                | ((self.g as u32) << 8)
+                | (self.b as u32)
+        }
     }
 
     const _: () = {
@@ -856,10 +2290,12 @@ mod win {
         get_trust_level: unsafe extern "system" fn(*mut c_void),
         get_border_brush: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         put_border_brush: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
-        get_border_thickness: unsafe extern "system" fn(*mut c_void),
-        put_border_thickness: unsafe extern "system" fn(*mut c_void),
+        get_border_thickness: unsafe extern "system" fn(*mut c_void, *mut RawThickness) -> HRESULT,
+        put_border_thickness: unsafe extern "system" fn(*mut c_void, RawThickness) -> HRESULT,
         get_background: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         put_background: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        get_corner_radius: unsafe extern "system" fn(*mut c_void, *mut RawCornerRadius) -> HRESULT,
+        put_corner_radius: unsafe extern "system" fn(*mut c_void, RawCornerRadius) -> HRESULT,
     }
 
     #[repr(C)]
@@ -877,7 +2313,7 @@ mod win {
         get_iids: unsafe extern "system" fn(*mut c_void),
         get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
         get_trust_level: unsafe extern "system" fn(*mut c_void),
-        get_children: unsafe extern "system" fn(*mut c_void),
+        get_children: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         get_background: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
         put_background: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
     }
@@ -885,6 +2321,67 @@ mod win {
     #[repr(C)]
     struct RawIPanel {
         lp_vtbl: *const RawIPanelVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIUIElementVectorVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_at: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> HRESULT,
+        get_size: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+        _pad8_10: [*const c_void; 3],
+        insert_at: unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> HRESULT,
+        remove_at: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIUIElementVector {
+        lp_vtbl: *const RawIUIElementVectorVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIElementCompositionPreviewStaticsVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_element_visual:
+            unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIElementCompositionPreviewStatics {
+        lp_vtbl: *const RawIElementCompositionPreviewStaticsVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIVisualVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_17: [*const c_void; 12],
+        get_is_visible: unsafe extern "system" fn(*mut c_void, *mut u8) -> HRESULT,
+        put_is_visible: unsafe extern "system" fn(*mut c_void, u8) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIVisual {
+        lp_vtbl: *const RawIVisualVtbl,
     }
 
     #[repr(C)]
@@ -1012,6 +2509,201 @@ mod win {
     #[repr(C)]
     struct RawIPanelStatics {
         lp_vtbl: *const RawIPanelStaticsVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIGrid2Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_border_brush: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_border_brush: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIGrid2 {
+        lp_vtbl: *const RawIGrid2Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIGridStatics2Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_border_brush_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIGridStatics2 {
+        lp_vtbl: *const RawIGridStatics2Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIContentPresenter4Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_13: [*const c_void; 8],
+        get_border_brush: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_border_brush: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        get_border_thickness: unsafe extern "system" fn(*mut c_void, *mut RawThickness) -> HRESULT,
+        put_border_thickness: unsafe extern "system" fn(*mut c_void, RawThickness) -> HRESULT,
+        get_corner_radius: unsafe extern "system" fn(*mut c_void, *mut RawCornerRadius) -> HRESULT,
+        put_corner_radius: unsafe extern "system" fn(*mut c_void, RawCornerRadius) -> HRESULT,
+        get_padding: unsafe extern "system" fn(*mut c_void, *mut RawThickness) -> HRESULT,
+        put_padding: unsafe extern "system" fn(*mut c_void, RawThickness) -> HRESULT,
+        get_background: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_background: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIContentPresenter4 {
+        lp_vtbl: *const RawIContentPresenter4Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIContentPresenterStatics4Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_9: [*const c_void; 4],
+        get_border_brush_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        _pad11_13: [*const c_void; 3],
+        get_background_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIContentPresenterStatics4 {
+        lp_vtbl: *const RawIContentPresenterStatics4Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIToolTipVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        get_horizontal_offset: unsafe extern "system" fn(*mut c_void, *mut f64) -> HRESULT,
+        put_horizontal_offset: unsafe extern "system" fn(*mut c_void, f64) -> HRESULT,
+        get_is_open: unsafe extern "system" fn(*mut c_void, *mut u8) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIToolTip {
+        lp_vtbl: *const RawIToolTipVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIControlVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_35: [*const c_void; 30],
+        get_background: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_background: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+        _pad38_39: [*const c_void; 2],
+        get_border_brush: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        put_border_brush: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIControl {
+        lp_vtbl: *const RawIControlVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIControl7Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_7: [*const c_void; 2],
+        get_corner_radius: unsafe extern "system" fn(*mut c_void, *mut RawCornerRadius) -> HRESULT,
+        put_corner_radius: unsafe extern "system" fn(*mut c_void, RawCornerRadius) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIControl7 {
+        lp_vtbl: *const RawIControl7Vtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIControlStaticsVtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6_20: [*const c_void; 15],
+        get_background_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+        _pad22: *const c_void,
+        get_border_brush_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIControlStatics {
+        lp_vtbl: *const RawIControlStaticsVtbl,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct RawIControlStatics7Vtbl {
+        query_interface:
+            unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+        add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+        release: unsafe extern "system" fn(*mut c_void) -> u32,
+        get_iids: unsafe extern "system" fn(*mut c_void),
+        get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+        get_trust_level: unsafe extern "system" fn(*mut c_void),
+        _pad6: *const c_void,
+        get_corner_radius_property:
+            unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+
+    #[repr(C)]
+    struct RawIControlStatics7 {
+        lp_vtbl: *const RawIControlStatics7Vtbl,
     }
 
     #[repr(C)]
@@ -1393,7 +3085,7 @@ mod win {
         (!out.is_null()).then_some(out)
     }
 
-    unsafe fn fetch_transparent_brush() -> Option<ComRaw> {
+    unsafe fn fetch_solid_brush(color: RawUiColor) -> Option<ComRaw> {
         let factory_com = activate_factory_iface(
             "Windows.UI.Xaml.Media.SolidColorBrush",
             &IID_ISOLIDCOLORBRUSHFACTORY,
@@ -1402,12 +3094,7 @@ mod win {
         let mut solid_com = ComRaw::null();
         if ((*(*fac).lp_vtbl).create_instance_with_color)(
             factory_com.as_ptr(),
-            RawUiColor {
-                a: 0,
-                r: 0,
-                g: 0,
-                b: 0,
-            },
+            color,
             &mut solid_com.0,
         )
         .is_err()
@@ -1417,6 +3104,10 @@ mod win {
         }
         let brush_com = qi_interface(solid_com.as_ptr(), &IID_IBRUSH);
         (!brush_com.is_null()).then_some(brush_com)
+    }
+
+    unsafe fn fetch_transparent_brush() -> Option<ComRaw> {
+        fetch_solid_brush(RawUiColor::TRANSPARENT)
     }
 
     unsafe fn fetch_unset_value() -> Option<ComRaw> {
@@ -1480,6 +3171,225 @@ mod win {
         }
     }
 
+    unsafe fn fetch_grid_border_brush_dp() -> Option<ComRaw> {
+        let statics_com =
+            activate_factory_iface("Windows.UI.Xaml.Controls.Grid", &IID_IGRIDSTATICS2)?;
+        let statics = statics_com.as_ptr().cast::<RawIGridStatics2>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_border_brush_property)(statics_com.as_ptr(), &mut dp.0)
+            .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_visual_tree_helper() -> Option<ComRaw> {
+        activate_factory_iface(
+            "Windows.UI.Xaml.Media.VisualTreeHelper",
+            &IID_IVISUALTREEHELPERSTATICS,
+        )
+    }
+
+    unsafe fn cached_visual_tree_helper() -> Option<ComRaw> {
+        ensure_cached_com(
+            |s| s.visual_tree_helper.as_ref(),
+            |s, v| s.visual_tree_helper = Some(v),
+            fetch_visual_tree_helper,
+        )
+    }
+
+    unsafe fn fetch_element_composition_preview() -> Option<ComRaw> {
+        activate_factory_iface(
+            "Windows.UI.Xaml.Hosting.ElementCompositionPreview",
+            &IID_IELEMENTCOMPOSITIONPREVIEWSTATICS,
+        )
+    }
+
+    unsafe fn cached_element_composition_preview() -> Option<ComRaw> {
+        ensure_cached_com(
+            |s| s.element_comp_preview.as_ref(),
+            |s, v| s.element_comp_preview = Some(v),
+            fetch_element_composition_preview,
+        )
+    }
+
+    unsafe fn fetch_focus_secondary_brush_dp() -> Option<ComRaw> {
+        let statics_com = activate_factory_iface(
+            "Windows.UI.Xaml.FrameworkElement",
+            &IID_IFRAMEWORKELEMENTSTATICS4,
+        )?;
+        let statics = statics_com.as_ptr().cast::<RawIFrameworkElementStatics4>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_focus_visual_secondary_brush_property)(
+            statics_com.as_ptr(),
+            &mut dp.0,
+        )
+        .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_focus_secondary_thickness_dp() -> Option<ComRaw> {
+        let statics_com = activate_factory_iface(
+            "Windows.UI.Xaml.FrameworkElement",
+            &IID_IFRAMEWORKELEMENTSTATICS4,
+        )?;
+        let statics = statics_com.as_ptr().cast::<RawIFrameworkElementStatics4>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_focus_visual_secondary_thickness_property)(
+            statics_com.as_ptr(),
+            &mut dp.0,
+        )
+        .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_element_shadow_dp() -> Option<ComRaw> {
+        let statics_com =
+            activate_factory_iface("Windows.UI.Xaml.UIElement", &IID_IUIELEMENTSTATICS10)?;
+        let statics = statics_com.as_ptr().cast::<RawIUIElementStatics10>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_shadow_property)(statics_com.as_ptr(), &mut dp.0).is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_content_presenter_bg_dp() -> Option<ComRaw> {
+        let statics_com = activate_factory_iface(
+            "Windows.UI.Xaml.Controls.ContentPresenter",
+            &IID_ICONTENTPRESENTERSTATICS4,
+        )?;
+        let statics = statics_com
+            .as_ptr()
+            .cast::<RawIContentPresenterStatics4>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_background_property)(statics_com.as_ptr(), &mut dp.0)
+            .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_content_presenter_border_brush_dp() -> Option<ComRaw> {
+        let statics_com = activate_factory_iface(
+            "Windows.UI.Xaml.Controls.ContentPresenter",
+            &IID_ICONTENTPRESENTERSTATICS4,
+        )?;
+        let statics = statics_com
+            .as_ptr()
+            .cast::<RawIContentPresenterStatics4>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_border_brush_property)(statics_com.as_ptr(), &mut dp.0)
+            .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_control_bg_dp() -> Option<ComRaw> {
+        let statics_com =
+            activate_factory_iface("Windows.UI.Xaml.Controls.Control", &IID_ICONTROLSTATICS)?;
+        let statics = statics_com.as_ptr().cast::<RawIControlStatics>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_background_property)(statics_com.as_ptr(), &mut dp.0).is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_control_border_brush_dp() -> Option<ComRaw> {
+        let statics_com =
+            activate_factory_iface("Windows.UI.Xaml.Controls.Control", &IID_ICONTROLSTATICS)?;
+        let statics = statics_com.as_ptr().cast::<RawIControlStatics>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_border_brush_property)(statics_com.as_ptr(), &mut dp.0)
+            .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn fetch_control_corner_radius_dp() -> Option<ComRaw> {
+        let statics_com =
+            activate_factory_iface("Windows.UI.Xaml.Controls.Control", &IID_ICONTROLSTATICS7)?;
+        let statics = statics_com.as_ptr().cast::<RawIControlStatics7>();
+        let mut dp = ComRaw::null();
+        if ((*(*statics).lp_vtbl).get_corner_radius_property)(statics_com.as_ptr(), &mut dp.0)
+            .is_ok()
+            && !dp.is_null()
+        {
+            Some(dp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn com_identity_key(ptr: *mut c_void) -> u64 {
+        let unk = qi_interface(ptr, &IID_IUNKNOWN);
+        let raw = if !unk.is_null() {
+            unk.as_ptr() as u64
+        } else {
+            ptr as u64
+        };
+        (1u64 << 63) | (raw & !(1u64 << 63))
+    }
+
+    unsafe fn element_framework_name(ptr: *mut c_void) -> Option<String> {
+        let fe_com = qi_interface(ptr, &IID_IFRAMEWORKELEMENT);
+        if fe_com.is_null() {
+            return None;
+        }
+        let fe = fe_com.as_ptr().cast::<RawIFrameworkElement>();
+        let mut hs = HSTRING::new();
+        if ((*(*fe).lp_vtbl).get_name)(fe_com.as_ptr(), &mut hs).is_ok() {
+            Some(hs.to_string_lossy())
+        } else {
+            None
+        }
+    }
+
+    unsafe fn element_runtime_class_name(ptr: *mut c_void) -> Option<String> {
+        let insp_com = qi_interface(ptr, &IID_IINSPECTABLE);
+        if insp_com.is_null() {
+            return None;
+        }
+        let insp = insp_com.as_ptr().cast::<RawIInspectable>();
+        let mut hs = HSTRING::new();
+        if ((*(*insp).lp_vtbl).get_runtime_class_name)(insp_com.as_ptr(), &mut hs).is_ok() {
+            Some(hs.to_string_lossy())
+        } else {
+            None
+        }
+    }
+
     unsafe fn is_transparent_solid_brush(brush_ptr: *mut c_void) -> bool {
         if brush_ptr.is_null() {
             return false;
@@ -1498,15 +3408,54 @@ mod win {
         ((*(*solid).lp_vtbl).get_color)(solid_com.as_ptr(), &mut col).is_ok() && col.a == 0
     }
 
+    unsafe fn is_solid_brush_with_color(brush_ptr: *mut c_void, target: RawUiColor) -> bool {
+        if brush_ptr.is_null() {
+            return false;
+        }
+        let solid_com = qi_interface(brush_ptr, &IID_ISOLIDCOLORBRUSH);
+        if solid_com.is_null() {
+            return false;
+        }
+        let solid = solid_com.as_ptr().cast::<RawISolidColorBrush>();
+        let mut col = RawUiColor {
+            a: target.a.wrapping_add(1),
+            r: 0,
+            g: 0,
+            b: 0,
+        };
+        ((*(*solid).lp_vtbl).get_color)(solid_com.as_ptr(), &mut col).is_ok() && col == target
+    }
+
     enum SavedBrush {
         Unset,
         Local(ComRaw),
+    }
+
+    enum SavedCornerRadius {
+        Unset,
+        Local(RawCornerRadius),
+    }
+
+    struct TooltipTrackedEntry {
+        presenter_weak: ComRaw,
+        tooltip_key: Option<u64>,
+        tooltip_weak: Option<ComRaw>,
     }
 
     #[derive(Default)]
     struct SavedTargetBrushes {
         background: Option<SavedBrush>,
         border_brush: Option<SavedBrush>,
+        focus_secondary: Option<SavedBrush>,
+        shadow: Option<SavedBrush>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum BrushSlot {
+        Background,
+        BorderBrush,
+        FocusSecondary,
+        Shadow,
     }
 
     struct PropWatchEntry {
@@ -1518,13 +3467,31 @@ mod win {
     #[derive(Default)]
     struct UiThreadBrushStore {
         trans_brush: Option<ComRaw>,
+        tinted_brushes: HashMap<u32, ComRaw>,
         unset_value: Option<ComRaw>,
         border_bg_dp: Option<ComRaw>,
         border_brush_dp: Option<ComRaw>,
         panel_bg_dp: Option<ComRaw>,
+        grid_border_brush_dp: Option<ComRaw>,
+        content_presenter_bg_dp: Option<ComRaw>,
+        content_presenter_border_brush_dp: Option<ComRaw>,
+        control_bg_dp: Option<ComRaw>,
+        control_border_brush_dp: Option<ComRaw>,
+        control_corner_radius_dp: Option<ComRaw>,
+        focus_secondary_brush_dp: Option<ComRaw>,
+        focus_secondary_thickness_dp: Option<ComRaw>,
+        element_shadow_dp: Option<ComRaw>,
+        visual_tree_helper: Option<ComRaw>,
+        element_comp_preview: Option<ComRaw>,
         prewarmed: bool,
         saved: HashMap<u64, SavedTargetBrushes>,
         watches: HashMap<(u64, u8), PropWatchEntry>,
+        alttab_subtargets: HashMap<u64, (TargetKind, ComRaw)>,
+        alttab_item_orig_comp_visible: HashMap<u64, u8>,
+        alttab_item_orig_focus_thickness: HashMap<u64, RawThickness>,
+        hover_flyout_shapes: HashMap<u64, (ComRaw, f64, i32)>,
+        tooltip_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
+        tooltip_modified_targets: HashMap<u64, TooltipTrackedEntry>,
     }
 
     thread_local! {
@@ -1669,8 +3636,50 @@ mod win {
                         sender,
                         border_com.as_ptr(),
                         cb.prop,
+                        RawUiColor::TRANSPARENT,
                         true,
                         None,
+                        DIAG_OVERFLOW_APPLIED,
+                    );
+                }
+            }
+            TargetKind::AltTabBorder => {
+                let border_com = qi_interface(sender, &IID_IBORDER);
+                if !border_com.is_null() {
+                    sync_overflow_brush_prop(
+                        &cb.runtime,
+                        cb.handle,
+                        sender,
+                        border_com.as_ptr(),
+                        cb.prop,
+                        RawUiColor::TRANSPARENT,
+                        true,
+                        None,
+                        DIAG_ALTTAB_APPLIED,
+                    );
+                }
+            }
+            TargetKind::AltTabItemBorder => {
+                let border_com = qi_interface(sender, &IID_IBORDER);
+                if !border_com.is_null() {
+                    let target_color = match cb.prop {
+                        BrushPropKind::BorderBrush => RawUiColor::from_argb(
+                            cb.runtime.alt_tab_item_border_argb.load(Ordering::Acquire),
+                        ),
+                        _ => RawUiColor::from_argb(
+                            cb.runtime.alt_tab_item_bg_argb.load(Ordering::Acquire),
+                        ),
+                    };
+                    sync_overflow_brush_prop(
+                        &cb.runtime,
+                        cb.handle,
+                        sender,
+                        border_com.as_ptr(),
+                        cb.prop,
+                        target_color,
+                        true,
+                        None,
+                        DIAG_ALTTAB_ITEM_APPLIED,
                     );
                 }
             }
@@ -1683,12 +3692,201 @@ mod win {
                         sender,
                         panel_com.as_ptr(),
                         cb.prop,
+                        RawUiColor::TRANSPARENT,
                         true,
                         None,
+                        DIAG_OVERFLOW_APPLIED,
                     );
                 }
             }
-            TargetKind::ShapeElement => {}
+            TargetKind::AltTabItemFocus => {
+                if matches!(cb.prop, BrushPropKind::FocusVisualSecondaryThickness) {
+                    sync_focus_secondary_thickness_prop(
+                        &cb.runtime,
+                        cb.handle,
+                        sender,
+                        true,
+                        true,
+                    );
+                } else {
+                    let fe4_com = qi_interface(sender, &IID_IFRAMEWORKELEMENT4);
+                    if !fe4_com.is_null() {
+                        sync_overflow_brush_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            fe4_com.as_ptr(),
+                            BrushPropKind::FocusVisualSecondaryBrush,
+                            RawUiColor::TRANSPARENT,
+                            true,
+                            None,
+                            DIAG_ALTTAB_FOCUS_APPLIED,
+                        );
+                    }
+                }
+            }
+            TargetKind::HoverFlyoutBorder => {
+                if matches!(cb.prop, BrushPropKind::ElementShadow) {
+                    sync_element_shadow_prop(
+                        &cb.runtime,
+                        cb.handle,
+                        sender,
+                        true,
+                        None,
+                        DIAG_HOVER_FLYOUT_SHADOW_APPLIED,
+                        false,
+                    );
+                } else {
+                    let border_com = qi_interface(sender, &IID_IBORDER);
+                    if !border_com.is_null() {
+                        sync_overflow_brush_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            border_com.as_ptr(),
+                            cb.prop,
+                            RawUiColor::TRANSPARENT,
+                            true,
+                            None,
+                            DIAG_HOVER_FLYOUT_APPLIED,
+                        );
+                    }
+                }
+            }
+            TargetKind::OsdPanel => {
+                let (target_bg, target_border) = cb.runtime.osd_target_colors();
+                match cb.prop {
+                    BrushPropKind::PanelBackground => {
+                        let panel_com = qi_interface(sender, &IID_IPANEL);
+                        if !panel_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                panel_com.as_ptr(),
+                                BrushPropKind::PanelBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_OSD_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::GridBorderBrush => {
+                        let grid2_com = qi_interface(sender, &IID_IGRID2);
+                        if !grid2_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                grid2_com.as_ptr(),
+                                BrushPropKind::GridBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_OSD_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::ElementShadow => {
+                        sync_element_shadow_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            true,
+                            None,
+                            DIAG_OSD_SHADOW_APPLIED,
+                            false,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            TargetKind::ToolTipPresenter => {
+                let (target_bg, target_border) = cb.runtime.tooltip_target_colors();
+                match cb.prop {
+                    BrushPropKind::ControlBackground => {
+                        let ctrl_com = qi_interface(sender, &IID_ICONTROL);
+                        if !ctrl_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                ctrl_com.as_ptr(),
+                                BrushPropKind::ControlBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_TOOLTIP_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::ControlBorderBrush => {
+                        let ctrl_com = qi_interface(sender, &IID_ICONTROL);
+                        if !ctrl_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                ctrl_com.as_ptr(),
+                                BrushPropKind::ControlBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_TOOLTIP_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::ContentPresenterBackground => {
+                        let cp_com = qi_interface(sender, &IID_ICONTENTPRESENTER4);
+                        if !cp_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                cp_com.as_ptr(),
+                                BrushPropKind::ContentPresenterBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_TOOLTIP_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::ContentPresenterBorderBrush => {
+                        let cp_com = qi_interface(sender, &IID_ICONTENTPRESENTER4);
+                        if !cp_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                cp_com.as_ptr(),
+                                BrushPropKind::ContentPresenterBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_TOOLTIP_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::ElementShadow => {
+                        let is_cp = !qi_interface(sender, &IID_ICONTENTPRESENTER4).is_null();
+                        sync_element_shadow_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            true,
+                            None,
+                            DIAG_TOOLTIP_SHADOW_APPLIED,
+                            is_cp,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            TargetKind::ShapeElement | TargetKind::HoverFlyoutShape => {}
         }
         S_OK
     }
@@ -1733,6 +3931,53 @@ mod win {
             |s, v| s.panel_bg_dp = Some(v),
             fetch_panel_bg_dp,
         );
+        let _ = ensure_cached_com(
+            |s| s.grid_border_brush_dp.as_ref(),
+            |s, v| s.grid_border_brush_dp = Some(v),
+            fetch_grid_border_brush_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.content_presenter_bg_dp.as_ref(),
+            |s, v| s.content_presenter_bg_dp = Some(v),
+            fetch_content_presenter_bg_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.content_presenter_border_brush_dp.as_ref(),
+            |s, v| s.content_presenter_border_brush_dp = Some(v),
+            fetch_content_presenter_border_brush_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.control_bg_dp.as_ref(),
+            |s, v| s.control_bg_dp = Some(v),
+            fetch_control_bg_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.control_border_brush_dp.as_ref(),
+            |s, v| s.control_border_brush_dp = Some(v),
+            fetch_control_border_brush_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.control_corner_radius_dp.as_ref(),
+            |s, v| s.control_corner_radius_dp = Some(v),
+            fetch_control_corner_radius_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.focus_secondary_brush_dp.as_ref(),
+            |s, v| s.focus_secondary_brush_dp = Some(v),
+            fetch_focus_secondary_brush_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.focus_secondary_thickness_dp.as_ref(),
+            |s, v| s.focus_secondary_thickness_dp = Some(v),
+            fetch_focus_secondary_thickness_dp,
+        );
+        let _ = ensure_cached_com(
+            |s| s.element_shadow_dp.as_ref(),
+            |s, v| s.element_shadow_dp = Some(v),
+            fetch_element_shadow_dp,
+        );
+        let _ = cached_visual_tree_helper();
+        let _ = cached_element_composition_preview();
     }
 
     unsafe fn unregister_watch_entry(entry: PropWatchEntry) {
@@ -1875,35 +4120,341 @@ mod win {
         Some(created)
     }
 
-    fn has_saved_brush_slot(handle: u64, is_border_brush: bool) -> bool {
+    unsafe fn cached_solid_brush(color: RawUiColor) -> Option<ComRaw> {
+        if color.a == 0 {
+            return ensure_cached_com(
+                |s| s.trans_brush.as_ref(),
+                |s, v| s.trans_brush = Some(v),
+                fetch_transparent_brush,
+            );
+        }
+        let key = color.to_argb();
+        if let Some(hit) = UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|s| s.tinted_brushes.get(&key).map(ComRaw::clone_ref))
+        }) {
+            return Some(hit);
+        }
+        let created = fetch_solid_brush(color)?;
+        let to_store = created.clone_ref();
+        let (rejected, evicted) = UI_BRUSH_STORE.with(|cell| {
+            if let Ok(mut s) = cell.try_borrow_mut() {
+                if s.tinted_brushes.contains_key(&key) {
+                    return (Some(to_store), None);
+                }
+                let drained = if s.tinted_brushes.len() >= 32 {
+                    Some(s.tinted_brushes.drain().map(|(_, v)| v).collect::<Vec<_>>())
+                } else {
+                    None
+                };
+                s.tinted_brushes.insert(key, to_store);
+                return (None, drained);
+            }
+            (Some(to_store), None)
+        });
+        drop(rejected);
+        drop(evicted);
+        Some(created)
+    }
+
+    fn has_saved_brush_slot(handle: u64, slot: BrushSlot) -> bool {
         UI_BRUSH_STORE.with(|cell| {
             cell.try_borrow().ok().is_some_and(|s| {
-                s.saved.get(&handle).is_some_and(|entry| {
-                    if is_border_brush {
-                        entry.border_brush.is_some()
-                    } else {
-                        entry.background.is_some()
-                    }
+                s.saved.get(&handle).is_some_and(|entry| match slot {
+                    BrushSlot::Background => entry.background.is_some(),
+                    BrushSlot::BorderBrush => entry.border_brush.is_some(),
+                    BrushSlot::FocusSecondary => entry.focus_secondary.is_some(),
+                    BrushSlot::Shadow => entry.shadow.is_some(),
                 })
             })
         })
     }
 
-    fn save_brush_slot_if_absent(handle: u64, is_border_brush: bool, val: SavedBrush) {
+    fn save_brush_slot_if_absent(handle: u64, slot: BrushSlot, val: SavedBrush) {
         let displaced = UI_BRUSH_STORE.with(|cell| {
             if let Ok(mut s) = cell.try_borrow_mut() {
                 let entry = s.saved.entry(handle).or_default();
-                let slot = if is_border_brush {
-                    &mut entry.border_brush
-                } else {
-                    &mut entry.background
+                let target = match slot {
+                    BrushSlot::Background => &mut entry.background,
+                    BrushSlot::BorderBrush => &mut entry.border_brush,
+                    BrushSlot::FocusSecondary => &mut entry.focus_secondary,
+                    BrushSlot::Shadow => &mut entry.shadow,
                 };
-                if slot.is_none() {
-                    *slot = Some(val);
+                if target.is_none() {
+                    *target = Some(val);
                     return None;
                 }
             }
             Some(val)
+        });
+        drop(displaced);
+    }
+
+    fn is_alttab_subtarget_tracked(key: u64) -> bool {
+        UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .is_some_and(|s| s.alttab_subtargets.contains_key(&key))
+        })
+    }
+
+    unsafe fn track_alttab_subtarget_weak(key: u64, kind: TargetKind, insp_ptr: *mut c_void) {
+        if key == 0 || insp_ptr.is_null() || is_alttab_subtarget_tracked(key) {
+            return;
+        }
+        let weak_src = qi_interface(insp_ptr, &IID_IWEAKREFERENCESOURCE);
+        if weak_src.is_null() {
+            return;
+        }
+        let src_iface = weak_src.as_ptr().cast::<RawIWeakReferenceSource>();
+        let mut weak_ref = ComRaw::null();
+        if ((*(*src_iface).lp_vtbl).get_weak_reference)(weak_src.as_ptr(), &mut weak_ref.0).is_err()
+            || weak_ref.is_null()
+        {
+            return;
+        }
+
+        let need_prune = UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .is_some_and(|s| s.alttab_subtargets.len() >= 256)
+        });
+        if need_prune {
+            let candidates: Vec<(u64, ComRaw)> = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .map(|s| {
+                        s.alttab_subtargets
+                            .iter()
+                            .map(|(&k, (_, w))| (k, w.clone_ref()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
+            let mut dead = Vec::new();
+            for (ck, wr_com) in candidates {
+                let wr = wr_com.as_ptr().cast::<RawIWeakReference>();
+                let mut resolved = ComRaw::null();
+                if ((*(*wr).lp_vtbl).resolve)(wr_com.as_ptr(), &IID_IINSPECTABLE, &mut resolved.0)
+                    .is_err()
+                    || resolved.is_null()
+                {
+                    dead.push(ck);
+                }
+            }
+            if !dead.is_empty() {
+                let removed = UI_BRUSH_STORE.with(|cell| {
+                    let Ok(mut s) = cell.try_borrow_mut() else {
+                        return Vec::new();
+                    };
+                    dead.iter()
+                        .filter_map(|k| s.alttab_subtargets.remove(k))
+                        .collect::<Vec<_>>()
+                });
+                drop(removed);
+                purge_saved_brushes_for_current_thread(&dead);
+            }
+        }
+
+        let displaced = UI_BRUSH_STORE.with(|cell| {
+            if let Ok(mut s) = cell.try_borrow_mut() {
+                if !s.alttab_subtargets.contains_key(&key) {
+                    s.alttab_subtargets.insert(key, (kind, weak_ref));
+                    return None;
+                }
+            }
+            Some(weak_ref)
+        });
+        drop(displaced);
+    }
+
+    fn unregister_watches_for_keys(keys: &[u64]) {
+        if keys.is_empty() {
+            return;
+        }
+        let removed_watches: Vec<PropWatchEntry> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            let mut watches = Vec::new();
+            if !s.watches.is_empty() {
+                for &k in keys {
+                    for prop_idx in 0u8..BrushPropKind::COUNT {
+                        if let Some(entry) = s.watches.remove(&(k, prop_idx)) {
+                            watches.push(entry);
+                        }
+                    }
+                }
+            }
+            watches
+        });
+        for entry in removed_watches {
+            unsafe {
+                unregister_watch_entry(entry);
+            }
+        }
+    }
+
+    unsafe fn make_weak_ref_com(insp_ptr: *mut c_void) -> Option<ComRaw> {
+        if insp_ptr.is_null() {
+            return None;
+        }
+        let weak_src = qi_interface(insp_ptr, &IID_IWEAKREFERENCESOURCE);
+        if weak_src.is_null() {
+            return None;
+        }
+        let src_iface = weak_src.as_ptr().cast::<RawIWeakReferenceSource>();
+        let mut weak_ref = ComRaw::null();
+        if ((*(*src_iface).lp_vtbl).get_weak_reference)(weak_src.as_ptr(), &mut weak_ref.0).is_ok()
+            && !weak_ref.is_null()
+        {
+            Some(weak_ref)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn resolve_weak_inspectable(weak_com: &ComRaw) -> Option<ComRaw> {
+        if weak_com.is_null() {
+            return None;
+        }
+        let wr = weak_com.as_ptr().cast::<RawIWeakReference>();
+        let mut insp = ComRaw::null();
+        if ((*(*wr).lp_vtbl).resolve)(weak_com.as_ptr(), &IID_IINSPECTABLE, &mut insp.0).is_ok()
+            && !insp.is_null()
+        {
+            Some(insp)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn track_tooltip_modified_target(
+        presenter_key: u64,
+        presenter_insp: *mut c_void,
+        parent_tooltip: Option<(u64, *mut c_void)>,
+    ) {
+        if presenter_key == 0 || presenter_insp.is_null() {
+            return;
+        }
+        let (already_exists, need_tooltip_fill, need_prune) = UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .map(|s| {
+                    let exists = s.tooltip_modified_targets.get(&presenter_key);
+                    let fill_tt = exists.is_some_and(|e| e.tooltip_weak.is_none())
+                        && parent_tooltip.is_some();
+                    (
+                        exists.is_some(),
+                        fill_tt,
+                        exists.is_none() && s.tooltip_modified_targets.len() >= 128,
+                    )
+                })
+                .unwrap_or((false, false, false))
+        });
+
+        if already_exists {
+            if need_tooltip_fill {
+                if let Some((tk, t_ptr)) = parent_tooltip {
+                    if let Some(t_weak) = make_weak_ref_com(t_ptr) {
+                        let rejected = UI_BRUSH_STORE.with(|cell| {
+                            if let Ok(mut s) = cell.try_borrow_mut() {
+                                if let Some(entry) =
+                                    s.tooltip_modified_targets.get_mut(&presenter_key)
+                                {
+                                    if entry.tooltip_weak.is_none() {
+                                        entry.tooltip_key = Some(tk);
+                                        entry.tooltip_weak = Some(t_weak);
+                                        return None;
+                                    }
+                                }
+                            }
+                            Some(t_weak)
+                        });
+                        drop(rejected);
+                    }
+                }
+            }
+            return;
+        }
+
+        if need_prune {
+            let candidates: Vec<(u64, ComRaw, Option<u64>, Option<ComRaw>)> = UI_BRUSH_STORE
+                .with(|cell| {
+                    cell.try_borrow()
+                        .ok()
+                        .map(|s| {
+                            s.tooltip_modified_targets
+                                .iter()
+                                .map(|(&k, e)| {
+                                    (
+                                        k,
+                                        e.presenter_weak.clone_ref(),
+                                        e.tooltip_key,
+                                        e.tooltip_weak.as_ref().map(ComRaw::clone_ref),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                });
+            let mut dead_entry_keys = Vec::new();
+            let mut dead_purge_keys = Vec::new();
+            for (pk, p_weak, tk_opt, t_weak_opt) in candidates {
+                let p_alive = resolve_weak_inspectable(&p_weak).is_some();
+                let t_alive = t_weak_opt
+                    .as_ref()
+                    .and_then(|tw| resolve_weak_inspectable(tw))
+                    .is_some();
+                if !p_alive && !t_alive {
+                    dead_entry_keys.push(pk);
+                    dead_purge_keys.push(pk);
+                    if let Some(tk) = tk_opt {
+                        dead_purge_keys.push(tk);
+                    }
+                }
+            }
+            if !dead_entry_keys.is_empty() {
+                let removed: Vec<TooltipTrackedEntry> = UI_BRUSH_STORE.with(|cell| {
+                    let Ok(mut s) = cell.try_borrow_mut() else {
+                        return Vec::new();
+                    };
+                    dead_entry_keys
+                        .iter()
+                        .filter_map(|k| s.tooltip_modified_targets.remove(k))
+                        .collect()
+                });
+                drop(removed);
+                purge_saved_brushes_for_current_thread(&dead_purge_keys);
+            }
+        }
+
+        let Some(presenter_weak) = make_weak_ref_com(presenter_insp) else {
+            return;
+        };
+        let (tooltip_key, tooltip_weak) = match parent_tooltip {
+            Some((tk, t_ptr)) => match make_weak_ref_com(t_ptr) {
+                Some(tw) => (Some(tk), Some(tw)),
+                None => (Some(tk), None),
+            },
+            None => (None, None),
+        };
+        let displaced = UI_BRUSH_STORE.with(|cell| {
+            if let Ok(mut s) = cell.try_borrow_mut() {
+                if !s.tooltip_modified_targets.contains_key(&presenter_key) {
+                    s.tooltip_modified_targets.insert(
+                        presenter_key,
+                        TooltipTrackedEntry {
+                            presenter_weak,
+                            tooltip_key,
+                            tooltip_weak,
+                        },
+                    );
+                    return None;
+                }
+            }
+            Some((presenter_weak, tooltip_weak))
         });
         drop(displaced);
     }
@@ -1927,15 +4478,30 @@ mod win {
                 let Ok(mut s) = cell.try_borrow_mut() else {
                     return (Vec::new(), Vec::new());
                 };
-                let brushes = if s.saved.is_empty() {
+                if !s.tooltip_orig_corner_radius.is_empty() {
+                    for &h in handles {
+                        s.tooltip_orig_corner_radius.remove(&h);
+                    }
+                }
+                let brushes: Vec<SavedTargetBrushes> = if s.saved.is_empty() {
                     Vec::new()
                 } else {
                     handles.iter().filter_map(|h| s.saved.remove(h)).collect()
                 };
+                if !s.alttab_item_orig_comp_visible.is_empty() {
+                    for &h in handles {
+                        s.alttab_item_orig_comp_visible.remove(&h);
+                    }
+                }
+                if !s.alttab_item_orig_focus_thickness.is_empty() {
+                    for &h in handles {
+                        s.alttab_item_orig_focus_thickness.remove(&h);
+                    }
+                }
                 let mut watches = Vec::new();
                 if !s.watches.is_empty() {
                     for &h in handles {
-                        for prop_idx in 0u8..3u8 {
+                        for prop_idx in 0u8..BrushPropKind::COUNT {
                             if let Some(entry) = s.watches.remove(&(h, prop_idx)) {
                                 watches.push(entry);
                             }
@@ -2008,26 +4574,60 @@ mod win {
         BorderBackground,
         BorderBrush,
         PanelBackground,
+        FocusVisualSecondaryBrush,
+        ElementShadow,
+        FocusVisualSecondaryThickness,
+        GridBorderBrush,
+        ContentPresenterBackground,
+        ContentPresenterBorderBrush,
+        ControlBackground,
+        ControlBorderBrush,
     }
 
     impl BrushPropKind {
+        const COUNT: u8 = 11;
+
         #[inline]
         fn key(self) -> u8 {
             match self {
                 Self::BorderBackground => 0,
                 Self::BorderBrush => 1,
                 Self::PanelBackground => 2,
+                Self::FocusVisualSecondaryBrush => 3,
+                Self::ElementShadow => 4,
+                Self::FocusVisualSecondaryThickness => 5,
+                Self::GridBorderBrush => 6,
+                Self::ContentPresenterBackground => 7,
+                Self::ContentPresenterBorderBrush => 8,
+                Self::ControlBackground => 9,
+                Self::ControlBorderBrush => 10,
             }
         }
 
         #[inline]
-        fn is_border_brush_slot(self) -> bool {
-            matches!(self, Self::BorderBrush)
+        fn brush_slot(self) -> BrushSlot {
+            match self {
+                Self::BorderBrush
+                | Self::GridBorderBrush
+                | Self::ContentPresenterBorderBrush
+                | Self::ControlBorderBrush => BrushSlot::BorderBrush,
+                Self::FocusVisualSecondaryBrush | Self::FocusVisualSecondaryThickness => {
+                    BrushSlot::FocusSecondary
+                }
+                Self::ElementShadow => BrushSlot::Shadow,
+                Self::BorderBackground
+                | Self::PanelBackground
+                | Self::ContentPresenterBackground
+                | Self::ControlBackground => BrushSlot::Background,
+            }
         }
 
         #[inline]
         fn allow_null_on_hide(self) -> bool {
-            matches!(self, Self::BorderBackground)
+            matches!(
+                self,
+                Self::BorderBackground | Self::FocusVisualSecondaryBrush
+            )
         }
 
         unsafe fn get(self, iface: *mut c_void) -> (HRESULT, ComRaw) {
@@ -2045,6 +4645,35 @@ mod win {
                     let p = iface.cast::<RawIPanel>();
                     ((*(*p).lp_vtbl).get_background)(iface, &mut cur.0)
                 }
+                Self::GridBorderBrush => {
+                    let g = iface.cast::<RawIGrid2>();
+                    ((*(*g).lp_vtbl).get_border_brush)(iface, &mut cur.0)
+                }
+                Self::ContentPresenterBackground => {
+                    let cp = iface.cast::<RawIContentPresenter4>();
+                    ((*(*cp).lp_vtbl).get_background)(iface, &mut cur.0)
+                }
+                Self::ContentPresenterBorderBrush => {
+                    let cp = iface.cast::<RawIContentPresenter4>();
+                    ((*(*cp).lp_vtbl).get_border_brush)(iface, &mut cur.0)
+                }
+                Self::ControlBackground => {
+                    let c = iface.cast::<RawIControl>();
+                    ((*(*c).lp_vtbl).get_background)(iface, &mut cur.0)
+                }
+                Self::ControlBorderBrush => {
+                    let c = iface.cast::<RawIControl>();
+                    ((*(*c).lp_vtbl).get_border_brush)(iface, &mut cur.0)
+                }
+                Self::FocusVisualSecondaryBrush => {
+                    let fe4 = iface.cast::<RawIFrameworkElement4>();
+                    ((*(*fe4).lp_vtbl).get_focus_visual_secondary_brush)(iface, &mut cur.0)
+                }
+                Self::ElementShadow => {
+                    let ui10 = iface.cast::<RawIUIElement10>();
+                    ((*(*ui10).lp_vtbl).get_shadow)(iface, &mut cur.0)
+                }
+                Self::FocusVisualSecondaryThickness => E_FAIL_HR,
             };
             (hr, cur)
         }
@@ -2063,6 +4692,35 @@ mod win {
                     let p = iface.cast::<RawIPanel>();
                     ((*(*p).lp_vtbl).put_background)(iface, brush)
                 }
+                Self::GridBorderBrush => {
+                    let g = iface.cast::<RawIGrid2>();
+                    ((*(*g).lp_vtbl).put_border_brush)(iface, brush)
+                }
+                Self::ContentPresenterBackground => {
+                    let cp = iface.cast::<RawIContentPresenter4>();
+                    ((*(*cp).lp_vtbl).put_background)(iface, brush)
+                }
+                Self::ContentPresenterBorderBrush => {
+                    let cp = iface.cast::<RawIContentPresenter4>();
+                    ((*(*cp).lp_vtbl).put_border_brush)(iface, brush)
+                }
+                Self::ControlBackground => {
+                    let c = iface.cast::<RawIControl>();
+                    ((*(*c).lp_vtbl).put_background)(iface, brush)
+                }
+                Self::ControlBorderBrush => {
+                    let c = iface.cast::<RawIControl>();
+                    ((*(*c).lp_vtbl).put_border_brush)(iface, brush)
+                }
+                Self::FocusVisualSecondaryBrush => {
+                    let fe4 = iface.cast::<RawIFrameworkElement4>();
+                    ((*(*fe4).lp_vtbl).put_focus_visual_secondary_brush)(iface, brush)
+                }
+                Self::ElementShadow => {
+                    let ui10 = iface.cast::<RawIUIElement10>();
+                    ((*(*ui10).lp_vtbl).put_shadow)(iface, brush)
+                }
+                Self::FocusVisualSecondaryThickness => E_FAIL_HR,
             }
         }
 
@@ -2083,42 +4741,187 @@ mod win {
                     |s, v| s.panel_bg_dp = Some(v),
                     fetch_panel_bg_dp,
                 ),
+                Self::GridBorderBrush => ensure_cached_com(
+                    |s| s.grid_border_brush_dp.as_ref(),
+                    |s, v| s.grid_border_brush_dp = Some(v),
+                    fetch_grid_border_brush_dp,
+                ),
+                Self::ContentPresenterBackground => ensure_cached_com(
+                    |s| s.content_presenter_bg_dp.as_ref(),
+                    |s, v| s.content_presenter_bg_dp = Some(v),
+                    fetch_content_presenter_bg_dp,
+                ),
+                Self::ContentPresenterBorderBrush => ensure_cached_com(
+                    |s| s.content_presenter_border_brush_dp.as_ref(),
+                    |s, v| s.content_presenter_border_brush_dp = Some(v),
+                    fetch_content_presenter_border_brush_dp,
+                ),
+                Self::ControlBackground => ensure_cached_com(
+                    |s| s.control_bg_dp.as_ref(),
+                    |s, v| s.control_bg_dp = Some(v),
+                    fetch_control_bg_dp,
+                ),
+                Self::ControlBorderBrush => ensure_cached_com(
+                    |s| s.control_border_brush_dp.as_ref(),
+                    |s, v| s.control_border_brush_dp = Some(v),
+                    fetch_control_border_brush_dp,
+                ),
+                Self::FocusVisualSecondaryBrush => ensure_cached_com(
+                    |s| s.focus_secondary_brush_dp.as_ref(),
+                    |s, v| s.focus_secondary_brush_dp = Some(v),
+                    fetch_focus_secondary_brush_dp,
+                ),
+                Self::ElementShadow => ensure_cached_com(
+                    |s| s.element_shadow_dp.as_ref(),
+                    |s, v| s.element_shadow_dp = Some(v),
+                    fetch_element_shadow_dp,
+                ),
+                Self::FocusVisualSecondaryThickness => ensure_cached_com(
+                    |s| s.focus_secondary_thickness_dp.as_ref(),
+                    |s, v| s.focus_secondary_thickness_dp = Some(v),
+                    fetch_focus_secondary_thickness_dp,
+                ),
             }
         }
     }
 
-    unsafe fn sync_overflow_brush_prop(
+    unsafe fn read_orig_shadow(
+        insp_ptr: *mut c_void,
+        dp: Option<&ComRaw>,
+        unset_val: Option<&ComRaw>,
+        current_shadow: &ComRaw,
+    ) -> Option<SavedBrush> {
+        if let (Some(dp_com), Some(unset_com)) = (dp, unset_val) {
+            let dep_com = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+            if !dep_com.is_null() {
+                let dep = dep_com.as_ptr().cast::<RawIDependencyObject>();
+                let mut local_val = ComRaw::null();
+                if ((*(*dep).lp_vtbl).read_local_value)(
+                    dep_com.as_ptr(),
+                    dp_com.as_ptr(),
+                    &mut local_val.0,
+                )
+                .is_ok()
+                    && !local_val.is_null()
+                {
+                    if com_same_identity(local_val.as_ptr(), unset_com.as_ptr()) {
+                        return Some(SavedBrush::Unset);
+                    }
+                    return Some(SavedBrush::Local(local_val));
+                }
+            }
+        }
+        if !current_shadow.is_null() {
+            Some(SavedBrush::Local(current_shadow.clone_ref()))
+        } else {
+            Some(SavedBrush::Unset)
+        }
+    }
+
+    unsafe fn sync_element_shadow_prop(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+        restored_saved: Option<SavedBrush>,
+        applied_flag: u32,
+        prefer_local_on_non_null: bool,
+    ) {
+        let ui10_com = qi_interface(insp_ptr, &IID_IUIELEMENT10);
+        if ui10_com.is_null() {
+            return;
+        }
+        let ui10 = ui10_com.as_ptr().cast::<RawIUIElement10>();
+        if desired_hide {
+            let mut cur_shadow = ComRaw::null();
+            let hr_get = ((*(*ui10).lp_vtbl).get_shadow)(ui10_com.as_ptr(), &mut cur_shadow.0);
+            if hr_get.is_err() || cur_shadow.is_null() {
+                return;
+            }
+            let captured = if !has_saved_brush_slot(handle, BrushSlot::Shadow) {
+                if prefer_local_on_non_null {
+                    Some(SavedBrush::Local(cur_shadow.clone_ref()))
+                } else {
+                    let dp = BrushPropKind::ElementShadow.dependency_property();
+                    let unset = ensure_cached_com(
+                        |s| s.unset_value.as_ref(),
+                        |s, v| s.unset_value = Some(v),
+                        fetch_unset_value,
+                    );
+                    read_orig_shadow(insp_ptr, dp.as_ref(), unset.as_ref(), &cur_shadow)
+                }
+            } else {
+                None
+            };
+            if {
+                let _sync_guard = PropSyncGuard::enter();
+                ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), null_mut()).is_ok()
+            } {
+                if let Some(orig) = captured {
+                    save_brush_slot_if_absent(handle, BrushSlot::Shadow, orig);
+                }
+                rt.diag_flags.fetch_or(applied_flag, Ordering::Relaxed);
+            }
+        } else {
+            let _sync_guard = PropSyncGuard::enter();
+            match restored_saved {
+                Some(SavedBrush::Local(orig)) => {
+                    let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), orig.as_ptr());
+                }
+                Some(SavedBrush::Unset) => {
+                    let dp = BrushPropKind::ElementShadow.dependency_property();
+                    if !clear_dp_value(insp_ptr, dp.as_ref()) {
+                        let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), null_mut());
+                    }
+                }
+                None => {
+                    if !prefer_local_on_non_null {
+                        let dp = BrushPropKind::ElementShadow.dependency_property();
+                        if !clear_dp_value(insp_ptr, dp.as_ref()) {
+                            let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), null_mut());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sync_overflow_brush_prop_with_mode(
         rt: &Arc<TapRuntime>,
         handle: u64,
         insp_ptr: *mut c_void,
         iface: *mut c_void,
         prop: BrushPropKind,
+        target_color: RawUiColor,
         desired_hide: bool,
         restored_saved: Option<SavedBrush>,
-    ) {
+        applied_flag: u32,
+        prefer_local_on_non_null: bool,
+    ) -> bool {
         if desired_hide {
             let (hr_get, cur) = prop.get(iface);
-            if hr_get.is_err() || is_transparent_solid_brush(cur.as_ptr()) {
-                return;
+            if hr_get.is_err() || is_solid_brush_with_color(cur.as_ptr(), target_color) {
+                return false;
             }
-            if !prop.allow_null_on_hide() && cur.is_null() {
-                return;
+            if !prop.allow_null_on_hide() && cur.is_null() && target_color.a == 0 {
+                return false;
             }
-            let Some(tb) = ensure_cached_com(
-                |s| s.trans_brush.as_ref(),
-                |s, v| s.trans_brush = Some(v),
-                fetch_transparent_brush,
-            ) else {
-                return;
+            let Some(tb) = cached_solid_brush(target_color) else {
+                return false;
             };
-            let captured = if !has_saved_brush_slot(handle, prop.is_border_brush_slot()) {
-                let dp = prop.dependency_property();
-                let unset = ensure_cached_com(
-                    |s| s.unset_value.as_ref(),
-                    |s, v| s.unset_value = Some(v),
-                    fetch_unset_value,
-                );
-                read_orig_brush(insp_ptr, dp.as_ref(), unset.as_ref(), &cur)
+            let captured = if !has_saved_brush_slot(handle, prop.brush_slot()) {
+                if prefer_local_on_non_null && !cur.is_null() {
+                    Some(SavedBrush::Local(cur.clone_ref()))
+                } else {
+                    let dp = prop.dependency_property();
+                    let unset = ensure_cached_com(
+                        |s| s.unset_value.as_ref(),
+                        |s, v| s.unset_value = Some(v),
+                        fetch_unset_value,
+                    );
+                    read_orig_brush(insp_ptr, dp.as_ref(), unset.as_ref(), &cur)
+                }
             } else {
                 None
             };
@@ -2127,34 +4930,72 @@ mod win {
                 prop.put(iface, tb.as_ptr()).is_ok()
             } {
                 if let Some(orig) = captured {
-                    save_brush_slot_if_absent(handle, prop.is_border_brush_slot(), orig);
+                    save_brush_slot_if_absent(handle, prop.brush_slot(), orig);
                 }
-                rt.diag_flags
-                    .fetch_or(DIAG_OVERFLOW_APPLIED, Ordering::Relaxed);
+                rt.diag_flags.fetch_or(applied_flag, Ordering::Relaxed);
+                return true;
             }
+            false
         } else {
             let _sync_guard = PropSyncGuard::enter();
             match restored_saved {
                 Some(SavedBrush::Local(orig)) => {
                     let _ = prop.put(iface, orig.as_ptr());
+                    true
                 }
                 Some(SavedBrush::Unset) => {
                     let dp = prop.dependency_property();
                     if !clear_dp_value(insp_ptr, dp.as_ref()) {
                         let _ = prop.put(iface, null_mut());
                     }
+                    true
                 }
                 None => {
+                    if prefer_local_on_non_null {
+                        return false;
+                    }
                     let (hr_get, cur) = prop.get(iface);
-                    if hr_get.is_ok() && is_transparent_solid_brush(cur.as_ptr()) {
+                    if hr_get.is_ok()
+                        && (is_transparent_solid_brush(cur.as_ptr())
+                            || is_solid_brush_with_color(cur.as_ptr(), target_color))
+                    {
                         let dp = prop.dependency_property();
                         if !clear_dp_value(insp_ptr, dp.as_ref()) {
                             let _ = prop.put(iface, null_mut());
                         }
+                        true
+                    } else {
+                        false
                     }
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn sync_overflow_brush_prop(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        iface: *mut c_void,
+        prop: BrushPropKind,
+        target_color: RawUiColor,
+        desired_hide: bool,
+        restored_saved: Option<SavedBrush>,
+        applied_flag: u32,
+    ) {
+        let _ = sync_overflow_brush_prop_with_mode(
+            rt,
+            handle,
+            insp_ptr,
+            iface,
+            prop,
+            target_color,
+            desired_hide,
+            restored_saved,
+            applied_flag,
+            false,
+        );
     }
 
     unsafe fn apply_shape_appearance(
@@ -2193,6 +5034,1778 @@ mod win {
         }
     }
 
+    unsafe fn measure_element_bounds_dip(
+        insp_ptr: *mut c_void,
+        min_w: f32,
+        min_h: f32,
+        min_opacity: f64,
+    ) -> Option<[f32; 4]> {
+        if insp_ptr.is_null() {
+            return None;
+        }
+        let ui_elem = qi_interface(insp_ptr, &IID_IUIELEMENT);
+        if ui_elem.is_null() {
+            return None;
+        }
+        let ui = ui_elem.as_ptr().cast::<RawIUIElement>();
+        let mut vis = VISIBILITY_COLLAPSED;
+        if ((*(*ui).lp_vtbl).get_visibility)(ui_elem.as_ptr(), &mut vis).is_err()
+            || vis != VISIBILITY_VISIBLE
+        {
+            return None;
+        }
+        let mut op = 0.0f64;
+        if ((*(*ui).lp_vtbl).get_opacity)(ui_elem.as_ptr(), &mut op).is_err()
+            || !op.is_finite()
+            || op <= min_opacity
+        {
+            return None;
+        }
+        if let Some(vth) = cached_visual_tree_helper() {
+            let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+            let mut cur_dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+            for hop in 0..32 {
+                if cur_dep.is_null() {
+                    return None;
+                }
+                let mut parent_dep = ComRaw::null();
+                if ((*(*vth_iface).lp_vtbl).get_parent)(
+                    vth.as_ptr(),
+                    cur_dep.as_ptr(),
+                    &mut parent_dep.0,
+                )
+                .is_err()
+                {
+                    return None;
+                }
+                if parent_dep.is_null() {
+                    if hop == 0 {
+                        return None;
+                    }
+                    break;
+                }
+                let p_ui = qi_interface(parent_dep.as_ptr(), &IID_IUIELEMENT);
+                if !p_ui.is_null() {
+                    let p_ui_iface = p_ui.as_ptr().cast::<RawIUIElement>();
+                    let mut p_vis = VISIBILITY_COLLAPSED;
+                    if ((*(*p_ui_iface).lp_vtbl).get_visibility)(p_ui.as_ptr(), &mut p_vis)
+                        .is_err()
+                        || p_vis != VISIBILITY_VISIBLE
+                    {
+                        return None;
+                    }
+                    let mut p_op = 0.0f64;
+                    if ((*(*p_ui_iface).lp_vtbl).get_opacity)(p_ui.as_ptr(), &mut p_op).is_err()
+                        || !p_op.is_finite()
+                        || p_op <= min_opacity
+                    {
+                        return None;
+                    }
+                }
+                cur_dep = parent_dep;
+            }
+        }
+        let mut sz = RawSize {
+            width: 0.0,
+            height: 0.0,
+        };
+        if ((*(*ui).lp_vtbl).get_render_size)(ui_elem.as_ptr(), &mut sz).is_err()
+            || !sz.width.is_finite()
+            || !sz.height.is_finite()
+            || sz.width < min_w
+            || sz.height < min_h
+        {
+            return None;
+        }
+        let mut gt_com = ComRaw::null();
+        if ((*(*ui).lp_vtbl).transform_to_visual)(ui_elem.as_ptr(), null_mut(), &mut gt_com.0)
+            .is_err()
+            || gt_com.is_null()
+        {
+            return None;
+        }
+        let gt = gt_com.as_ptr().cast::<RawIGeneralTransform>();
+        let mut p0 = RawPoint { x: 0.0, y: 0.0 };
+        let mut p1 = RawPoint { x: 0.0, y: 0.0 };
+        if ((*(*gt).lp_vtbl).transform_point)(
+            gt_com.as_ptr(),
+            RawPoint { x: 0.0, y: 0.0 },
+            &mut p0,
+        )
+        .is_err()
+            || ((*(*gt).lp_vtbl).transform_point)(
+                gt_com.as_ptr(),
+                RawPoint {
+                    x: sz.width,
+                    y: sz.height,
+                },
+                &mut p1,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        if !p0.x.is_finite()
+            || !p0.y.is_finite()
+            || !p1.x.is_finite()
+            || !p1.y.is_finite()
+            || (p1.x - p0.x) < min_w
+            || (p1.y - p0.y) < min_h
+        {
+            return None;
+        }
+        Some([p0.x, p0.y, p1.x, p1.y])
+    }
+
+    unsafe fn measure_hover_flyout_bounds_dip(insp_ptr: *mut c_void) -> Option<[f32; 4]> {
+        if let Some(bounds) = measure_element_bounds_dip(insp_ptr, 48.0, 36.0, 0.05) {
+            return Some(bounds);
+        }
+        let vth = cached_visual_tree_helper()?;
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+        if dep.is_null() {
+            return None;
+        }
+        let mut parent_dep = ComRaw::null();
+        if ((*(*vth_iface).lp_vtbl).get_parent)(vth.as_ptr(), dep.as_ptr(), &mut parent_dep.0)
+            .is_err()
+            || parent_dep.is_null()
+        {
+            return None;
+        }
+        if element_framework_name(parent_dep.as_ptr()).as_deref() == Some("HoverFlyoutGrid") {
+            return measure_element_bounds_dip(parent_dep.as_ptr(), 48.0, 36.0, 0.05);
+        }
+        None
+    }
+
+    unsafe fn measure_tooltip_bounds_dip(insp_ptr: *mut c_void) -> Option<[f32; 4]> {
+        if let Some(vth) = cached_visual_tree_helper() {
+            let dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+            if !dep.is_null() {
+                let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+                let mut parent_dep = ComRaw::null();
+                if ((*(*vth_iface).lp_vtbl).get_parent)(
+                    vth.as_ptr(),
+                    dep.as_ptr(),
+                    &mut parent_dep.0,
+                )
+                .is_ok()
+                    && !parent_dep.is_null()
+                {
+                    let tt_com = qi_interface(parent_dep.as_ptr(), &IID_ITOOLTIP);
+                    if !tt_com.is_null() {
+                        let tt = tt_com.as_ptr().cast::<RawIToolTip>();
+                        let mut is_open = 1u8;
+                        if ((*(*tt).lp_vtbl).get_is_open)(tt_com.as_ptr(), &mut is_open).is_ok()
+                            && is_open == 0
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        measure_element_bounds_dip(insp_ptr, 20.0, 16.0, 0.05)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn apply_border_target_appearance(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        kind: TargetKind,
+        bg_color: RawUiColor,
+        border_color: RawUiColor,
+        desired_hide: bool,
+        applied_flag: u32,
+    ) {
+        let border_com = qi_interface(insp_ptr, &IID_IBORDER);
+        if border_com.is_null() {
+            return;
+        }
+        let saved = if desired_hide {
+            SavedTargetBrushes::default()
+        } else {
+            take_saved_target_brushes(handle)
+        };
+        sync_overflow_brush_prop(
+            rt,
+            handle,
+            insp_ptr,
+            border_com.as_ptr(),
+            BrushPropKind::BorderBackground,
+            bg_color,
+            desired_hide,
+            saved.background,
+            applied_flag,
+        );
+        sync_overflow_brush_prop(
+            rt,
+            handle,
+            insp_ptr,
+            border_com.as_ptr(),
+            BrushPropKind::BorderBrush,
+            border_color,
+            desired_hide,
+            saved.border_brush,
+            applied_flag,
+        );
+        if desired_hide {
+            rt.diag_flags.fetch_or(applied_flag, Ordering::Relaxed);
+            ensure_prop_watch_registered(
+                rt,
+                handle,
+                kind,
+                BrushPropKind::BorderBackground,
+                insp_ptr,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                handle,
+                kind,
+                BrushPropKind::BorderBrush,
+                insp_ptr,
+            );
+        }
+    }
+
+    unsafe fn sync_focus_secondary_thickness_prop(
+        rt: &Arc<TapRuntime>,
+        key: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+        allow_clear_dp: bool,
+    ) {
+        let fe4_com = qi_interface(insp_ptr, &IID_IFRAMEWORKELEMENT4);
+        if fe4_com.is_null() {
+            return;
+        }
+        let fe4 = fe4_com.as_ptr().cast::<RawIFrameworkElement4>();
+        if desired_hide {
+            let mut cur_thick = RawThickness::default();
+            let hr_get = ((*(*fe4).lp_vtbl).get_focus_visual_secondary_thickness)(
+                fe4_com.as_ptr(),
+                &mut cur_thick,
+            );
+            let zero = RawThickness::default();
+            if hr_get.is_ok() && !approx_eq_thickness(cur_thick, zero) {
+                UI_BRUSH_STORE.with(|cell| {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.alttab_item_orig_focus_thickness
+                            .entry(key)
+                            .or_insert(cur_thick);
+                    }
+                });
+            }
+            if hr_get.is_err() || !approx_eq_thickness(cur_thick, zero) {
+                let _sync_guard = PropSyncGuard::enter();
+                if ((*(*fe4).lp_vtbl).put_focus_visual_secondary_thickness)(
+                    fe4_com.as_ptr(),
+                    zero,
+                )
+                .is_ok()
+                {
+                    rt.diag_flags
+                        .fetch_or(DIAG_ALTTAB_FOCUS_APPLIED, Ordering::Relaxed);
+                }
+            }
+        } else {
+            let saved_thick = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.alttab_item_orig_focus_thickness.remove(&key))
+            });
+            let _sync_guard = PropSyncGuard::enter();
+            let cleared = allow_clear_dp
+                && clear_dp_value(
+                    insp_ptr,
+                    BrushPropKind::FocusVisualSecondaryThickness
+                        .dependency_property()
+                        .as_ref(),
+                );
+            if !cleared {
+                if let Some(orig) = saved_thick {
+                    let _ = ((*(*fe4).lp_vtbl).put_focus_visual_secondary_thickness)(
+                        fe4_com.as_ptr(),
+                        orig,
+                    );
+                }
+            }
+        }
+    }
+
+    unsafe fn apply_focus_secondary_appearance(
+        rt: &Arc<TapRuntime>,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        if insp_ptr.is_null() {
+            return;
+        }
+        let key = com_identity_key(insp_ptr);
+        let fe4_com = qi_interface(insp_ptr, &IID_IFRAMEWORKELEMENT4);
+        if fe4_com.is_null() {
+            return;
+        }
+        if desired_hide {
+            track_alttab_subtarget_weak(key, TargetKind::AltTabItemFocus, insp_ptr);
+            sync_focus_secondary_thickness_prop(rt, key, insp_ptr, true, true);
+            sync_overflow_brush_prop(
+                rt,
+                key,
+                insp_ptr,
+                fe4_com.as_ptr(),
+                BrushPropKind::FocusVisualSecondaryBrush,
+                RawUiColor::TRANSPARENT,
+                true,
+                None,
+                DIAG_ALTTAB_FOCUS_APPLIED,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                key,
+                TargetKind::AltTabItemFocus,
+                BrushPropKind::FocusVisualSecondaryBrush,
+                insp_ptr,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                key,
+                TargetKind::AltTabItemFocus,
+                BrushPropKind::FocusVisualSecondaryThickness,
+                insp_ptr,
+            );
+        } else {
+            let saved = take_saved_target_brushes(key);
+            sync_focus_secondary_thickness_prop(rt, key, insp_ptr, false, true);
+            sync_overflow_brush_prop(
+                rt,
+                key,
+                insp_ptr,
+                fe4_com.as_ptr(),
+                BrushPropKind::FocusVisualSecondaryBrush,
+                RawUiColor::TRANSPARENT,
+                false,
+                saved.focus_secondary,
+                DIAG_ALTTAB_FOCUS_APPLIED,
+            );
+        }
+    }
+
+    #[inline]
+    fn approx_eq_thickness(a: RawThickness, b: RawThickness) -> bool {
+        (a.left - b.left).abs() <= 1e-3
+            && (a.top - b.top).abs() <= 1e-3
+            && (a.right - b.right).abs() <= 1e-3
+            && (a.bottom - b.bottom).abs() <= 1e-3
+    }
+
+    #[inline]
+    fn approx_eq_corner_radius(a: RawCornerRadius, b: RawCornerRadius) -> bool {
+        (a.top_left - b.top_left).abs() <= 1e-3
+            && (a.top_right - b.top_right).abs() <= 1e-3
+            && (a.bottom_right - b.bottom_right).abs() <= 1e-3
+            && (a.bottom_left - b.bottom_left).abs() <= 1e-3
+    }
+
+    unsafe fn set_element_framework_name(ptr: *mut c_void, name: &str) -> bool {
+        let fe_com = qi_interface(ptr, &IID_IFRAMEWORKELEMENT);
+        if fe_com.is_null() {
+            return false;
+        }
+        let fe = fe_com.as_ptr().cast::<RawIFrameworkElement>();
+        let hs = HSTRING::from(name);
+        let abi_hs: core::mem::MaybeUninit<HSTRING> = core::mem::transmute_copy(&hs);
+        let ok = ((*(*fe).lp_vtbl).put_name)(fe_com.as_ptr(), abi_hs).is_ok();
+        drop(hs);
+        ok
+    }
+
+    unsafe fn sync_overlay_border_geometry(src_insp: *mut c_void, dst_insp: *mut c_void) {
+        let src_border_com = qi_interface(src_insp, &IID_IBORDER);
+        let dst_border_com = qi_interface(dst_insp, &IID_IBORDER);
+        if !src_border_com.is_null() && !dst_border_com.is_null() {
+            let src_b = src_border_com.as_ptr().cast::<RawIBorder>();
+            let dst_b = dst_border_com.as_ptr().cast::<RawIBorder>();
+
+            let mut src_bt = RawThickness::default();
+            let mut dst_bt = RawThickness::default();
+            if ((*(*src_b).lp_vtbl).get_border_thickness)(src_border_com.as_ptr(), &mut src_bt)
+                .is_ok()
+                && (((*(*dst_b).lp_vtbl).get_border_thickness)(
+                    dst_border_com.as_ptr(),
+                    &mut dst_bt,
+                )
+                .is_err()
+                    || !approx_eq_thickness(src_bt, dst_bt))
+            {
+                let _ = ((*(*dst_b).lp_vtbl).put_border_thickness)(dst_border_com.as_ptr(), src_bt);
+            }
+
+            let mut src_cr = RawCornerRadius::default();
+            let mut dst_cr = RawCornerRadius::default();
+            if ((*(*src_b).lp_vtbl).get_corner_radius)(src_border_com.as_ptr(), &mut src_cr).is_ok()
+                && (((*(*dst_b).lp_vtbl).get_corner_radius)(dst_border_com.as_ptr(), &mut dst_cr)
+                    .is_err()
+                    || !approx_eq_corner_radius(src_cr, dst_cr))
+            {
+                let _ = ((*(*dst_b).lp_vtbl).put_corner_radius)(dst_border_com.as_ptr(), src_cr);
+            }
+        }
+
+        let src_fe_com = qi_interface(src_insp, &IID_IFRAMEWORKELEMENT);
+        let dst_fe_com = qi_interface(dst_insp, &IID_IFRAMEWORKELEMENT);
+        if !src_fe_com.is_null() && !dst_fe_com.is_null() {
+            let src_fe = src_fe_com.as_ptr().cast::<RawIFrameworkElement>();
+            let dst_fe = dst_fe_com.as_ptr().cast::<RawIFrameworkElement>();
+            let mut src_margin = RawThickness::default();
+            let mut dst_margin = RawThickness::default();
+            if ((*(*src_fe).lp_vtbl).get_margin)(src_fe_com.as_ptr(), &mut src_margin).is_ok()
+                && (((*(*dst_fe).lp_vtbl).get_margin)(dst_fe_com.as_ptr(), &mut dst_margin)
+                    .is_err()
+                    || !approx_eq_thickness(src_margin, dst_margin))
+            {
+                let _ = ((*(*dst_fe).lp_vtbl).put_margin)(dst_fe_com.as_ptr(), src_margin);
+            }
+        }
+    }
+
+    unsafe fn sync_overlay_border_brushes(
+        dst_border_ptr: *mut c_void,
+        bg_color: RawUiColor,
+        border_color: RawUiColor,
+    ) {
+        let dst_b = dst_border_ptr.cast::<RawIBorder>();
+
+        let mut cur_bg = ComRaw::null();
+        if ((*(*dst_b).lp_vtbl).get_background)(dst_border_ptr, &mut cur_bg.0).is_err()
+            || !is_solid_brush_with_color(cur_bg.as_ptr(), bg_color)
+        {
+            if let Some(tb) = cached_solid_brush(bg_color) {
+                let _ = ((*(*dst_b).lp_vtbl).put_background)(dst_border_ptr, tb.as_ptr());
+            }
+        }
+
+        let mut cur_bb = ComRaw::null();
+        if ((*(*dst_b).lp_vtbl).get_border_brush)(dst_border_ptr, &mut cur_bb.0).is_err()
+            || !is_solid_brush_with_color(cur_bb.as_ptr(), border_color)
+        {
+            if let Some(tb) = cached_solid_brush(border_color) {
+                let _ = ((*(*dst_b).lp_vtbl).put_border_brush)(dst_border_ptr, tb.as_ptr());
+            }
+        }
+    }
+
+    unsafe fn activate_alttab_overlay_border() -> Option<ComRaw> {
+        let class_id = HSTRING::from("Windows.UI.Xaml.Controls.Border");
+        let insp: IInspectable = RoActivateInstance(&class_id).ok()?;
+        let raw = insp.into_raw();
+        (!raw.is_null()).then_some(ComRaw(raw))
+    }
+
+    enum ParentPanelLookup {
+        Panel(ComRaw),
+        Detached,
+        NonPanel,
+    }
+
+    unsafe fn resolve_parent_panel(
+        bg_border_insp: *mut c_void,
+        parent_hint: Option<*mut c_void>,
+    ) -> ParentPanelLookup {
+        if let Some(p) = parent_hint.filter(|p| !p.is_null()) {
+            let panel_com = qi_interface(p, &IID_IPANEL);
+            return if panel_com.is_null() {
+                ParentPanelLookup::NonPanel
+            } else {
+                ParentPanelLookup::Panel(panel_com)
+            };
+        }
+        let Some(vth) = cached_visual_tree_helper() else {
+            return ParentPanelLookup::Detached;
+        };
+        let dep = qi_interface(bg_border_insp, &IID_IDEPENDENCYOBJECT);
+        if dep.is_null() {
+            return ParentPanelLookup::Detached;
+        }
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let mut parent_dep = ComRaw::null();
+        if ((*(*vth_iface).lp_vtbl).get_parent)(vth.as_ptr(), dep.as_ptr(), &mut parent_dep.0)
+            .is_err()
+            || parent_dep.is_null()
+        {
+            return ParentPanelLookup::Detached;
+        }
+        let panel_com = qi_interface(parent_dep.as_ptr(), &IID_IPANEL);
+        if panel_com.is_null() {
+            ParentPanelLookup::NonPanel
+        } else {
+            ParentPanelLookup::Panel(panel_com)
+        }
+    }
+
+    unsafe fn find_overlay_in_panel_children(children_ptr: *mut c_void) -> Option<ComRaw> {
+        let vec = children_ptr.cast::<RawIUIElementVector>();
+        let mut count = 0u32;
+        if ((*(*vec).lp_vtbl).get_size)(children_ptr, &mut count).is_err() {
+            return None;
+        }
+        for i in 0..count.min(64) {
+            let mut child = ComRaw::null();
+            if ((*(*vec).lp_vtbl).get_at)(children_ptr, i, &mut child.0).is_ok()
+                && !child.is_null()
+                && element_framework_name(child.as_ptr()).as_deref()
+                    == Some(ALTTAB_ITEM_OVERLAY_NAME)
+            {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    unsafe fn remove_all_overlays_in_panel_children(children_ptr: *mut c_void) {
+        let vec = children_ptr.cast::<RawIUIElementVector>();
+        let mut count = 0u32;
+        if ((*(*vec).lp_vtbl).get_size)(children_ptr, &mut count).is_err() {
+            return;
+        }
+        for i in (0..count.min(64)).rev() {
+            let mut child = ComRaw::null();
+            if ((*(*vec).lp_vtbl).get_at)(children_ptr, i, &mut child.0).is_ok()
+                && !child.is_null()
+                && element_framework_name(child.as_ptr()).as_deref()
+                    == Some(ALTTAB_ITEM_OVERLAY_NAME)
+            {
+                let _ = ((*(*vec).lp_vtbl).remove_at)(children_ptr, i);
+            }
+        }
+    }
+
+    unsafe fn record_and_hide_alttab_item_visual(key: u64, bg_border_insp: *mut c_void) -> bool {
+        let Some(ecp) = cached_element_composition_preview() else {
+            return false;
+        };
+        let ui_elem = qi_interface(bg_border_insp, &IID_IUIELEMENT);
+        if ui_elem.is_null() {
+            return false;
+        }
+        let ecp_iface = ecp.as_ptr().cast::<RawIElementCompositionPreviewStatics>();
+        let mut vis_com = ComRaw::null();
+        if ((*(*ecp_iface).lp_vtbl).get_element_visual)(
+            ecp.as_ptr(),
+            ui_elem.as_ptr(),
+            &mut vis_com.0,
+        )
+        .is_err()
+            || vis_com.is_null()
+        {
+            return false;
+        }
+        let vis = vis_com.as_ptr().cast::<RawIVisual>();
+        let mut cur_vis = 1u8;
+        let hr_get = ((*(*vis).lp_vtbl).get_is_visible)(vis_com.as_ptr(), &mut cur_vis);
+
+        UI_BRUSH_STORE.with(|cell| {
+            if let Ok(mut s) = cell.try_borrow_mut() {
+                if !s.alttab_item_orig_comp_visible.contains_key(&key) {
+                    let orig_vis = if hr_get.is_ok() && cur_vis != 0 {
+                        cur_vis
+                    } else {
+                        1u8
+                    };
+                    s.alttab_item_orig_comp_visible.insert(key, orig_vis);
+                }
+            }
+        });
+
+        if hr_get.is_err() || cur_vis != 0 {
+            ((*(*vis).lp_vtbl).put_is_visible)(vis_com.as_ptr(), 0u8).is_ok()
+        } else {
+            true
+        }
+    }
+
+    unsafe fn restore_alttab_item_visual(key: u64, bg_border_insp: *mut c_void) {
+        let saved_vis = UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow_mut()
+                .ok()
+                .and_then(|mut s| s.alttab_item_orig_comp_visible.remove(&key))
+        });
+        let Some(ecp) = cached_element_composition_preview() else {
+            return;
+        };
+        let ui_elem = qi_interface(bg_border_insp, &IID_IUIELEMENT);
+        if ui_elem.is_null() {
+            return;
+        }
+        let ecp_iface = ecp.as_ptr().cast::<RawIElementCompositionPreviewStatics>();
+        let mut vis_com = ComRaw::null();
+        if ((*(*ecp_iface).lp_vtbl).get_element_visual)(
+            ecp.as_ptr(),
+            ui_elem.as_ptr(),
+            &mut vis_com.0,
+        )
+        .is_err()
+            || vis_com.is_null()
+        {
+            return;
+        }
+        let vis = vis_com.as_ptr().cast::<RawIVisual>();
+        let mut cur_vis = 1u8;
+        let hr_get = ((*(*vis).lp_vtbl).get_is_visible)(vis_com.as_ptr(), &mut cur_vis);
+        if saved_vis.is_some() || (hr_get.is_ok() && cur_vis == 0) {
+            let target_vis = saved_vis.unwrap_or(1u8);
+            if hr_get.is_err() || cur_vis != target_vis {
+                let _ = ((*(*vis).lp_vtbl).put_is_visible)(vis_com.as_ptr(), target_vis);
+            }
+        }
+    }
+
+    fn has_saved_fallback_brushes(key: u64) -> bool {
+        UI_BRUSH_STORE.with(|cell| {
+            cell.try_borrow().ok().is_some_and(|s| {
+                s.saved.contains_key(&key)
+                    || s.watches.contains_key(&(key, 0))
+                    || s.watches.contains_key(&(key, 1))
+            })
+        })
+    }
+
+    unsafe fn apply_alttab_item_border_appearance(
+        rt: &Arc<TapRuntime>,
+        bg_border_insp: *mut c_void,
+        parent_hint: Option<*mut c_void>,
+        bg_color: RawUiColor,
+        border_color: RawUiColor,
+        desired_hide: bool,
+    ) {
+        if bg_border_insp.is_null() {
+            return;
+        }
+        let key = com_identity_key(bg_border_insp);
+        if desired_hide {
+            track_alttab_subtarget_weak(key, TargetKind::AltTabItemBorder, bg_border_insp);
+            match resolve_parent_panel(bg_border_insp, parent_hint) {
+                ParentPanelLookup::Detached => return,
+                ParentPanelLookup::Panel(panel_com) => {
+                    if let Some(vth) = cached_visual_tree_helper() {
+                        let root_dep = qi_interface(panel_com.as_ptr(), &IID_IDEPENDENCYOBJECT);
+                        if !root_dep.is_null() {
+                            let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+                            let mut lv_dep = ComRaw::null();
+                            if ((*(*vth_iface).lp_vtbl).get_parent)(
+                                vth.as_ptr(),
+                                root_dep.as_ptr(),
+                                &mut lv_dep.0,
+                            )
+                            .is_ok()
+                                && !lv_dep.is_null()
+                            {
+                                apply_focus_secondary_appearance(rt, lv_dep.as_ptr(), true);
+                            }
+                        }
+                    }
+                    let panel = panel_com.as_ptr().cast::<RawIPanel>();
+                    let mut children_com = ComRaw::null();
+                    if ((*(*panel).lp_vtbl).get_children)(panel_com.as_ptr(), &mut children_com.0)
+                        .is_ok()
+                        && !children_com.is_null()
+                    {
+                        let overlay_ready = if let Some(existing) =
+                            find_overlay_in_panel_children(children_com.as_ptr())
+                        {
+                            sync_overlay_border_geometry(bg_border_insp, existing.as_ptr());
+                            let ov_border = qi_interface(existing.as_ptr(), &IID_IBORDER);
+                            if !ov_border.is_null() {
+                                sync_overlay_border_brushes(
+                                    ov_border.as_ptr(),
+                                    bg_color,
+                                    border_color,
+                                );
+                            }
+                            true
+                        } else if let Some(overlay) = activate_alttab_overlay_border() {
+                            let _ = set_element_framework_name(
+                                overlay.as_ptr(),
+                                ALTTAB_ITEM_OVERLAY_NAME,
+                            );
+                            let ov_ui = qi_interface(overlay.as_ptr(), &IID_IUIELEMENT);
+                            if !ov_ui.is_null() {
+                                let ui_iface = ov_ui.as_ptr().cast::<RawIUIElement>();
+                                let _ = ((*(*ui_iface).lp_vtbl).put_is_hit_test_visible)(
+                                    ov_ui.as_ptr(),
+                                    0u8,
+                                );
+                            }
+                            sync_overlay_border_geometry(bg_border_insp, overlay.as_ptr());
+                            let ov_border = qi_interface(overlay.as_ptr(), &IID_IBORDER);
+                            if !ov_border.is_null() {
+                                sync_overlay_border_brushes(
+                                    ov_border.as_ptr(),
+                                    bg_color,
+                                    border_color,
+                                );
+                            }
+                            if !ov_ui.is_null() {
+                                let vec = children_com.as_ptr().cast::<RawIUIElementVector>();
+                                ((*(*vec).lp_vtbl).insert_at)(
+                                    children_com.as_ptr(),
+                                    0,
+                                    ov_ui.as_ptr(),
+                                )
+                                .is_ok()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if overlay_ready {
+                            if record_and_hide_alttab_item_visual(key, bg_border_insp) {
+                                rt.diag_flags
+                                    .fetch_or(DIAG_ALTTAB_ITEM_APPLIED, Ordering::Relaxed);
+                                return;
+                            }
+                            remove_all_overlays_in_panel_children(children_com.as_ptr());
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                ParentPanelLookup::NonPanel => {}
+            }
+
+            apply_border_target_appearance(
+                rt,
+                key,
+                bg_border_insp,
+                TargetKind::AltTabItemBorder,
+                bg_color,
+                border_color,
+                true,
+                DIAG_ALTTAB_ITEM_APPLIED,
+            );
+        } else {
+            if let ParentPanelLookup::Panel(panel_com) =
+                resolve_parent_panel(bg_border_insp, parent_hint)
+            {
+                let panel = panel_com.as_ptr().cast::<RawIPanel>();
+                let mut children_com = ComRaw::null();
+                if ((*(*panel).lp_vtbl).get_children)(panel_com.as_ptr(), &mut children_com.0)
+                    .is_ok()
+                    && !children_com.is_null()
+                {
+                    remove_all_overlays_in_panel_children(children_com.as_ptr());
+                }
+            }
+            restore_alttab_item_visual(key, bg_border_insp);
+            if has_saved_fallback_brushes(key) {
+                apply_border_target_appearance(
+                    rt,
+                    key,
+                    bg_border_insp,
+                    TargetKind::AltTabItemBorder,
+                    bg_color,
+                    border_color,
+                    false,
+                    DIAG_ALTTAB_ITEM_APPLIED,
+                );
+            }
+        }
+    }
+
+    unsafe fn sync_alttab_subtree_items(
+        rt: &Arc<TapRuntime>,
+        bg_element_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        if bg_element_ptr.is_null() {
+            return;
+        }
+        let Some(vth) = cached_visual_tree_helper() else {
+            return;
+        };
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let root_insp = qi_interface(bg_element_ptr, &IID_IINSPECTABLE);
+        if root_insp.is_null() {
+            return;
+        }
+
+        let bg_color = RawUiColor::from_argb(rt.alt_tab_item_bg_argb.load(Ordering::Acquire));
+        let border_color =
+            RawUiColor::from_argb(rt.alt_tab_item_border_argb.load(Ordering::Acquire));
+
+        let mut queue: VecDeque<(ComRaw, Option<ComRaw>, Option<ComRaw>)> = VecDeque::new();
+        queue.push_back((root_insp, None, None));
+        let mut visited = 0usize;
+
+        while let Some((node_com, parent_com, gp_com)) = queue.pop_front() {
+            if visited >= 600 {
+                break;
+            }
+            visited += 1;
+
+            let cls_name = element_runtime_class_name(node_com.as_ptr());
+            let elem_name = element_framework_name(node_com.as_ptr());
+
+            if elem_name.as_deref() == Some(ALTTAB_ITEM_OVERLAY_NAME) {
+                continue;
+            }
+
+            if cls_name.as_deref().is_some_and(|c| c.contains("ListViewItem")) {
+                apply_focus_secondary_appearance(rt, node_com.as_ptr(), desired_hide);
+            }
+
+            if elem_name.as_deref() == Some("BackgroundBorder")
+                && !qi_interface(node_com.as_ptr(), &IID_IBORDER).is_null()
+            {
+                apply_alttab_item_border_appearance(
+                    rt,
+                    node_com.as_ptr(),
+                    parent_com.as_ref().map(ComRaw::as_ptr),
+                    bg_color,
+                    border_color,
+                    desired_hide,
+                );
+                if let Some(ref gp) = gp_com {
+                    let gp_key = com_identity_key(gp.as_ptr());
+                    if !is_alttab_subtarget_tracked(gp_key) {
+                        apply_focus_secondary_appearance(rt, gp.as_ptr(), desired_hide);
+                    }
+                }
+                continue;
+            }
+
+            let skip_children = elem_name
+                .as_deref()
+                .is_some_and(|n| matches!(n, "ThumbnailHost" | "CloseButton"))
+                || cls_name.as_deref().is_some_and(|c| {
+                    c.contains("SwitchItemControl")
+                        || c.contains("SwitchItemElement")
+                        || c.contains("Button")
+                        || c.contains("ScrollBar")
+                });
+            if skip_children {
+                continue;
+            }
+
+            let dep = qi_interface(node_com.as_ptr(), &IID_IDEPENDENCYOBJECT);
+            if dep.is_null() {
+                continue;
+            }
+            let mut count = 0i32;
+            if ((*(*vth_iface).lp_vtbl).get_children_count)(vth.as_ptr(), dep.as_ptr(), &mut count)
+                .is_err()
+                || count <= 0
+            {
+                continue;
+            }
+            for i in 0..count.min(128) {
+                let mut child_dep = ComRaw::null();
+                if ((*(*vth_iface).lp_vtbl).get_child)(
+                    vth.as_ptr(),
+                    dep.as_ptr(),
+                    i,
+                    &mut child_dep.0,
+                )
+                .is_ok()
+                    && !child_dep.is_null()
+                {
+                    queue.push_back((
+                        child_dep,
+                        Some(node_com.clone_ref()),
+                        parent_com.as_ref().map(ComRaw::clone_ref),
+                    ));
+                }
+            }
+        }
+    }
+
+    unsafe fn restore_all_alttab_subtargets_for_current_thread(rt: &Arc<TapRuntime>) {
+        let entries: Vec<(u64, TargetKind, ComRaw)> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            s.alttab_subtargets
+                .drain()
+                .map(|(k, (kind, weak_obj))| (k, kind, weak_obj))
+                .collect()
+        });
+        if entries.is_empty() {
+            return;
+        }
+        let bg_color = RawUiColor::from_argb(rt.alt_tab_item_bg_argb.load(Ordering::Acquire));
+        let border_color =
+            RawUiColor::from_argb(rt.alt_tab_item_border_argb.load(Ordering::Acquire));
+        let mut keys = Vec::with_capacity(entries.len());
+        for (key, kind, weak_com) in entries {
+            keys.push(key);
+            let wr = weak_com.as_ptr().cast::<RawIWeakReference>();
+            let mut insp = ComRaw::null();
+            if ((*(*wr).lp_vtbl).resolve)(weak_com.as_ptr(), &IID_IINSPECTABLE, &mut insp.0)
+                .is_ok()
+                && !insp.is_null()
+            {
+                match kind {
+                    TargetKind::AltTabItemBorder => {
+                        apply_alttab_item_border_appearance(
+                            rt,
+                            insp.as_ptr(),
+                            None,
+                            bg_color,
+                            border_color,
+                            false,
+                        );
+                    }
+                    TargetKind::AltTabItemFocus => {
+                        apply_focus_secondary_appearance(rt, insp.as_ptr(), false);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        purge_saved_brushes_for_current_thread(&keys);
+    }
+
+    unsafe fn sync_hover_flyout_bg_shapes(
+        rt: &Arc<TapRuntime>,
+        bg_border_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        if bg_border_ptr.is_null() {
+            return;
+        }
+        let Some(vth) = cached_visual_tree_helper() else {
+            return;
+        };
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let root_insp = qi_interface(bg_border_ptr, &IID_IINSPECTABLE);
+        if root_insp.is_null() {
+            return;
+        }
+
+        let mut queue: VecDeque<ComRaw> = VecDeque::new();
+        queue.push_back(root_insp);
+        let mut visited = 0usize;
+
+        while let Some(node_com) = queue.pop_front() {
+            if visited >= 32 {
+                break;
+            }
+            visited += 1;
+
+            let elem_name = element_framework_name(node_com.as_ptr());
+            if elem_name
+                .as_deref()
+                .is_some_and(|n| matches!(n, "BackgroundFill" | "BackgroundStroke" | "ScreenEdgeStroke"))
+            {
+                let key = com_identity_key(node_com.as_ptr());
+                let cached_orig = UI_BRUSH_STORE.with(|cell| {
+                    cell.try_borrow()
+                        .ok()
+                        .and_then(|s| s.hover_flyout_shapes.get(&key).map(|(_, op, vis)| (*op, *vis)))
+                });
+                let (orig_opacity, orig_visibility) = if let Some(pair) = cached_orig {
+                    pair
+                } else {
+                    let mut orig_op = 1.0f64;
+                    let mut orig_vis = VISIBILITY_VISIBLE;
+                    let ui_elem = qi_interface(node_com.as_ptr(), &IID_IUIELEMENT);
+                    if !ui_elem.is_null() {
+                        let ui = ui_elem.as_ptr().cast::<RawIUIElement>();
+                        if ((*(*ui).lp_vtbl).get_opacity)(ui_elem.as_ptr(), &mut orig_op).is_err()
+                            || !orig_op.is_finite()
+                            || orig_op <= 0.01
+                        {
+                            orig_op = 1.0;
+                        }
+                        if ((*(*ui).lp_vtbl).get_visibility)(ui_elem.as_ptr(), &mut orig_vis).is_err() {
+                            orig_vis = VISIBILITY_VISIBLE;
+                        }
+                    }
+                    if desired_hide {
+                        let weak_src = qi_interface(node_com.as_ptr(), &IID_IWEAKREFERENCESOURCE);
+                        if !weak_src.is_null() {
+                            let src_iface = weak_src.as_ptr().cast::<RawIWeakReferenceSource>();
+                            let mut weak_ref = ComRaw::null();
+                            if ((*(*src_iface).lp_vtbl).get_weak_reference)(
+                                weak_src.as_ptr(),
+                                &mut weak_ref.0,
+                            )
+                            .is_ok()
+                                && !weak_ref.is_null()
+                            {
+                                let displaced = UI_BRUSH_STORE.with(|cell| {
+                                    if let Ok(mut s) = cell.try_borrow_mut() {
+                                        if !s.hover_flyout_shapes.contains_key(&key) {
+                                            if s.hover_flyout_shapes.len() >= 64 {
+                                                let dead: Vec<u64> = s
+                                                    .hover_flyout_shapes
+                                                    .iter()
+                                                    .filter_map(|(&k, (w, _, _))| {
+                                                        let wr = w.as_ptr().cast::<RawIWeakReference>();
+                                                        let mut resolved = ComRaw::null();
+                                                        let alive = ((*(*wr).lp_vtbl).resolve)(
+                                                            w.as_ptr(),
+                                                            &IID_IINSPECTABLE,
+                                                            &mut resolved.0,
+                                                        )
+                                                        .is_ok()
+                                                            && !resolved.is_null();
+                                                        (!alive).then_some(k)
+                                                    })
+                                                    .collect();
+                                                for dk in dead {
+                                                    s.hover_flyout_shapes.remove(&dk);
+                                                }
+                                            }
+                                            s.hover_flyout_shapes
+                                                .insert(key, (weak_ref, orig_op, orig_vis));
+                                            return None;
+                                        }
+                                    }
+                                    Some(weak_ref)
+                                });
+                                drop(displaced);
+                            }
+                        }
+                    }
+                    (orig_op, orig_vis)
+                };
+                apply_shape_appearance(rt, node_com.as_ptr(), desired_hide, orig_opacity, orig_visibility);
+                if desired_hide {
+                    rt.diag_flags
+                        .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            if elem_name
+                .as_deref()
+                .is_some_and(|n| n.contains("HoverFlyoutContent") || n.contains("Thumbnail"))
+            {
+                continue;
+            }
+
+            let dep = qi_interface(node_com.as_ptr(), &IID_IDEPENDENCYOBJECT);
+            if dep.is_null() {
+                continue;
+            }
+            let mut count = 0i32;
+            if ((*(*vth_iface).lp_vtbl).get_children_count)(vth.as_ptr(), dep.as_ptr(), &mut count)
+                .is_err()
+                || count <= 0
+            {
+                continue;
+            }
+            for i in 0..count.min(32) {
+                let mut child_dep = ComRaw::null();
+                if ((*(*vth_iface).lp_vtbl).get_child)(
+                    vth.as_ptr(),
+                    dep.as_ptr(),
+                    i,
+                    &mut child_dep.0,
+                )
+                .is_ok()
+                    && !child_dep.is_null()
+                {
+                    queue.push_back(child_dep);
+                }
+            }
+        }
+    }
+
+    unsafe fn restore_all_hover_flyout_shapes_for_current_thread(rt: &Arc<TapRuntime>) {
+        let entries: Vec<(ComRaw, f64, i32)> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            s.hover_flyout_shapes
+                .drain()
+                .map(|(_, entry)| entry)
+                .collect()
+        });
+        for (weak_com, orig_opacity, orig_visibility) in entries {
+            let wr = weak_com.as_ptr().cast::<RawIWeakReference>();
+            let mut insp = ComRaw::null();
+            if ((*(*wr).lp_vtbl).resolve)(weak_com.as_ptr(), &IID_IINSPECTABLE, &mut insp.0)
+                .is_ok()
+                && !insp.is_null()
+            {
+                apply_shape_appearance(rt, insp.as_ptr(), false, orig_opacity, orig_visibility);
+            }
+        }
+    }
+
+    unsafe fn apply_hover_flyout_border_appearance(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        let border_com = qi_interface(insp_ptr, &IID_IBORDER);
+        let saved = if desired_hide {
+            SavedTargetBrushes::default()
+        } else {
+            take_saved_target_brushes(handle)
+        };
+        if !border_com.is_null() {
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBackground,
+                RawUiColor::TRANSPARENT,
+                desired_hide,
+                saved.background,
+                DIAG_HOVER_FLYOUT_APPLIED,
+            );
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBrush,
+                RawUiColor::TRANSPARENT,
+                desired_hide,
+                saved.border_brush,
+                DIAG_HOVER_FLYOUT_APPLIED,
+            );
+        }
+        sync_element_shadow_prop(
+            rt,
+            handle,
+            insp_ptr,
+            desired_hide,
+            saved.shadow,
+            DIAG_HOVER_FLYOUT_SHADOW_APPLIED,
+            false,
+        );
+        if desired_hide {
+            if !border_com.is_null() {
+                rt.diag_flags
+                    .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    TargetKind::HoverFlyoutBorder,
+                    BrushPropKind::BorderBackground,
+                    insp_ptr,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    TargetKind::HoverFlyoutBorder,
+                    BrushPropKind::BorderBrush,
+                    insp_ptr,
+                );
+            }
+            ensure_prop_watch_registered(
+                rt,
+                handle,
+                TargetKind::HoverFlyoutBorder,
+                BrushPropKind::ElementShadow,
+                insp_ptr,
+            );
+        }
+    }
+
+    unsafe fn apply_osd_panel_appearance(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
+        let grid2_com = qi_interface(insp_ptr, &IID_IGRID2);
+        let saved = if desired_hide {
+            SavedTargetBrushes::default()
+        } else {
+            take_saved_target_brushes(handle)
+        };
+        let (target_bg, target_border) = rt.osd_target_colors();
+        if !panel_com.is_null() {
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                panel_com.as_ptr(),
+                BrushPropKind::PanelBackground,
+                target_bg,
+                desired_hide,
+                saved.background,
+                DIAG_OSD_APPLIED,
+            );
+        }
+        if !grid2_com.is_null() {
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                grid2_com.as_ptr(),
+                BrushPropKind::GridBorderBrush,
+                target_border,
+                desired_hide,
+                saved.border_brush,
+                DIAG_OSD_APPLIED,
+            );
+        }
+        sync_element_shadow_prop(
+            rt,
+            handle,
+            insp_ptr,
+            desired_hide,
+            saved.shadow,
+            DIAG_OSD_SHADOW_APPLIED,
+            false,
+        );
+        if desired_hide {
+            if !panel_com.is_null() {
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    TargetKind::OsdPanel,
+                    BrushPropKind::PanelBackground,
+                    insp_ptr,
+                );
+            }
+            if !grid2_com.is_null() {
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    TargetKind::OsdPanel,
+                    BrushPropKind::GridBorderBrush,
+                    insp_ptr,
+                );
+            }
+            ensure_prop_watch_registered(
+                rt,
+                handle,
+                TargetKind::OsdPanel,
+                BrushPropKind::ElementShadow,
+                insp_ptr,
+            );
+        }
+    }
+
+    unsafe fn find_parent_tooltip_control(insp_ptr: *mut c_void) -> Option<(u64, ComRaw)> {
+        let vth = cached_visual_tree_helper()?;
+        let dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+        if dep.is_null() {
+            return None;
+        }
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let mut parent_dep = ComRaw::null();
+        if ((*(*vth_iface).lp_vtbl).get_parent)(vth.as_ptr(), dep.as_ptr(), &mut parent_dep.0)
+            .is_err()
+            || parent_dep.is_null()
+        {
+            return None;
+        }
+        let tt_com = qi_interface(parent_dep.as_ptr(), &IID_ITOOLTIP);
+        let ctrl_com = qi_interface(parent_dep.as_ptr(), &IID_ICONTROL);
+        if tt_com.is_null() || ctrl_com.is_null() {
+            return None;
+        }
+        let parent_insp = qi_interface(parent_dep.as_ptr(), &IID_IINSPECTABLE);
+        if parent_insp.is_null() {
+            return None;
+        }
+        let parent_key = com_identity_key(parent_insp.as_ptr());
+        Some((parent_key, parent_insp))
+    }
+
+    unsafe fn sync_tooltip_control_corner_radius(
+        tooltip_key: u64,
+        tt_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        if tt_ptr.is_null() {
+            return;
+        }
+        let ctrl7_com = qi_interface(tt_ptr, &IID_ICONTROL7);
+        if ctrl7_com.is_null() {
+            return;
+        }
+        let ctrl7 = ctrl7_com.as_ptr().cast::<RawIControl7>();
+        if apply_round {
+            let already_saved = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.tooltip_orig_corner_radius.contains_key(&tooltip_key))
+            });
+            if !already_saved {
+                let mut saved_cr: Option<SavedCornerRadius> = None;
+                let dp = ensure_cached_com(
+                    |s| s.control_corner_radius_dp.as_ref(),
+                    |s, v| s.control_corner_radius_dp = Some(v),
+                    fetch_control_corner_radius_dp,
+                );
+                let unset = ensure_cached_com(
+                    |s| s.unset_value.as_ref(),
+                    |s, v| s.unset_value = Some(v),
+                    fetch_unset_value,
+                );
+                if let (Some(dp_com), Some(unset_com)) = (dp, unset) {
+                    let dep_com = qi_interface(tt_ptr, &IID_IDEPENDENCYOBJECT);
+                    if !dep_com.is_null() {
+                        let dep = dep_com.as_ptr().cast::<RawIDependencyObject>();
+                        let mut local_val = ComRaw::null();
+                        if ((*(*dep).lp_vtbl).read_local_value)(
+                            dep_com.as_ptr(),
+                            dp_com.as_ptr(),
+                            &mut local_val.0,
+                        )
+                        .is_ok()
+                            && !local_val.is_null()
+                            && com_same_identity(local_val.as_ptr(), unset_com.as_ptr())
+                        {
+                            saved_cr = Some(SavedCornerRadius::Unset);
+                        }
+                    }
+                }
+                if saved_cr.is_none() {
+                    let mut cur_cr = RawCornerRadius::default();
+                    if ((*(*ctrl7).lp_vtbl).get_corner_radius)(ctrl7_com.as_ptr(), &mut cur_cr)
+                        .is_ok()
+                    {
+                        saved_cr = Some(SavedCornerRadius::Local(cur_cr));
+                    }
+                }
+                if let Some(orig) = saved_cr {
+                    let _ = UI_BRUSH_STORE.with(|cell| {
+                        if let Ok(mut s) = cell.try_borrow_mut() {
+                            s.tooltip_orig_corner_radius
+                                .entry(tooltip_key)
+                                .or_insert(orig);
+                        }
+                    });
+                }
+            }
+            let target_cr = RawCornerRadius {
+                top_left: 8.0,
+                top_right: 8.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
+            };
+            let mut cur_cr = RawCornerRadius::default();
+            if ((*(*ctrl7).lp_vtbl).get_corner_radius)(ctrl7_com.as_ptr(), &mut cur_cr).is_err()
+                || !approx_eq_corner_radius(cur_cr, target_cr)
+            {
+                let _ = ((*(*ctrl7).lp_vtbl).put_corner_radius)(ctrl7_com.as_ptr(), target_cr);
+            }
+        } else {
+            let orig = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.tooltip_orig_corner_radius.remove(&tooltip_key))
+            });
+            match orig {
+                Some(SavedCornerRadius::Unset) => {
+                    let dp = ensure_cached_com(
+                        |s| s.control_corner_radius_dp.as_ref(),
+                        |s, v| s.control_corner_radius_dp = Some(v),
+                        fetch_control_corner_radius_dp,
+                    );
+                    let _ = clear_dp_value(tt_ptr, dp.as_ref());
+                }
+                Some(SavedCornerRadius::Local(orig_cr)) => {
+                    let _ = ((*(*ctrl7).lp_vtbl).put_corner_radius)(ctrl7_com.as_ptr(), orig_cr);
+                }
+                None => {}
+            }
+        }
+    }
+
+    unsafe fn sync_tooltip_presenter_corner_radius_fallback(
+        presenter_key: u64,
+        cp_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        if cp_ptr.is_null() {
+            return;
+        }
+        let cp = cp_ptr.cast::<RawIContentPresenter4>();
+        if apply_round {
+            let target_cr = RawCornerRadius {
+                top_left: 8.0,
+                top_right: 8.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
+            };
+            let mut cur_cr = RawCornerRadius::default();
+            if ((*(*cp).lp_vtbl).get_corner_radius)(cp_ptr, &mut cur_cr).is_ok()
+                && approx_eq_corner_radius(cur_cr, target_cr)
+            {
+                return;
+            }
+            let already_saved = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.tooltip_orig_corner_radius.contains_key(&presenter_key))
+            });
+            if !already_saved
+                && ((*(*cp).lp_vtbl).get_corner_radius)(cp_ptr, &mut cur_cr).is_ok()
+            {
+                let _ = UI_BRUSH_STORE.with(|cell| {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.tooltip_orig_corner_radius
+                            .entry(presenter_key)
+                            .or_insert(SavedCornerRadius::Local(cur_cr));
+                    }
+                });
+            }
+            let _ = ((*(*cp).lp_vtbl).put_corner_radius)(cp_ptr, target_cr);
+        } else {
+            let orig = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.tooltip_orig_corner_radius.remove(&presenter_key))
+            });
+            if let Some(SavedCornerRadius::Local(orig_cr)) = orig {
+                let _ = ((*(*cp).lp_vtbl).put_corner_radius)(cp_ptr, orig_cr);
+            }
+        }
+    }
+
+    unsafe fn restore_tooltip_pair(
+        rt: &Arc<TapRuntime>,
+        presenter_key: u64,
+        presenter_insp: Option<*mut c_void>,
+        tooltip_key_opt: Option<u64>,
+        tooltip_insp: Option<*mut c_void>,
+    ) {
+        let tk_eff = tooltip_insp
+            .map(|p| com_identity_key(p))
+            .or(tooltip_key_opt);
+
+        let mut keys_to_clean = Vec::with_capacity(2);
+        if presenter_key != 0 {
+            keys_to_clean.push(presenter_key);
+        }
+        if let Some(tk) = tk_eff.filter(|&k| k != 0 && !keys_to_clean.contains(&k)) {
+            keys_to_clean.push(tk);
+        }
+        unregister_watches_for_keys(&keys_to_clean);
+
+        let (target_bg, target_border) = rt.tooltip_target_colors();
+
+        if let (Some(tk), Some(tt_ptr)) = (tk_eff, tooltip_insp) {
+            let tt_saved = take_saved_target_brushes(tk);
+            let ctrl_com = qi_interface(tt_ptr, &IID_ICONTROL);
+            if !ctrl_com.is_null() {
+                sync_overflow_brush_prop(
+                    rt,
+                    tk,
+                    tt_ptr,
+                    ctrl_com.as_ptr(),
+                    BrushPropKind::ControlBackground,
+                    target_bg,
+                    false,
+                    tt_saved.background,
+                    DIAG_TOOLTIP_APPLIED,
+                );
+                sync_overflow_brush_prop(
+                    rt,
+                    tk,
+                    tt_ptr,
+                    ctrl_com.as_ptr(),
+                    BrushPropKind::ControlBorderBrush,
+                    target_border,
+                    false,
+                    tt_saved.border_brush,
+                    DIAG_TOOLTIP_APPLIED,
+                );
+            }
+            sync_tooltip_control_corner_radius(tk, tt_ptr, false);
+            if tt_saved.shadow.is_some() {
+                sync_element_shadow_prop(
+                    rt,
+                    tk,
+                    tt_ptr,
+                    false,
+                    tt_saved.shadow,
+                    DIAG_TOOLTIP_SHADOW_APPLIED,
+                    false,
+                );
+            }
+        }
+
+        if let Some(cp_ptr) = presenter_insp {
+            let cp_saved = take_saved_target_brushes(presenter_key);
+            if cp_saved.shadow.is_some() {
+                sync_element_shadow_prop(
+                    rt,
+                    presenter_key,
+                    cp_ptr,
+                    false,
+                    cp_saved.shadow,
+                    DIAG_TOOLTIP_SHADOW_APPLIED,
+                    true,
+                );
+            }
+            let cp_com = qi_interface(cp_ptr, &IID_ICONTENTPRESENTER4);
+            if !cp_com.is_null() {
+                if let Some(sb_bg) = cp_saved.background {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        presenter_key,
+                        cp_ptr,
+                        cp_com.as_ptr(),
+                        BrushPropKind::ContentPresenterBackground,
+                        target_bg,
+                        false,
+                        Some(sb_bg),
+                        DIAG_TOOLTIP_APPLIED,
+                        true,
+                    );
+                }
+                if let Some(sb_bb) = cp_saved.border_brush {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        presenter_key,
+                        cp_ptr,
+                        cp_com.as_ptr(),
+                        BrushPropKind::ContentPresenterBorderBrush,
+                        target_border,
+                        false,
+                        Some(sb_bb),
+                        DIAG_TOOLTIP_APPLIED,
+                        true,
+                    );
+                }
+                sync_tooltip_presenter_corner_radius_fallback(
+                    presenter_key,
+                    cp_com.as_ptr(),
+                    false,
+                );
+            }
+        }
+
+        purge_saved_brushes_for_current_thread(&keys_to_clean);
+    }
+
+    unsafe fn restore_all_tooltip_targets_for_current_thread(rt: &Arc<TapRuntime>) {
+        let entries: Vec<(u64, TooltipTrackedEntry)> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            s.tooltip_modified_targets.drain().collect()
+        });
+        for (presenter_key, entry) in entries {
+            let cp_insp = resolve_weak_inspectable(&entry.presenter_weak);
+            let tt_insp = entry
+                .tooltip_weak
+                .as_ref()
+                .and_then(|tw| resolve_weak_inspectable(tw));
+            restore_tooltip_pair(
+                rt,
+                presenter_key,
+                cp_insp.as_ref().map(ComRaw::as_ptr),
+                entry.tooltip_key,
+                tt_insp.as_ref().map(ComRaw::as_ptr),
+            );
+        }
+    }
+
+    unsafe fn apply_tooltip_presenter_appearance(
+        rt: &Arc<TapRuntime>,
+        _handle: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        if insp_ptr.is_null() {
+            return;
+        }
+        let presenter_key = com_identity_key(insp_ptr);
+        let parent_tooltip = find_parent_tooltip_control(insp_ptr);
+
+        if desired_hide {
+            let parent_pair = parent_tooltip
+                .as_ref()
+                .map(|(tk, insp)| (*tk, insp.as_ptr()));
+            track_tooltip_modified_target(presenter_key, insp_ptr, parent_pair);
+
+            let (target_bg, target_border) = rt.tooltip_target_colors();
+            let apply_round = rt.is_tooltip_suppressed();
+
+            if let Some((tooltip_key, ref tt_insp)) = parent_tooltip {
+                let tt_ptr = tt_insp.as_ptr();
+                let ctrl_com = qi_interface(tt_ptr, &IID_ICONTROL);
+                if !ctrl_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        tooltip_key,
+                        tt_ptr,
+                        ctrl_com.as_ptr(),
+                        BrushPropKind::ControlBackground,
+                        target_bg,
+                        true,
+                        None,
+                        DIAG_TOOLTIP_APPLIED,
+                    );
+                    sync_overflow_brush_prop(
+                        rt,
+                        tooltip_key,
+                        tt_ptr,
+                        ctrl_com.as_ptr(),
+                        BrushPropKind::ControlBorderBrush,
+                        target_border,
+                        true,
+                        None,
+                        DIAG_TOOLTIP_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        tooltip_key,
+                        TargetKind::ToolTipPresenter,
+                        BrushPropKind::ControlBackground,
+                        tt_ptr,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        tooltip_key,
+                        TargetKind::ToolTipPresenter,
+                        BrushPropKind::ControlBorderBrush,
+                        tt_ptr,
+                    );
+                }
+                sync_tooltip_control_corner_radius(tooltip_key, tt_ptr, apply_round);
+                sync_element_shadow_prop(
+                    rt,
+                    tooltip_key,
+                    tt_ptr,
+                    true,
+                    None,
+                    DIAG_TOOLTIP_SHADOW_APPLIED,
+                    false,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    tooltip_key,
+                    TargetKind::ToolTipPresenter,
+                    BrushPropKind::ElementShadow,
+                    tt_ptr,
+                );
+            }
+
+            sync_element_shadow_prop(
+                rt,
+                presenter_key,
+                insp_ptr,
+                true,
+                None,
+                DIAG_TOOLTIP_SHADOW_APPLIED,
+                true,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                presenter_key,
+                TargetKind::ToolTipPresenter,
+                BrushPropKind::ElementShadow,
+                insp_ptr,
+            );
+
+            // Preserve {TemplateBinding Background/BorderBrush/CornerRadius} on ContentPresenter#LayoutRoot:
+            // only fall back to local mutation if LayoutRoot did not already inherit ToolTip's values.
+            let cp_com = qi_interface(insp_ptr, &IID_ICONTENTPRESENTER4);
+            if !cp_com.is_null() {
+                let wrote_cp_bg = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    presenter_key,
+                    insp_ptr,
+                    cp_com.as_ptr(),
+                    BrushPropKind::ContentPresenterBackground,
+                    target_bg,
+                    true,
+                    None,
+                    DIAG_TOOLTIP_APPLIED,
+                    true,
+                );
+                if wrote_cp_bg
+                    || parent_tooltip.is_none()
+                    || has_saved_brush_slot(presenter_key, BrushSlot::Background)
+                {
+                    ensure_prop_watch_registered(
+                        rt,
+                        presenter_key,
+                        TargetKind::ToolTipPresenter,
+                        BrushPropKind::ContentPresenterBackground,
+                        insp_ptr,
+                    );
+                }
+                let wrote_cp_bb = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    presenter_key,
+                    insp_ptr,
+                    cp_com.as_ptr(),
+                    BrushPropKind::ContentPresenterBorderBrush,
+                    target_border,
+                    true,
+                    None,
+                    DIAG_TOOLTIP_APPLIED,
+                    true,
+                );
+                if wrote_cp_bb
+                    || parent_tooltip.is_none()
+                    || has_saved_brush_slot(presenter_key, BrushSlot::BorderBrush)
+                {
+                    ensure_prop_watch_registered(
+                        rt,
+                        presenter_key,
+                        TargetKind::ToolTipPresenter,
+                        BrushPropKind::ContentPresenterBorderBrush,
+                        insp_ptr,
+                    );
+                }
+                if apply_round
+                    || UI_BRUSH_STORE.with(|cell| {
+                        cell.try_borrow()
+                            .ok()
+                            .is_some_and(|s| s.tooltip_orig_corner_radius.contains_key(&presenter_key))
+                    })
+                {
+                    sync_tooltip_presenter_corner_radius_fallback(
+                        presenter_key,
+                        cp_com.as_ptr(),
+                        apply_round,
+                    );
+                }
+            }
+        } else {
+            let tracked = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.tooltip_modified_targets.remove(&presenter_key))
+            });
+            let resolved_parent = if parent_tooltip.is_some() {
+                parent_tooltip
+            } else {
+                tracked.as_ref().and_then(|e| {
+                    e.tooltip_weak
+                        .as_ref()
+                        .and_then(|tw| resolve_weak_inspectable(tw))
+                        .map(|insp| (e.tooltip_key.unwrap_or_else(|| com_identity_key(insp.as_ptr())), insp))
+                })
+            };
+            let tk_opt = resolved_parent
+                .as_ref()
+                .map(|(tk, _)| *tk)
+                .or_else(|| tracked.as_ref().and_then(|e| e.tooltip_key));
+            restore_tooltip_pair(
+                rt,
+                presenter_key,
+                Some(insp_ptr),
+                tk_opt,
+                resolved_parent.as_ref().map(|(_, insp)| insp.as_ptr()),
+            );
+        }
+    }
+
     unsafe fn apply_target_appearance(
         rt: &Arc<TapRuntime>,
         handle: u64,
@@ -2209,50 +6822,62 @@ mod win {
             TargetKind::ShapeElement => {
                 apply_shape_appearance(rt, insp_ptr, desired_hide, orig_opacity, orig_visibility);
             }
-            TargetKind::OverflowBorder => {
-                let border_com = qi_interface(insp_ptr, &IID_IBORDER);
-                if border_com.is_null() {
-                    return;
-                }
-                let saved = if desired_hide {
-                    SavedTargetBrushes::default()
-                } else {
-                    take_saved_target_brushes(handle)
-                };
-                sync_overflow_brush_prop(
-                    rt,
-                    handle,
-                    insp_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBackground,
-                    desired_hide,
-                    saved.background,
-                );
-                sync_overflow_brush_prop(
-                    rt,
-                    handle,
-                    insp_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBrush,
-                    desired_hide,
-                    saved.border_brush,
-                );
+            TargetKind::HoverFlyoutShape => {
+                apply_shape_appearance(rt, insp_ptr, desired_hide, orig_opacity, orig_visibility);
                 if desired_hide {
-                    ensure_prop_watch_registered(
-                        rt,
-                        handle,
-                        TargetKind::OverflowBorder,
-                        BrushPropKind::BorderBackground,
-                        insp_ptr,
-                    );
-                    ensure_prop_watch_registered(
-                        rt,
-                        handle,
-                        TargetKind::OverflowBorder,
-                        BrushPropKind::BorderBrush,
-                        insp_ptr,
-                    );
+                    rt.diag_flags
+                        .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
                 }
+            }
+            TargetKind::HoverFlyoutBorder => {
+                apply_hover_flyout_border_appearance(rt, handle, insp_ptr, desired_hide);
+            }
+            TargetKind::OverflowBorder => {
+                apply_border_target_appearance(
+                    rt,
+                    handle,
+                    insp_ptr,
+                    TargetKind::OverflowBorder,
+                    RawUiColor::TRANSPARENT,
+                    RawUiColor::TRANSPARENT,
+                    desired_hide,
+                    DIAG_OVERFLOW_APPLIED,
+                );
+            }
+            TargetKind::AltTabBorder => {
+                apply_border_target_appearance(
+                    rt,
+                    handle,
+                    insp_ptr,
+                    TargetKind::AltTabBorder,
+                    RawUiColor::TRANSPARENT,
+                    RawUiColor::TRANSPARENT,
+                    desired_hide,
+                    DIAG_ALTTAB_APPLIED,
+                );
+            }
+            TargetKind::AltTabItemBorder => {
+                let bg_color =
+                    RawUiColor::from_argb(rt.alt_tab_item_bg_argb.load(Ordering::Acquire));
+                let border_color =
+                    RawUiColor::from_argb(rt.alt_tab_item_border_argb.load(Ordering::Acquire));
+                apply_alttab_item_border_appearance(
+                    rt,
+                    insp_ptr,
+                    None,
+                    bg_color,
+                    border_color,
+                    desired_hide,
+                );
+            }
+            TargetKind::AltTabItemFocus => {
+                apply_focus_secondary_appearance(rt, insp_ptr, desired_hide);
+            }
+            TargetKind::OsdPanel => {
+                apply_osd_panel_appearance(rt, handle, insp_ptr, desired_hide);
+            }
+            TargetKind::ToolTipPresenter => {
+                apply_tooltip_presenter_appearance(rt, handle, insp_ptr, desired_hide);
             }
             TargetKind::OverflowPanel => {
                 let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
@@ -2270,8 +6895,10 @@ mod win {
                     insp_ptr,
                     panel_com.as_ptr(),
                     BrushPropKind::PanelBackground,
+                    RawUiColor::TRANSPARENT,
                     desired_hide,
                     saved.background,
+                    DIAG_OVERFLOW_APPLIED,
                 );
                 if desired_hide {
                     ensure_prop_watch_registered(
@@ -2286,9 +6913,11 @@ mod win {
         }
     }
 
-    fn release_target_resources(target: TrackedTarget, git: Option<&IGlobalInterfaceTable>) {
-        release_raw_com_addr(target.weak_ref_raw);
-        match target.dispatcher {
+    fn release_owned_dispatcher(
+        dispatcher: OwnedDispatcher,
+        git: Option<&IGlobalInterfaceTable>,
+    ) {
+        match dispatcher {
             OwnedDispatcher::Queue(addr) => {
                 if addr != 0 {
                     unsafe {
@@ -2302,15 +6931,33 @@ mod win {
         }
     }
 
+    fn release_target_resources(target: TrackedTarget, git: Option<&IGlobalInterfaceTable>) {
+        release_raw_com_addr(target.weak_ref_raw);
+        release_owned_dispatcher(target.dispatcher, git);
+    }
+
     struct RuntimeState {
         desired_hide: bool,
         shutdown: bool,
         targets: HashMap<u64, TrackedTarget>,
+        tooltip_dispatchers: Vec<(u32, OwnedDispatcher)>,
     }
 
     struct TapRuntime {
         tree: Mutex<VisualTreeIndex>,
         state: Mutex<RuntimeState>,
+        alt_tab_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
+        hover_flyout_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
+        osd_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
+        osd_suppressed: AtomicBool,
+        osd_fallback_bg_argb: AtomicU32,
+        osd_fallback_border_argb: AtomicU32,
+        tooltip_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
+        tooltip_suppressed: AtomicBool,
+        tooltip_fallback_bg_argb: AtomicU32,
+        tooltip_fallback_border_argb: AtomicU32,
+        alt_tab_item_bg_argb: AtomicU32,
+        alt_tab_item_border_argb: AtomicU32,
         diag_cookie: AtomicU32,
         shutdown_started: AtomicBool,
         stop_requested: AtomicBool,
@@ -2333,7 +6980,20 @@ mod win {
                     desired_hide: false,
                     shutdown: false,
                     targets: HashMap::new(),
+                    tooltip_dispatchers: Vec::new(),
                 }),
+                alt_tab_bounds_dip: Mutex::new(None),
+                hover_flyout_bounds_dip: Mutex::new(None),
+                osd_bounds_dip: Mutex::new(None),
+                osd_suppressed: AtomicBool::new(false),
+                osd_fallback_bg_argb: AtomicU32::new(0x3E_141822),
+                osd_fallback_border_argb: AtomicU32::new(0x52_FFFFFF),
+                tooltip_bounds_dip: Mutex::new(None),
+                tooltip_suppressed: AtomicBool::new(false),
+                tooltip_fallback_bg_argb: AtomicU32::new(0x44_141822),
+                tooltip_fallback_border_argb: AtomicU32::new(0x54_FFFFFF),
+                alt_tab_item_bg_argb: AtomicU32::new(0x38_1A1D24),
+                alt_tab_item_border_argb: AtomicU32::new(0x42_FFFFFF),
                 diag_cookie: AtomicU32::new(diag_cookie),
                 shutdown_started: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
@@ -2371,6 +7031,16 @@ mod win {
                 .unwrap_or(false)
         }
 
+        #[inline]
+        fn is_osd_suppressed(&self) -> bool {
+            self.osd_suppressed.load(Ordering::Acquire)
+        }
+
+        #[inline]
+        fn is_tooltip_suppressed(&self) -> bool {
+            self.tooltip_suppressed.load(Ordering::Acquire)
+        }
+
         fn clear_host_handle(&self) {
             if let Ok(mut hh) = self.host_handle_raw.lock() {
                 if let Some((_, raw)) = hh.take() {
@@ -2385,6 +7055,14 @@ mod win {
 
         fn on_host_exited(self: &Arc<Self>) {
             self.clear_host_handle();
+            self.osd_suppressed.store(false, Ordering::Release);
+            if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                *b = None;
+            }
+            self.tooltip_suppressed.store(false, Ordering::Release);
+            if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                *b = None;
+            }
             if let Ok(mut g) = self.state.lock() {
                 if !g.shutdown {
                     g.desired_hide = false;
@@ -2418,6 +7096,14 @@ mod win {
                 }
             } else if !hide {
                 self.clear_host_handle();
+                self.osd_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                    *b = None;
+                }
+                self.tooltip_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                    *b = None;
+                }
             }
 
             if let Ok(mut g) = self.state.lock() {
@@ -2432,6 +7118,14 @@ mod win {
         fn trigger_shutdown(self: &Arc<Self>, wait_ms: u64) {
             let first = !self.shutdown_started.swap(true, Ordering::AcqRel);
             if first {
+                self.osd_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                    *b = None;
+                }
+                self.tooltip_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                    *b = None;
+                }
                 if let Ok(mut g) = self.state.lock() {
                     g.desired_hide = false;
                     g.shutdown = true;
@@ -2537,46 +7231,69 @@ mod win {
         }
 
         fn dispatch_apply_to_ui_threads(self: &Arc<Self>, wait_ms: u64) {
+            self.dispatch_apply_filtered(wait_ms, None);
+        }
+
+        fn dispatch_apply_filtered(
+            self: &Arc<Self>,
+            wait_ms: u64,
+            only_kind: Option<TargetKind>,
+        ) -> usize {
             let mut seen_keys: Vec<DispatchKey> = Vec::new();
             let mut dispatch_list: Vec<DispatchTarget> = Vec::new();
-
-            if let Ok(g) = self.state.lock() {
-                for t in g.targets.values() {
-                    match (t.thread_id, t.dispatcher) {
-                        (Some(tid), OwnedDispatcher::Queue(addr)) if addr != 0 => {
-                            let key = DispatchKey::ThreadQueue(tid);
-                            if !seen_keys.contains(&key) {
-                                unsafe {
-                                    let raw_ptr = addr as *mut c_void;
-                                    if let Some(borrowed) =
-                                        DispatcherQueue::from_raw_borrowed(&raw_ptr)
-                                    {
-                                        seen_keys.push(key);
-                                        dispatch_list.push(DispatchTarget::Queue {
-                                            thread_id: tid,
-                                            queue: borrowed.clone(),
-                                        });
-                                    }
+            let push_unique = |seen_keys: &mut Vec<DispatchKey>,
+                               dispatch_list: &mut Vec<DispatchTarget>,
+                               thread_id: Option<u32>,
+                               dispatcher: OwnedDispatcher| {
+                match (thread_id, dispatcher) {
+                    (Some(tid), OwnedDispatcher::Queue(addr)) if addr != 0 => {
+                        let key = DispatchKey::ThreadQueue(tid);
+                        if !seen_keys.contains(&key) {
+                            unsafe {
+                                let raw_ptr = addr as *mut c_void;
+                                if let Some(borrowed) =
+                                    DispatcherQueue::from_raw_borrowed(&raw_ptr)
+                                {
+                                    seen_keys.push(key);
+                                    dispatch_list.push(DispatchTarget::Queue {
+                                        thread_id: tid,
+                                        queue: borrowed.clone(),
+                                    });
                                 }
                             }
                         }
-                        (_, OwnedDispatcher::Core(cookie)) if cookie != 0 => {
-                            let key = DispatchKey::CoreCookie(cookie);
-                            if !seen_keys.contains(&key) {
-                                seen_keys.push(key);
-                                dispatch_list.push(DispatchTarget::Core { cookie });
-                            }
+                    }
+                    (_, OwnedDispatcher::Core(cookie)) if cookie != 0 => {
+                        let key = DispatchKey::CoreCookie(cookie);
+                        if !seen_keys.contains(&key) {
+                            seen_keys.push(key);
+                            dispatch_list.push(DispatchTarget::Core { cookie });
                         }
-                        _ => {}
+                    }
+                    _ => {}
+                }
+            };
+
+            if let Ok(g) = self.state.lock() {
+                for t in g.targets.values() {
+                    if only_kind.is_some_and(|k| t.kind != k) {
+                        continue;
+                    }
+                    push_unique(&mut seen_keys, &mut dispatch_list, t.thread_id, t.dispatcher);
+                }
+                if only_kind.is_none() {
+                    for &(tid, disp) in &g.tooltip_dispatchers {
+                        push_unique(&mut seen_keys, &mut dispatch_list, Some(tid), disp);
                     }
                 }
             }
 
-            if dispatch_list.is_empty() {
-                return;
+            let count = dispatch_list.len();
+            if count == 0 {
+                return 0;
             }
 
-            let barrier = (wait_ms > 0).then(|| PendingBarrier::new(dispatch_list.len()));
+            let barrier = (wait_ms > 0).then(|| PendingBarrier::new(count));
             let git = if dispatch_list
                 .iter()
                 .any(|d| matches!(d, DispatchTarget::Core { .. }))
@@ -2592,6 +7309,152 @@ mod win {
 
             if let Some(b) = barrier {
                 b.wait_timeout(Duration::from_millis(wait_ms));
+            }
+            count
+        }
+
+        fn query_alt_tab_bounds_dip(self: &Arc<Self>, wait_ms: u64) -> Option<(u32, [f32; 4])> {
+            let dispatched = self.dispatch_apply_filtered(wait_ms, Some(TargetKind::AltTabBorder));
+            if dispatched == 0 {
+                if let Ok(mut b) = self.alt_tab_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            self.alt_tab_bounds_dip.lock().ok().and_then(|b| *b)
+        }
+
+        fn query_hover_flyout_bounds_dip(
+            self: &Arc<Self>,
+            wait_ms: u64,
+        ) -> Option<(u32, [f32; 4])> {
+            let dispatched =
+                self.dispatch_apply_filtered(wait_ms, Some(TargetKind::HoverFlyoutBorder));
+            if dispatched == 0 {
+                if let Ok(mut b) = self.hover_flyout_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            self.hover_flyout_bounds_dip.lock().ok().and_then(|b| *b)
+        }
+
+        fn query_osd_bounds_dip(self: &Arc<Self>, wait_ms: u64) -> Option<(u32, [f32; 4])> {
+            if self.is_osd_suppressed() {
+                if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            let dispatched = self.dispatch_apply_filtered(wait_ms, Some(TargetKind::OsdPanel));
+            if dispatched == 0 {
+                if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            self.osd_bounds_dip.lock().ok().and_then(|b| *b)
+        }
+
+        #[inline]
+        fn osd_target_colors(&self) -> (RawUiColor, RawUiColor) {
+            if self.is_osd_suppressed() {
+                (
+                    RawUiColor::from_argb(self.osd_fallback_bg_argb.load(Ordering::Acquire)),
+                    RawUiColor::from_argb(self.osd_fallback_border_argb.load(Ordering::Acquire)),
+                )
+            } else {
+                (RawUiColor::TRANSPARENT, RawUiColor::TRANSPARENT)
+            }
+        }
+
+        fn set_osd_suppressed(self: &Arc<Self>, suppressed: bool) {
+            let prev = self.osd_suppressed.swap(suppressed, Ordering::AcqRel);
+            if suppressed {
+                if let Ok(mut b) = self.osd_bounds_dip.lock() {
+                    *b = None;
+                }
+            }
+            if prev != suppressed && self.desired_hide() {
+                self.dispatch_apply_filtered(0, Some(TargetKind::OsdPanel));
+            }
+        }
+
+        fn set_osd_fallback_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
+            let prev_bg = self.osd_fallback_bg_argb.swap(bg_argb, Ordering::AcqRel);
+            let prev_bd = self
+                .osd_fallback_border_argb
+                .swap(border_argb, Ordering::AcqRel);
+            if (prev_bg != bg_argb || prev_bd != border_argb)
+                && self.desired_hide()
+                && self.is_osd_suppressed()
+            {
+                self.dispatch_apply_filtered(0, Some(TargetKind::OsdPanel));
+            }
+        }
+
+        fn query_tooltip_bounds_dip(self: &Arc<Self>, wait_ms: u64) -> Option<(u32, [f32; 4])> {
+            if self.is_tooltip_suppressed() {
+                if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            let dispatched = self.dispatch_apply_filtered(wait_ms, Some(TargetKind::ToolTipPresenter));
+            if dispatched == 0 {
+                if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                    *b = None;
+                }
+                return None;
+            }
+            self.tooltip_bounds_dip.lock().ok().and_then(|b| *b)
+        }
+
+        #[inline]
+        fn tooltip_target_colors(&self) -> (RawUiColor, RawUiColor) {
+            if self.is_tooltip_suppressed() {
+                (
+                    RawUiColor::from_argb(self.tooltip_fallback_bg_argb.load(Ordering::Acquire)),
+                    RawUiColor::from_argb(self.tooltip_fallback_border_argb.load(Ordering::Acquire)),
+                )
+            } else {
+                (RawUiColor::TRANSPARENT, RawUiColor::TRANSPARENT)
+            }
+        }
+
+        fn set_tooltip_suppressed(self: &Arc<Self>, suppressed: bool) {
+            let prev = self.tooltip_suppressed.swap(suppressed, Ordering::AcqRel);
+            if suppressed {
+                if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
+                    *b = None;
+                }
+            }
+            if prev != suppressed && self.desired_hide() {
+                self.dispatch_apply_filtered(0, Some(TargetKind::ToolTipPresenter));
+            }
+        }
+
+        fn set_tooltip_fallback_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
+            let prev_bg = self.tooltip_fallback_bg_argb.swap(bg_argb, Ordering::AcqRel);
+            let prev_bd = self
+                .tooltip_fallback_border_argb
+                .swap(border_argb, Ordering::AcqRel);
+            if (prev_bg != bg_argb || prev_bd != border_argb)
+                && self.desired_hide()
+                && self.is_tooltip_suppressed()
+            {
+                self.dispatch_apply_filtered(0, Some(TargetKind::ToolTipPresenter));
+            }
+        }
+
+        fn set_alt_tab_item_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
+            let prev_bg = self.alt_tab_item_bg_argb.swap(bg_argb, Ordering::AcqRel);
+            let prev_bd = self
+                .alt_tab_item_border_argb
+                .swap(border_argb, Ordering::AcqRel);
+            if (prev_bg != bg_argb || prev_bd != border_argb) && self.desired_hide() {
+                self.dispatch_apply_filtered(0, Some(TargetKind::AltTabItemBorder));
+                self.dispatch_apply_filtered(0, Some(TargetKind::AltTabBorder));
             }
         }
     }
@@ -2647,10 +7510,12 @@ mod win {
             (target_hide, list)
         };
 
-        if items.is_empty() {
+        if desired_hide && items.is_empty() {
             return;
         }
-        rt.diag_flags.fetch_or(DIAG_APPLY_RAN, Ordering::Relaxed);
+        if !items.is_empty() {
+            rt.diag_flags.fetch_or(DIAG_APPLY_RAN, Ordering::Relaxed);
+        }
         if desired_hide {
             unsafe {
                 prewarm_overflow_brush_store_for_current_thread();
@@ -2658,6 +7523,16 @@ mod win {
         }
 
         let mut stale_handles = Vec::new();
+        let mut saw_alt_tab = false;
+        let mut measured_alt_tab: Option<[f32; 4]> = None;
+        let mut saw_hover_flyout = false;
+        let mut measured_hover_flyout: Option<([f32; 4], f32)> = None;
+        let mut saw_osd = false;
+        let mut measured_osd: Option<([f32; 4], f32)> = None;
+        let osd_suppressed = rt.is_osd_suppressed();
+        let mut saw_tooltip = false;
+        let mut measured_tooltip: Option<([f32; 4], f32)> = None;
+        let tooltip_suppressed = rt.is_tooltip_suppressed();
         for item in items {
             let weak_com = ComRaw(item.weak_ref_raw as *mut c_void);
             if weak_com.is_null() {
@@ -2688,6 +7563,94 @@ mod win {
                     item.orig_opacity,
                     item.orig_visibility,
                 );
+
+                if item.kind == TargetKind::AltTabBorder {
+                    saw_alt_tab = true;
+                    sync_alttab_subtree_items(rt, insp.as_ptr(), desired_hide);
+                    if desired_hide {
+                        if let Some(bounds) =
+                            measure_element_bounds_dip(insp.as_ptr(), 80.0, 60.0, 0.01)
+                        {
+                            measured_alt_tab = Some(bounds);
+                        }
+                    }
+                } else if item.kind == TargetKind::HoverFlyoutBorder {
+                    saw_hover_flyout = true;
+                    sync_hover_flyout_bg_shapes(rt, insp.as_ptr(), desired_hide);
+                    if desired_hide {
+                        if let Some(bounds) = measure_hover_flyout_bounds_dip(insp.as_ptr()) {
+                            let area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
+                            if measured_hover_flyout
+                                .is_none_or(|(_, best_area)| area > best_area)
+                            {
+                                measured_hover_flyout = Some((bounds, area));
+                            }
+                        }
+                    }
+                } else if item.kind == TargetKind::OsdPanel {
+                    saw_osd = true;
+                    if desired_hide && !osd_suppressed {
+                        if let Some(bounds) =
+                            measure_element_bounds_dip(insp.as_ptr(), 80.0, 32.0, 0.05)
+                        {
+                            let area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
+                            if measured_osd.is_none_or(|(_, best_area)| area > best_area) {
+                                measured_osd = Some((bounds, area));
+                            }
+                        }
+                    }
+                } else if item.kind == TargetKind::ToolTipPresenter {
+                    saw_tooltip = true;
+                    if desired_hide && !tooltip_suppressed {
+                        if let Some(bounds) = measure_tooltip_bounds_dip(insp.as_ptr()) {
+                            let area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]);
+                            if measured_tooltip.is_none_or(|(_, best_area)| area > best_area) {
+                                measured_tooltip = Some((bounds, area));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if saw_alt_tab {
+            let cur_tid = unsafe { GetCurrentThreadId() };
+            if let Ok(mut b) = rt.alt_tab_bounds_dip.lock() {
+                *b = if desired_hide {
+                    measured_alt_tab.map(|r| (cur_tid, r))
+                } else {
+                    None
+                };
+            }
+        }
+        if saw_hover_flyout {
+            let cur_tid = unsafe { GetCurrentThreadId() };
+            if let Ok(mut b) = rt.hover_flyout_bounds_dip.lock() {
+                *b = if desired_hide {
+                    measured_hover_flyout.map(|(r, _)| (cur_tid, r))
+                } else {
+                    None
+                };
+            }
+        }
+        if saw_osd {
+            let cur_tid = unsafe { GetCurrentThreadId() };
+            if let Ok(mut b) = rt.osd_bounds_dip.lock() {
+                *b = if desired_hide && !osd_suppressed {
+                    measured_osd.map(|(r, _)| (cur_tid, r))
+                } else {
+                    None
+                };
+            }
+        }
+        if saw_tooltip {
+            let cur_tid = unsafe { GetCurrentThreadId() };
+            if let Ok(mut b) = rt.tooltip_bounds_dip.lock() {
+                *b = if desired_hide && !tooltip_suppressed {
+                    measured_tooltip.map(|(r, _)| (cur_tid, r))
+                } else {
+                    None
+                };
             }
         }
 
@@ -2706,6 +7669,14 @@ mod win {
                 for old in evicted {
                     release_target_resources(old, git.as_ref());
                 }
+            }
+        }
+
+        if !desired_hide {
+            unsafe {
+                restore_all_alttab_subtargets_for_current_thread(rt);
+                restore_all_hover_flyout_shapes_for_current_thread(rt);
+                restore_all_tooltip_targets_for_current_thread(rt);
             }
         }
 
@@ -2757,7 +7728,7 @@ mod win {
 
         let mut orig = 1.0f64;
         let mut orig_vis = VISIBILITY_VISIBLE;
-        if kind == TargetKind::ShapeElement {
+        if matches!(kind, TargetKind::ShapeElement | TargetKind::HoverFlyoutShape) {
             let ui_elem = qi_interface(insp.as_ptr(), &IID_IUIELEMENT);
             if ui_elem.is_null() {
                 return;
@@ -2775,9 +7746,19 @@ mod win {
             }
         }
 
-        let want_hide_initial = kind == TargetKind::ShapeElement && rt.desired_hide();
-        if want_hide_initial {
+        let want_shape_hide_initial =
+            matches!(kind, TargetKind::ShapeElement | TargetKind::HoverFlyoutShape)
+                && rt.desired_hide();
+        let want_focus_hide_initial = kind == TargetKind::AltTabItemFocus && rt.desired_hide();
+        if want_shape_hide_initial {
             apply_shape_appearance(rt, insp.as_ptr(), true, orig, orig_vis);
+            if kind == TargetKind::HoverFlyoutShape {
+                rt.diag_flags
+                    .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
+            }
+        } else if want_focus_hide_initial {
+            let key = com_identity_key(insp.as_ptr());
+            sync_focus_secondary_thickness_prop(rt, key, insp.as_ptr(), true, false);
         }
 
         let weak_src = qi_interface(insp.as_ptr(), &IID_IWEAKREFERENCESOURCE);
@@ -2793,15 +7774,20 @@ mod win {
         }
         rt.diag_flags.fetch_or(DIAG_QI_WEAK_OK, Ordering::Relaxed);
 
+        let cur_tid = GetCurrentThreadId();
+        let mut tooltip_extra_disp: Option<OwnedDispatcher> = None;
         let (thread_id, dispatcher, async_dispatch) =
             if let Ok(dq) = DispatcherQueue::GetForCurrentThread() {
-                let tid = GetCurrentThreadId();
                 let dq_for_enqueue = dq.clone();
+                if kind == TargetKind::ToolTipPresenter {
+                    tooltip_extra_disp =
+                        Some(OwnedDispatcher::Queue(dq.clone().into_raw() as usize));
+                }
                 (
-                    Some(tid),
+                    Some(cur_tid),
                     OwnedDispatcher::Queue(dq.into_raw() as usize),
                     DispatchTarget::Queue {
-                        thread_id: tid,
+                        thread_id: cur_tid,
                         queue: dq_for_enqueue,
                     },
                 )
@@ -2823,6 +7809,13 @@ mod win {
                 let Ok(cookie) = git.RegisterInterfaceInGlobal(cd_unk, &IID_ICOREDISPATCHER) else {
                     return;
                 };
+                if kind == TargetKind::ToolTipPresenter {
+                    if let Ok(extra_cookie) =
+                        git.RegisterInterfaceInGlobal(cd_unk, &IID_ICOREDISPATCHER)
+                    {
+                        tooltip_extra_disp = Some(OwnedDispatcher::Core(extra_cookie));
+                    }
+                }
                 (
                     None,
                     OwnedDispatcher::Core(cookie),
@@ -2850,6 +7843,13 @@ mod win {
                         dispatcher,
                     },
                 );
+                if let Some(extra) = tooltip_extra_disp.take() {
+                    if !g.tooltip_dispatchers.iter().any(|(tid, _)| *tid == cur_tid) {
+                        g.tooltip_dispatchers.push((cur_tid, extra));
+                    } else {
+                        tooltip_extra_disp = Some(extra);
+                    }
+                }
                 want_hide_after = g.desired_hide;
                 rt.diag_flags
                     .fetch_or(DIAG_INSERTED_TARGET, Ordering::Relaxed);
@@ -2874,21 +7874,34 @@ mod win {
             });
         }
 
+        if let Some(unused_extra) = tooltip_extra_disp {
+            release_owned_dispatcher(unused_extra, Some(&git));
+        }
         if let Some(old) = evicted {
             release_target_resources(old, Some(&git));
         }
 
         if shutdown_after {
-            if want_hide_initial {
+            if want_shape_hide_initial {
                 apply_shape_appearance(rt, insp.as_ptr(), false, orig, orig_vis);
+            } else if want_focus_hide_initial {
+                let key = com_identity_key(insp.as_ptr());
+                sync_focus_secondary_thickness_prop(rt, key, insp.as_ptr(), false, false);
             }
-        } else if kind == TargetKind::ShapeElement {
-            if want_hide_after != want_hide_initial {
+        } else if matches!(kind, TargetKind::ShapeElement | TargetKind::HoverFlyoutShape) {
+            if want_hide_after != want_shape_hide_initial {
                 apply_shape_appearance(rt, insp.as_ptr(), want_hide_after, orig, orig_vis);
+                if want_hide_after && kind == TargetKind::HoverFlyoutShape {
+                    rt.diag_flags
+                        .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
+                }
             }
         } else if want_hide_after {
             let core_git = matches!(async_dispatch, DispatchTarget::Core { .. }).then_some(&git);
             rt.enqueue_target_dispatch(async_dispatch, core_git, None);
+        } else if want_focus_hide_initial {
+            let key = com_identity_key(insp.as_ptr());
+            sync_focus_secondary_thickness_prop(rt, key, insp.as_ptr(), false, false);
         }
     }
 
@@ -3028,13 +8041,35 @@ mod win {
             let cur_tid = GetCurrentThreadId();
             let type_name = bstr_ptr_to_string(element.type_name);
             let name = bstr_ptr_to_string(element.name);
-            let is_container_root = type_name.contains("TaskbarFrame")
+            let hint_container_root = type_name.contains("TaskbarFrame")
                 || type_name.contains("TaskbarBackground")
+                || type_name.contains("FlyoutFrame")
+                || matches!(
+                    name.as_str(),
+                    "HoverFlyoutCanvas"
+                        | "HoverFlyoutGrid"
+                        | "HoverFlyoutBackground"
+                        | "HoverFlyoutBackgroundControl"
+                )
                 || name == "OverflowRootGrid"
+                || name == "ModalRootGrid"
+                || name == "AltTabRoot"
+                || type_name.contains("Switcher.AltTab")
+                || name == "BackgroundElement"
+                || type_name.contains("SwitchItemList")
+                || name == "CustomFocusItemPanel"
                 || type_name.contains("NotificationAreaOverflow")
                 || type_name.contains("NotifyIconOverflow")
-                || type_name.contains("OverflowView");
-            if is_container_root {
+                || type_name.contains("OverflowView")
+                || name == "ConfirmatorFrameCanvas"
+                || name == "ConfirmatorMainGrid"
+                || type_name.contains("HWConfirmatorUI")
+                || type_name.contains("ConfirmatorHostControl")
+                || type_name.ends_with(".ToolTip")
+                || type_name == "ToolTip";
+            let may_be_alttab_item_container = type_name.contains("ListViewItem");
+            let mut is_container_root = hint_container_root;
+            if hint_container_root {
                 rt.diag_flags.fetch_or(DIAG_SAW_FRAME_OR_BG, Ordering::Relaxed);
             }
             if matches!(
@@ -3045,6 +8080,9 @@ mod win {
             }
             let (matched_kind, extra_candidates) = if let Ok(mut idx) = rt.tree.lock() {
                 idx.on_add_on_thread(relation.parent, handle, type_name, name, cur_tid);
+                if !is_container_root && may_be_alttab_item_container {
+                    is_container_root = idx.thread_has_alttab_container(cur_tid);
+                }
                 let matched_kind = idx.classify_target(handle);
                 let extra = if is_container_root {
                     idx.collect_classified_targets_for_thread(cur_tid)
@@ -3082,11 +8120,44 @@ mod win {
             if !removed.is_empty() {
                 purge_saved_brushes_for_current_thread(&removed);
                 let mut evicted = Vec::new();
+                let mut removed_alt_tab = false;
+                let mut removed_hover_flyout = false;
+                let mut removed_osd = false;
+                let mut removed_tooltip = false;
                 if let Ok(mut g) = rt.state.lock() {
                     for rh in removed {
                         if let Some(old) = g.targets.remove(&rh) {
+                            if old.kind == TargetKind::AltTabBorder {
+                                removed_alt_tab = true;
+                            } else if old.kind == TargetKind::HoverFlyoutBorder {
+                                removed_hover_flyout = true;
+                            } else if old.kind == TargetKind::OsdPanel {
+                                removed_osd = true;
+                            } else if old.kind == TargetKind::ToolTipPresenter {
+                                removed_tooltip = true;
+                            }
                             evicted.push(old);
                         }
+                    }
+                }
+                if removed_alt_tab {
+                    if let Ok(mut b) = rt.alt_tab_bounds_dip.lock() {
+                        *b = None;
+                    }
+                }
+                if removed_hover_flyout {
+                    if let Ok(mut b) = rt.hover_flyout_bounds_dip.lock() {
+                        *b = None;
+                    }
+                }
+                if removed_osd {
+                    if let Ok(mut b) = rt.osd_bounds_dip.lock() {
+                        *b = None;
+                    }
+                }
+                if removed_tooltip {
+                    if let Ok(mut b) = rt.tooltip_bounds_dip.lock() {
+                        *b = None;
                     }
                 }
                 if !evicted.is_empty() {
@@ -3540,14 +8611,26 @@ mod win {
 
             drop(vts_com);
 
-            let leftover: Vec<TrackedTarget> = if let Ok(mut g) = rt.state.lock() {
+            let (leftover, leftover_tooltip_dispatchers): (
+                Vec<TrackedTarget>,
+                Vec<OwnedDispatcher>,
+            ) = if let Ok(mut g) = rt.state.lock() {
                 g.shutdown = true;
-                g.targets.drain().map(|(_, t)| t).collect()
+                (
+                    g.targets.drain().map(|(_, t)| t).collect(),
+                    g.tooltip_dispatchers
+                        .drain(..)
+                        .map(|(_, disp)| disp)
+                        .collect(),
+                )
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             };
             for t in leftover {
                 release_target_resources(t, git.as_ref());
+            }
+            for disp in leftover_tooltip_dispatchers {
+                release_owned_dispatcher(disp, git.as_ref());
             }
 
             let diag_cookie = rt.diag_cookie.swap(0, Ordering::AcqRel);
@@ -3781,6 +8864,100 @@ mod win {
                                 io_event,
                                 &[CMD_VERSION, TAP_PROTOCOL_VERSION],
                             );
+                        }
+                        CMD_ALTTAB_RECT => {
+                            let bounds = if rt.desired_hide() {
+                                rt.query_alt_tab_bounds_dip(40)
+                            } else {
+                                None
+                            };
+                            let mut resp = [0u8; 22];
+                            resp[0] = CMD_ALTTAB_RECT;
+                            if let Some((tid, r)) = bounds {
+                                resp[1] = 1;
+                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                            }
+                            let _ = write_pipe_exact(pipe, io_event, &resp);
+                        }
+                        CMD_HOVER_FLYOUT_RECT => {
+                            let bounds = if rt.desired_hide() {
+                                rt.query_hover_flyout_bounds_dip(40)
+                            } else {
+                                None
+                            };
+                            let mut resp = [0u8; 22];
+                            resp[0] = CMD_HOVER_FLYOUT_RECT;
+                            if let Some((tid, r)) = bounds {
+                                resp[1] = 1;
+                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                            }
+                            let _ = write_pipe_exact(pipe, io_event, &resp);
+                        }
+                        CMD_OSD_RECT | CMD_TOOLTIP_RECT => {
+                            let bounds = if cmd == CMD_OSD_RECT {
+                                if rt.desired_hide() && !rt.is_osd_suppressed() {
+                                    rt.query_osd_bounds_dip(40)
+                                } else {
+                                    None
+                                }
+                            } else if rt.desired_hide() && !rt.is_tooltip_suppressed() {
+                                rt.query_tooltip_bounds_dip(40)
+                            } else {
+                                None
+                            };
+                            let mut resp = [0u8; 22];
+                            resp[0] = cmd;
+                            if let Some((tid, r)) = bounds {
+                                resp[1] = 1;
+                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                            }
+                            let _ = write_pipe_exact(pipe, io_event, &resp);
+                        }
+                        CMD_SET_OSD_SUPPRESS | CMD_SET_TOOLTIP_SUPPRESS => {
+                            let mut extra = [0u8; 1];
+                            if read_pipe_exact(pipe, io_event, &mut extra) {
+                                if cmd == CMD_SET_OSD_SUPPRESS {
+                                    rt.set_osd_suppressed(extra[0] != 0);
+                                } else {
+                                    rt.set_tooltip_suppressed(extra[0] != 0);
+                                }
+                                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+                            }
+                        }
+                        CMD_SET_ALTTAB_ITEM_STYLE
+                        | CMD_SET_OSD_FALLBACK_STYLE
+                        | CMD_SET_TOOLTIP_FALLBACK_STYLE => {
+                            let mut extra = [0u8; 8];
+                            if read_pipe_exact(pipe, io_event, &mut extra) {
+                                let bg_argb =
+                                    u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
+                                let border_argb =
+                                    u32::from_le_bytes([extra[4], extra[5], extra[6], extra[7]]);
+                                match cmd {
+                                    CMD_SET_ALTTAB_ITEM_STYLE => {
+                                        rt.set_alt_tab_item_colors(bg_argb, border_argb);
+                                    }
+                                    CMD_SET_OSD_FALLBACK_STYLE => {
+                                        rt.set_osd_fallback_colors(bg_argb, border_argb);
+                                    }
+                                    _ => {
+                                        rt.set_tooltip_fallback_colors(bg_argb, border_argb);
+                                    }
+                                }
+                                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+                            }
                         }
                         CMD_SHUTDOWN => {
                             rt.trigger_shutdown(600);

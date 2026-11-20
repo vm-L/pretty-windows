@@ -295,6 +295,97 @@ pub fn derive_background_accent(bg: Rgb, light_glass: bool) -> Rgb {
     hsl_to_rgb(h, s_out, target_l)
 }
 
+#[inline]
+fn rgb_luma_01(c: Rgb) -> f32 {
+    (0.2126 * f32::from(c.r) + 0.7152 * f32::from(c.g) + 0.0722 * f32::from(c.b)) / 255.0
+}
+
+#[inline]
+fn rgb_chroma_01(c: Rgb) -> f32 {
+    let max_c = c.r.max(c.g).max(c.b);
+    let min_c = c.r.min(c.g).min(c.b);
+    f32::from(max_c - min_c) / 255.0
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_in_ui_accent_deadzone(c: Rgb, light_theme: bool) -> bool {
+    let y = rgb_luma_01(c);
+    let chroma = rgb_chroma_01(c);
+    if light_theme {
+        if y > 0.60 {
+            return true;
+        }
+        let clamped_y = y.clamp(0.54, 0.96);
+        let dy = (y - clamped_y) / 0.24;
+        let dc = chroma / 0.42;
+        (dy * dy + dc * dc) < 1.0
+    } else {
+        if y < 0.36 {
+            return true;
+        }
+        let clamped_y = y.clamp(0.16, 0.62);
+        let dy = (y - clamped_y) / 0.22;
+        let dc = chroma / 0.42;
+        (dy * dy + dc * dc) < 1.0
+    }
+}
+
+/// Pushes an accent color outside a static theme-aware glass similarity deadzone while
+/// preserving its hue (or preserving neutral low saturation as crisp pearl-white / charcoal).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn enforce_ui_accent_deadzone(color: Rgb, light_theme: bool) -> Rgb {
+    if !is_in_ui_accent_deadzone(color, light_theme) {
+        return color;
+    }
+
+    let (h, s, l) = rgb_to_hsl(color);
+    let chroma = rgb_chroma_01(color);
+
+    if s < 0.10 || chroma < 0.06 {
+        let s_out = s.min(0.08);
+        return if light_theme {
+            hsl_to_rgb(h, s_out, l.min(0.22))
+        } else {
+            hsl_to_rgb(h, s_out, l.max(0.89))
+        };
+    }
+
+    let move_toward = |cur: f32, target: f32, step: f32| -> f32 {
+        if cur < target {
+            (cur + step).min(target)
+        } else {
+            (cur - step).max(target)
+        }
+    };
+
+    let mut cur_s = s;
+    let mut cur_l = l;
+    let mut cand = color;
+    for _ in 0..48 {
+        let y = rgb_luma_01(cand);
+        if light_theme {
+            if y > 0.60 {
+                cur_l = (cur_l - 0.025).max(0.24);
+                cur_s = (cur_s + 0.015).min(0.84);
+            } else {
+                cur_s = (cur_s + 0.035).min(0.84);
+                cur_l = move_toward(cur_l, 0.34, 0.014);
+            }
+        } else if y < 0.36 {
+            cur_l = (cur_l + 0.025).min(0.76);
+            cur_s = (cur_s + 0.015).min(0.84);
+        } else {
+            cur_s = (cur_s + 0.035).min(0.84);
+            cur_l = move_toward(cur_l, 0.68, 0.014);
+        }
+        cand = hsl_to_rgb(h, cur_s, cur_l);
+        if !is_in_ui_accent_deadzone(cand, light_theme) {
+            return cand;
+        }
+    }
+    cand
+}
+
 /// Applies a fast 3-pass separable box blur (approximating Gaussian blur) on BGRA8 pixels.
 pub fn gaussian_blur_bgra(bgra: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
     if width == 0 || height == 0 || radius == 0 || bgra.len() < width * height * 4 {
@@ -739,6 +830,123 @@ mod tests {
         assert!(inpaint_occluded_rects_bgra(&mut buf, w, h, &[(0, 4, 4, 8)]));
         for px in buf.chunks_exact(4) {
             assert_eq!(px, &[247, 247, 247, 255]);
+        }
+    }
+
+    fn circular_hue_diff_deg(a: f32, b: f32) -> f32 {
+        let d = (a - b).abs().rem_euclid(360.0);
+        d.min(360.0 - d)
+    }
+
+    #[test]
+    fn ui_accent_deadzone_preserves_clear_vibrant_accents() {
+        for dark_clear in [
+            Rgb::new(228, 186, 78),
+            Rgb::new(82, 205, 198),
+            Rgb::new(0, 120, 212),
+        ] {
+            assert_eq!(enforce_ui_accent_deadzone(dark_clear, false), dark_clear);
+        }
+        for light_clear in [
+            Rgb::new(152, 114, 24),
+            Rgb::new(28, 138, 132),
+            Rgb::new(0, 120, 212),
+        ] {
+            assert_eq!(enforce_ui_accent_deadzone(light_clear, true), light_clear);
+        }
+    }
+
+    #[test]
+    fn ui_accent_deadzone_pushes_muddy_colors_out_preserving_hue() {
+        let samples = [
+            Rgb::new(125, 167, 171), // muted gray-cyan
+            Rgb::new(162, 130, 136), // dusty mauve
+            Rgb::new(170, 165, 125), // muddy khaki
+        ];
+        for sample in samples {
+            let (orig_h, orig_s, _) = rgb_to_hsl(sample);
+            for light_theme in [false, true] {
+                let out = enforce_ui_accent_deadzone(sample, light_theme);
+                assert!(
+                    !is_in_ui_accent_deadzone(out, light_theme),
+                    "{sample:?} remained in deadzone (light={light_theme}): {out:?}"
+                );
+                let (out_h, out_s, _) = rgb_to_hsl(out);
+                assert!(
+                    circular_hue_diff_deg(orig_h, out_h) <= 4.0,
+                    "hue drifted for {sample:?} (light={light_theme}): {orig_h} -> {out_h}"
+                );
+                assert!(
+                    out_s > orig_s,
+                    "expected pushed saturation for {sample:?} (light={light_theme}): {orig_s} -> {out_s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ui_accent_deadzone_fixes_extreme_luma_while_preserving_hue() {
+        let dark_blue = Rgb::new(30, 40, 215);
+        let (orig_hb, _, _) = rgb_to_hsl(dark_blue);
+        let out_dark = enforce_ui_accent_deadzone(dark_blue, false);
+        assert!(!is_in_ui_accent_deadzone(out_dark, false));
+        assert!(rgb_luma_01(out_dark) >= 0.36);
+        assert!(circular_hue_diff_deg(orig_hb, rgb_to_hsl(out_dark).0) <= 4.0);
+
+        let bright_yellow = Rgb::new(225, 210, 25);
+        let (orig_hy, _, _) = rgb_to_hsl(bright_yellow);
+        let out_light = enforce_ui_accent_deadzone(bright_yellow, true);
+        assert!(!is_in_ui_accent_deadzone(out_light, true));
+        assert!(rgb_luma_01(out_light) <= 0.60);
+        assert!(circular_hue_diff_deg(orig_hy, rgb_to_hsl(out_light).0) <= 4.0);
+    }
+
+    #[test]
+    fn ui_accent_deadzone_keeps_neutral_gray_achromatic() {
+        for gray in [
+            Rgb::new(150, 150, 150),
+            Rgb::new(194, 194, 194),
+            Rgb::new(94, 94, 94),
+        ] {
+            let dark_out = enforce_ui_accent_deadzone(gray, false);
+            let (_, dark_s, dark_l) = rgb_to_hsl(dark_out);
+            assert!(!is_in_ui_accent_deadzone(dark_out, false));
+            assert!(dark_s <= 0.08, "neutral turned chromatic: {dark_out:?}");
+            assert!(dark_l >= 0.88, "expected pearl-white lightness: {dark_l}");
+
+            let light_out = enforce_ui_accent_deadzone(gray, true);
+            let (_, light_s, light_l) = rgb_to_hsl(light_out);
+            assert!(!is_in_ui_accent_deadzone(light_out, true));
+            assert!(light_s <= 0.08, "neutral turned chromatic: {light_out:?}");
+            assert!(light_l <= 0.22, "expected charcoal lightness: {light_l}");
+        }
+    }
+
+    #[test]
+    fn ui_accent_deadzone_clears_24_hue_sweep_across_muted_grid() {
+        for step in 0..24 {
+            let h = (step as f32) * 15.0;
+            for s in [0.12f32, 0.25, 0.42] {
+                for l in [0.30f32, 0.48, 0.65, 0.78] {
+                    let sample = hsl_to_rgb(h, s, l);
+                    let (orig_h, _, _) = rgb_to_hsl(sample);
+                    let sample_chroma = rgb_chroma_01(sample);
+                    for light_theme in [false, true] {
+                        let out = enforce_ui_accent_deadzone(sample, light_theme);
+                        assert!(
+                            !is_in_ui_accent_deadzone(out, light_theme),
+                            "24-hue sweep failed at h={h}, s={s}, l={l}, light={light_theme}: {sample:?} -> {out:?}"
+                        );
+                        if sample_chroma >= 0.06 {
+                            let (out_h, _, _) = rgb_to_hsl(out);
+                            assert!(
+                                circular_hue_diff_deg(orig_h, out_h) <= 4.0,
+                                "24-hue sweep drifted at h={h}, s={s}, l={l}, light={light_theme}: {orig_h} -> {out_h}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

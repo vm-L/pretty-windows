@@ -73,34 +73,55 @@ pub fn query_taskbar_state() -> Option<TaskbarState> {
     }
 }
 
-/// Computes MediaBar screen coordinates anchored on the left side of the taskbar
-/// (automatically leaving room for the Win11 Widgets button when enabled).
-/// Returns `(x, y, width, height, clamped_offset_x)`.
-pub fn compute_bar_rect(
-    tb: &TaskbarState,
-    bar_width_px: i32,
-    offset_x: i32,
-) -> (i32, i32, i32, i32, i32) {
+/// Default left-anchored screen X coordinate for MediaBar (before applying `offset_x`).
+pub fn default_bar_x(tb: &TaskbarState) -> i32 {
     let scale = (tb.dpi as f32) / 96.0;
     let left_anchor_margin = if tb.widgets_enabled {
         (158.0 * scale).round() as i32
     } else {
         (6.0 * scale).round() as i32
     };
-    let default_x = tb.taskbar_rect.left + left_anchor_margin;
+    tb.taskbar_rect.left + left_anchor_margin
+}
+
+/// Computes MediaBar screen coordinates anchored on the left side of the taskbar
+/// (automatically leaving room for the Win11 Widgets button when enabled) while avoiding
+/// overlap with any active peer bar. Returns `(x, y, width, height, resolved_offset_x)`.
+pub fn compute_bar_rect(
+    tb: &TaskbarState,
+    bar_width_px: i32,
+    offset_x: i32,
+    current_x: Option<i32>,
+    peer_span: Option<(i32, i32)>,
+    mode: crate::system::BarCollisionMode,
+) -> (i32, i32, i32, i32, i32) {
+    let scale = (tb.dpi as f32) / 96.0;
+    let default_x = default_bar_x(tb);
 
     let min_x = tb.taskbar_rect.left + (4.0 * scale).round() as i32;
     let max_x = (tb.tray_rect.left - bar_width_px - (4.0 * scale).round() as i32).max(min_x);
+    let gap_px = (crate::system::TASKBAR_BAR_GAP_DIP * scale).round() as i32;
+    let hysteresis_px = (crate::system::TASKBAR_BAR_SWAP_HYSTERESIS_DIP * scale).round() as i32;
 
-    let clamped_x = (default_x + offset_x).clamp(min_x, max_x);
-    let clamped_offset = clamped_x - default_x;
+    let resolved_x = crate::system::resolve_taskbar_bar_x(
+        default_x + offset_x,
+        bar_width_px,
+        min_x,
+        max_x,
+        current_x,
+        peer_span,
+        gap_px,
+        hysteresis_px,
+        mode,
+    );
+    let resolved_offset = resolved_x - default_x;
     let height = (tb.taskbar_rect.bottom - tb.taskbar_rect.top).max(28);
     (
-        clamped_x,
+        resolved_x,
         tb.taskbar_rect.top,
         bar_width_px,
         height,
-        clamped_offset,
+        resolved_offset,
     )
 }
 

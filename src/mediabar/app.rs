@@ -16,12 +16,18 @@ use super::smtc::{
     WM_APP_SMTC_UPDATED,
 };
 use super::taskbar::{
-    compute_bar_rect, ensure_above_taskbar, is_fullscreen_active, query_taskbar_state,
+    compute_bar_rect, default_bar_x, ensure_above_taskbar, is_fullscreen_active, query_taskbar_state,
     TaskbarState,
 };
 use super::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
-use crate::color::{derive_background_accent, Rgb, NEUTRAL_BACKDROP_FALLBACK};
-use crate::system::{exclude_from_peek, is_light_taskbar, set_mediabar_shared_accent};
+use crate::color::{
+    derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK,
+};
+use crate::system::{
+    exclude_from_peek, is_light_taskbar, notify_peer_taskbar_bar_resync, peer_taskbar_bar_span,
+    register_taskbar_bar, set_mediabar_shared_accent, unregister_taskbar_bar,
+    update_taskbar_bar_bounds, BarCollisionMode, TaskbarBarSlot,
+};
 use crate::ui::glass::sample_screen_region_rgb;
 use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
 use std::cell::RefCell;
@@ -43,15 +49,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsIconic, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW,
     RegisterClassExW, RegisterWindowMessageW, SetCursor, SetTimer, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HICON, HTCLIENT, HWND_TOPMOST, IDC_ARROW,
-    MA_NOACTIVATE, SC_MINIMIZE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_CAPTURECHANGED,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR, WM_SETTINGCHANGE,
-    WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    MA_NOACTIVATE, SC_MINIMIZE, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SETTINGCHANGE, WM_SYSCOMMAND, WM_TIMER, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const MAIN_CLASS_NAME: PCWSTR = w!("MediaBarMainWnd");
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
+const WM_APP_MEDIABAR_RESYNC_POS: u32 = WM_APP + 6;
 
 const TIMER_GUARD_ID: usize = 1;
 const TIMER_ANIM_ID: usize = 2;
@@ -261,16 +268,27 @@ impl AppState {
     }
 
     fn sync_taskbar_geometry(&mut self, force_render: bool) {
+        self.sync_taskbar_geometry_with_mode(force_render, None, BarCollisionMode::Passive);
+    }
+
+    fn sync_taskbar_geometry_with_mode(
+        &mut self,
+        force_render: bool,
+        drag_offset_override: Option<i32>,
+        mode: BarCollisionMode,
+    ) {
         let tb_opt = query_taskbar_state();
         self.taskbar = tb_opt;
 
         let Some(tb) = tb_opt else {
+            update_taskbar_bar_bounds(TaskbarBarSlot::MediaBar, None);
             self.set_bar_visible(false);
             return;
         };
 
         let occluded = tb.auto_hide_collapsed || is_fullscreen_active(tb.taskbar_hwnd);
         if occluded {
+            update_taskbar_bar_bounds(TaskbarBarSlot::MediaBar, None);
             self.hidden_by_guard = true;
             if self.popup.is_visible() {
                 self.popup.hide();
@@ -283,10 +301,19 @@ impl AppState {
 
         let scale = (tb.dpi as f32) / 96.0;
         let width_px = (BAR_WIDTH_DIP * scale).round() as i32;
-        let (x, y, w, h, clamped_offset) = compute_bar_rect(&tb, width_px, self.config.offset_x);
-        if clamped_offset != self.config.offset_x {
-            self.config.offset_x = clamped_offset;
+        let desired_offset = drag_offset_override.unwrap_or(self.config.offset_x);
+        let current_x = if self.win_w > 0 {
+            Some(self.win_x)
+        } else {
+            None
+        };
+        let peer_span = peer_taskbar_bar_span(TaskbarBarSlot::MediaBar);
+        let (x, y, w, h, resolved_offset) =
+            compute_bar_rect(&tb, width_px, desired_offset, current_x, peer_span, mode);
+        if mode == BarCollisionMode::Drag {
+            self.config.offset_x = resolved_offset;
         }
+        update_taskbar_bar_bounds(TaskbarBarSlot::MediaBar, Some((x, x + w)));
 
         let geom_changed =
             self.win_x != x || self.win_y != y || self.win_w != w || self.win_h != h || self.dpi != tb.dpi;
@@ -425,17 +452,21 @@ impl AppState {
         Option<Arc<MediaCover>>,
         Rgb,
     ) {
-        let fallback_bg_accent = derive_background_accent(self.backdrop_rgb, self.light_taskbar);
+        let fallback_bg_accent = enforce_ui_accent_deadzone(
+            derive_background_accent(self.backdrop_rgb, self.light_taskbar),
+            self.light_taskbar,
+        );
         if let Some(src) = self.active_source() {
             let accent = if self.config.auto_color {
                 src.cover
                     .as_ref()
                     .map(|c| {
-                        if self.light_taskbar {
+                        let raw = if self.light_taskbar {
                             c.accent_light
                         } else {
                             c.accent_dark
-                        }
+                        };
+                        enforce_ui_accent_deadzone(raw, self.light_taskbar)
                     })
                     .unwrap_or(fallback_bg_accent)
             } else {
@@ -836,6 +867,8 @@ impl MediaBarInstance {
             )?));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(app) as isize);
             crate::system::register_taskbar_overlay(hwnd);
+            register_taskbar_bar(TaskbarBarSlot::MediaBar, hwnd, WM_APP_MEDIABAR_RESYNC_POS);
+            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MediaBar);
 
             SetTimer(hwnd, TIMER_GUARD_ID, GUARD_INTERVAL_MS, None);
             let _ = PostMessageW(hwnd, WM_APP_SMTC_UPDATED, WPARAM(0), LPARAM(0));
@@ -880,6 +913,7 @@ unsafe extern "system" fn main_wnd_proc(
 
     if msg == WM_DESTROY {
         crate::system::unregister_taskbar_overlay(hwnd);
+        unregister_taskbar_bar(TaskbarBarSlot::MediaBar, hwnd);
         set_mediabar_shared_accent(None);
         let rc = Rc::from_raw(raw_ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -952,6 +986,12 @@ unsafe extern "system" fn main_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_APP_MEDIABAR_RESYNC_POS => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.sync_taskbar_geometry(false);
+            }
+            LRESULT(0)
+        }
         WM_APP_POPUP_CLOSED => {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 state.popup_closed_at = Some(Instant::now());
@@ -1011,6 +1051,7 @@ unsafe extern "system" fn main_wnd_proc(
                         state.config.offset_x = 0;
                         state.save_config();
                         state.sync_taskbar_geometry(true);
+                        notify_peer_taskbar_bar_resync(TaskbarBarSlot::MediaBar);
                     }
                 }
                 SETTING_CLOSE => {
@@ -1130,8 +1171,11 @@ unsafe extern "system" fn main_wnd_proc(
                         state.is_dragging = true;
                         SetCursor(state.grab_cursor);
                         let candidate = state.drag_start_offset_x + dx;
-                        state.config.offset_x = candidate;
-                        state.sync_taskbar_geometry(true);
+                        state.sync_taskbar_geometry_with_mode(
+                            true,
+                            Some(candidate),
+                            BarCollisionMode::Drag,
+                        );
                         return LRESULT(0);
                     }
                 }
@@ -1187,10 +1231,18 @@ unsafe extern "system" fn main_wnd_proc(
                 if !state.config.locked {
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
+                    let current_offset = if state.win_w > 0 {
+                        query_taskbar_state()
+                            .or(state.taskbar)
+                            .map(|tb| state.win_x - default_bar_x(&tb))
+                            .unwrap_or(state.config.offset_x)
+                    } else {
+                        state.config.offset_x
+                    };
                     state.is_mouse_down = true;
                     state.is_dragging = false;
                     state.drag_start_screen_x = pt.x;
-                    state.drag_start_offset_x = state.config.offset_x;
+                    state.drag_start_offset_x = current_offset;
                     state.pressed_zone = HitZone::None;
                     let _ = SetCapture(hwnd);
                     SetCursor(state.grab_cursor);
@@ -1276,6 +1328,7 @@ unsafe extern "system" fn main_wnd_proc(
                             state.grab_cursor
                         });
                         state.save_config();
+                        notify_peer_taskbar_bar_resync(TaskbarBarSlot::MediaBar);
                         state.dirty = true;
                         state.render_now();
                     } else if state.config.locked {

@@ -8,17 +8,22 @@ use super::metrics::MetricsHandle;
 use super::popup::MonitorPopup;
 use super::render::{MonitorRenderInput, MonitorRenderer};
 use super::taskbar::{
-    compute_clamped_offset, compute_monitor_bar_rect, ensure_above_taskbar, is_fullscreen_active,
+    compute_monitor_bar_rect, default_monitor_bar_x, ensure_above_taskbar, is_fullscreen_active,
     query_taskbar_state, TaskbarState,
 };
 use super::wireless::WirelessHandle;
 use super::{
     WM_APP_MONITOR_BRIGHTNESS_UPDATED, WM_APP_MONITOR_CLOSE_SELF, WM_APP_MONITOR_CONFIG_CHANGED,
     WM_APP_MONITOR_METRICS_UPDATED, WM_APP_MONITOR_PICK_CUSTOM_APP, WM_APP_MONITOR_POPUP_CLOSED,
-    WM_APP_MONITOR_RESET_POS, WM_APP_MONITOR_TOGGLE_LOCK, WM_APP_MONITOR_WIRELESS_UPDATED,
+    WM_APP_MONITOR_RESET_POS, WM_APP_MONITOR_RESYNC_POS, WM_APP_MONITOR_TOGGLE_LOCK,
+    WM_APP_MONITOR_WIRELESS_UPDATED,
 };
 use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
-use crate::system::{exclude_from_peek, is_light_taskbar, resolve_unified_accent};
+use crate::system::{
+    exclude_from_peek, is_light_taskbar, notify_peer_taskbar_bar_resync, peer_taskbar_bar_span,
+    register_taskbar_bar, resolve_unified_accent, unregister_taskbar_bar,
+    update_taskbar_bar_bounds, BarCollisionMode, TaskbarBarSlot,
+};
 use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -168,6 +173,8 @@ impl MonitorBarInstance {
                 Box::into_raw(state) as isize,
             );
             crate::system::register_taskbar_overlay(hwnd);
+            register_taskbar_bar(TaskbarBarSlot::MonitorBar, hwnd, WM_APP_MONITOR_RESYNC_POS);
+            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
             let _ = SetTimer(hwnd, TIMER_SYNC_ID, TIMER_SYNC_MS, None);
 
             Ok(Self { hwnd })
@@ -282,6 +289,15 @@ impl AppState {
     }
 
     fn sync_taskbar_and_render(&mut self, force_render: bool) {
+        self.sync_taskbar_and_render_with_mode(force_render, None, BarCollisionMode::Passive);
+    }
+
+    fn sync_taskbar_and_render_with_mode(
+        &mut self,
+        force_render: bool,
+        drag_offset_override: Option<i32>,
+        mode: BarCollisionMode,
+    ) {
         let state_opt: Option<TaskbarState> = query_taskbar_state();
         let should_hide = match state_opt {
             None => true,
@@ -289,6 +305,7 @@ impl AppState {
         };
 
         if should_hide {
+            update_taskbar_bar_bounds(TaskbarBarSlot::MonitorBar, None);
             if !self.hidden_by_guard {
                 self.hidden_by_guard = true;
                 self.popup.hide_immediately();
@@ -302,7 +319,23 @@ impl AppState {
         let tb = state_opt.expect("checked Some above");
         let cfg = self.cfg_snapshot();
         let width_dip = MonitorLayout::desired_width_dip(&cfg);
-        let (x, y, w, h) = compute_monitor_bar_rect(&tb, width_dip, cfg.offset_x);
+        let desired_offset = drag_offset_override.unwrap_or(cfg.offset_x);
+        let current_x = if self.bar_w > 0 {
+            Some(self.bar_x)
+        } else {
+            None
+        };
+        let peer_span = peer_taskbar_bar_span(TaskbarBarSlot::MonitorBar);
+        let (x, y, w, h, resolved_offset) =
+            compute_monitor_bar_rect(&tb, width_dip, desired_offset, current_x, peer_span, mode);
+        if mode == BarCollisionMode::Drag {
+            if let Ok(mut guard) = self.cfg.lock() {
+                if guard.offset_x != resolved_offset {
+                    guard.offset_x = resolved_offset;
+                }
+            }
+        }
+        update_taskbar_bar_bounds(TaskbarBarSlot::MonitorBar, Some((x, x + w)));
 
         let light_now = is_light_taskbar();
         let accent_now = resolve_unified_accent(NEUTRAL_BACKDROP_FALLBACK, light_now).0;
@@ -489,20 +522,11 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
                         let _ = SetCursor(state.drag_cursor);
                     }
                     if state.dragging {
-                        if let Some(tb) = query_taskbar_state() {
-                            let width_dip = {
-                                let cfg = state.cfg_snapshot();
-                                MonitorLayout::desired_width_dip(&cfg)
-                            };
-                            let clamped =
-                                compute_clamped_offset(&tb, width_dip, state.press_offset_x + dx);
-                            if let Ok(mut guard) = state.cfg.lock() {
-                                if guard.offset_x != clamped {
-                                    guard.offset_x = clamped;
-                                }
-                            }
-                            state.sync_taskbar_and_render(true);
-                        }
+                        state.sync_taskbar_and_render_with_mode(
+                            true,
+                            Some(state.press_offset_x + dx),
+                            BarCollisionMode::Drag,
+                        );
                     }
                 }
             }
@@ -519,11 +543,21 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
             let _ = GetCursorPos(&mut pt);
             let cfg = state.cfg_snapshot();
             let can_drag = !cfg.locked;
+            let press_offset_x = if state.bar_w > 0 {
+                query_taskbar_state()
+                    .map(|tb| {
+                        let width_dip = MonitorLayout::desired_width_dip(&cfg);
+                        state.bar_x - default_monitor_bar_x(&tb, width_dip)
+                    })
+                    .unwrap_or(cfg.offset_x)
+            } else {
+                cfg.offset_x
+            };
             state.lbutton_down = true;
             state.drag_pending = can_drag;
             state.dragging = false;
             state.press_cursor_x = pt.x;
-            state.press_offset_x = cfg.offset_x;
+            state.press_offset_x = press_offset_x;
             let _ = SetCapture(hwnd);
             if can_drag {
                 let _ = SetCursor(state.drag_cursor);
@@ -542,6 +576,7 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
             let cfg = state.cfg_snapshot();
             if was_dragging {
                 state.save_current_cfg(&cfg);
+                notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
                 state.ensure_hover_timer();
                 state.render_now();
             } else if was_pressed && cfg.locked {
@@ -611,6 +646,11 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_APP_MONITOR_CONFIG_CHANGED => {
             state.sync_taskbar_and_render(true);
+            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
+            LRESULT(0)
+        }
+        WM_APP_MONITOR_RESYNC_POS => {
+            state.sync_taskbar_and_render(false);
             LRESULT(0)
         }
         WM_APP_MONITOR_TOGGLE_LOCK => {
@@ -637,6 +677,7 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
                 state.save_current_cfg(&cfg);
             }
             state.sync_taskbar_and_render(true);
+            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
             LRESULT(0)
         }
         WM_APP_MONITOR_PICK_CUSTOM_APP => {
@@ -665,6 +706,7 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_DESTROY => {
             crate::system::unregister_taskbar_overlay(hwnd);
+            unregister_taskbar_bar(TaskbarBarSlot::MonitorBar, hwnd);
             let _ = KillTimer(hwnd, TIMER_SYNC_ID);
             let _ = KillTimer(hwnd, TIMER_HOVER_ANIM_ID);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);

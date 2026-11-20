@@ -175,7 +175,8 @@ mod win {
     use std::time::{Duration, Instant};
     use windows::core::{s, w, GUID, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{
-        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, HWND, INVALID_HANDLE_VALUE, LPARAM,
+        WPARAM,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_NONE, OPEN_EXISTING,
@@ -189,6 +190,7 @@ mod win {
     };
     use windows::Win32::System::Pipes::WaitNamedPipeW;
     use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
     /// Shared protocol with `tap/src/lib.rs` (`PrettyWindowsTap.dll`).
     const CLSID_PRETTY_WINDOWS_TAP_U128: u128 = 0x8a4e6f21_9c3b_4d7a_b1e5_3f7c2a9d8410;
@@ -197,6 +199,23 @@ mod win {
     const CMD_RESTORE: u8 = 0x00;
     const CMD_HIDE: u8 = 0x01;
     const CMD_PING: u8 = 0x02;
+    const CMD_ALTTAB_RECT: u8 = 0x06;
+    const CMD_SET_ALTTAB_ITEM_STYLE: u8 = 0x07;
+    const CMD_HOVER_FLYOUT_RECT: u8 = 0x08;
+    const CMD_OSD_RECT: u8 = 0x09;
+    const CMD_SET_OSD_SUPPRESS: u8 = 0x0A;
+    const CMD_SET_OSD_FALLBACK_STYLE: u8 = 0x0B;
+    const CMD_TOOLTIP_RECT: u8 = 0x0C;
+    const CMD_SET_TOOLTIP_SUPPRESS: u8 = 0x0D;
+    const CMD_SET_TOOLTIP_FALLBACK_STYLE: u8 = 0x0E;
+
+    #[derive(Clone, Copy, Debug)]
+    pub struct AltTabBoundsCache {
+        pub thread_id: u32,
+        pub rect_dip: [f32; 4],
+        #[allow(dead_code)]
+        pub updated_at: Instant,
+    }
 
     const E_NOTFOUND_HR: HRESULT = HRESULT(0x80070490u32 as i32);
     const MAINTAIN_PING_INTERVAL: Duration = Duration::from_secs(2);
@@ -274,6 +293,30 @@ mod win {
         conflict_detected: bool,
         wake_seq: u64,
         last_processed_seq: u64,
+        alt_tab_query_seq: u64,
+        last_alt_tab_query_seq: u64,
+        alt_tab_bounds: Option<AltTabBoundsCache>,
+        hover_flyout_query_seq: u64,
+        last_hover_flyout_query_seq: u64,
+        hover_flyout_bounds: Option<AltTabBoundsCache>,
+        osd_query_seq: u64,
+        last_osd_query_seq: u64,
+        osd_bounds: Option<AltTabBoundsCache>,
+        osd_suppressed: bool,
+        synced_osd_suppressed: Option<bool>,
+        osd_fallback_colors: Option<(u32, u32)>,
+        synced_osd_fallback_colors: Option<(u32, u32)>,
+        tooltip_query_seq: u64,
+        last_tooltip_query_seq: u64,
+        tooltip_bounds: Option<AltTabBoundsCache>,
+        tooltip_suppressed: bool,
+        synced_tooltip_suppressed: Option<bool>,
+        tooltip_fallback_colors: Option<(u32, u32)>,
+        synced_tooltip_fallback_colors: Option<(u32, u32)>,
+        alt_tab_item_colors: Option<(u32, u32)>,
+        synced_alt_tab_item_colors: Option<(u32, u32)>,
+        notify_hwnd_raw: usize,
+        notify_msg: u32,
         last_inject_try: Option<Instant>,
         last_ping_ok: Option<Instant>,
         stop_worker: bool,
@@ -298,6 +341,30 @@ mod win {
                         conflict_detected: false,
                         wake_seq: 0,
                         last_processed_seq: 0,
+                        alt_tab_query_seq: 0,
+                        last_alt_tab_query_seq: 0,
+                        alt_tab_bounds: None,
+                        hover_flyout_query_seq: 0,
+                        last_hover_flyout_query_seq: 0,
+                        hover_flyout_bounds: None,
+                        osd_query_seq: 0,
+                        last_osd_query_seq: 0,
+                        osd_bounds: None,
+                        osd_suppressed: false,
+                        synced_osd_suppressed: None,
+                        osd_fallback_colors: None,
+                        synced_osd_fallback_colors: None,
+                        tooltip_query_seq: 0,
+                        last_tooltip_query_seq: 0,
+                        tooltip_bounds: None,
+                        tooltip_suppressed: false,
+                        synced_tooltip_suppressed: None,
+                        tooltip_fallback_colors: None,
+                        synced_tooltip_fallback_colors: None,
+                        alt_tab_item_colors: None,
+                        synced_alt_tab_item_colors: None,
+                        notify_hwnd_raw: 0,
+                        notify_msg: 0,
                         last_inject_try: None,
                         last_ping_ok: None,
                         stop_worker: false,
@@ -308,6 +375,285 @@ mod win {
                 )),
                 worker: None,
             }
+        }
+
+        pub fn set_notify_target(&mut self, hwnd: HWND, msg: u32) {
+            if let Ok(mut st) = self.shared.0.lock() {
+                st.notify_hwnd_raw = hwnd.0 as usize;
+                st.notify_msg = msg;
+            }
+        }
+
+        pub fn request_alt_tab_rect(&mut self, explorer_pid: u32) {
+            if explorer_pid == 0 {
+                return;
+            }
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                if st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker {
+                    st.target_pid = explorer_pid;
+                    st.alt_tab_query_seq = st.alt_tab_query_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                self.ensure_worker_started();
+                self.shared.1.notify_all();
+            }
+        }
+
+        pub fn clear_alt_tab_rect(&mut self) {
+            if let Ok(mut st) = self.shared.0.lock() {
+                st.alt_tab_bounds = None;
+            }
+        }
+
+        pub fn cached_alt_tab_rect(&self) -> Option<AltTabBoundsCache> {
+            self.shared.0.lock().ok().and_then(|st| st.alt_tab_bounds)
+        }
+
+        pub fn request_hover_flyout_rect(&mut self, explorer_pid: u32) {
+            if explorer_pid == 0 {
+                return;
+            }
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                if st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker {
+                    st.target_pid = explorer_pid;
+                    st.hover_flyout_query_seq = st.hover_flyout_query_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                self.ensure_worker_started();
+                self.shared.1.notify_all();
+            }
+        }
+
+        pub fn clear_hover_flyout_rect(&mut self) {
+            if let Ok(mut st) = self.shared.0.lock() {
+                st.hover_flyout_bounds = None;
+            }
+        }
+
+        pub fn cached_hover_flyout_rect(&self) -> Option<AltTabBoundsCache> {
+            self.shared
+                .0
+                .lock()
+                .ok()
+                .and_then(|st| st.hover_flyout_bounds)
+        }
+
+        pub fn request_osd_rect(&mut self, explorer_pid: u32) {
+            if explorer_pid == 0 {
+                return;
+            }
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                if st.desired_hidden
+                    && !st.osd_suppressed
+                    && !st.guard.is_tripped()
+                    && !st.stop_worker
+                {
+                    st.target_pid = explorer_pid;
+                    st.osd_query_seq = st.osd_query_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                self.ensure_worker_started();
+                self.shared.1.notify_all();
+            }
+        }
+
+        pub fn clear_osd_rect(&mut self) {
+            if let Ok(mut st) = self.shared.0.lock() {
+                st.osd_bounds = None;
+            }
+        }
+
+        pub fn cached_osd_rect(&self) -> Option<AltTabBoundsCache> {
+            self.shared.0.lock().ok().and_then(|st| st.osd_bounds)
+        }
+
+        pub fn set_osd_suppressed(&mut self, explorer_pid: u32, suppressed: bool) {
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                let changed = st.osd_suppressed != suppressed;
+                st.osd_suppressed = suppressed;
+                if suppressed {
+                    st.osd_bounds = None;
+                }
+                if explorer_pid != 0 {
+                    st.target_pid = explorer_pid;
+                }
+                if changed && st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker {
+                    st.wake_seq = st.wake_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                if explorer_pid != 0 {
+                    self.ensure_worker_started();
+                }
+                if self.worker.is_some() {
+                    self.shared.1.notify_all();
+                }
+            }
+        }
+
+        pub fn request_tooltip_rect(&mut self, explorer_pid: u32) {
+            if explorer_pid == 0 {
+                return;
+            }
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                if st.desired_hidden
+                    && !st.tooltip_suppressed
+                    && !st.guard.is_tripped()
+                    && !st.stop_worker
+                {
+                    st.target_pid = explorer_pid;
+                    st.tooltip_query_seq = st.tooltip_query_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                self.ensure_worker_started();
+                self.shared.1.notify_all();
+            }
+        }
+
+        pub fn clear_tooltip_rect(&mut self) {
+            if let Ok(mut st) = self.shared.0.lock() {
+                st.tooltip_bounds = None;
+            }
+        }
+
+        pub fn cached_tooltip_rect(&self) -> Option<AltTabBoundsCache> {
+            self.shared.0.lock().ok().and_then(|st| st.tooltip_bounds)
+        }
+
+        pub fn set_tooltip_suppressed(&mut self, explorer_pid: u32, suppressed: bool) {
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                let changed = st.tooltip_suppressed != suppressed;
+                st.tooltip_suppressed = suppressed;
+                if suppressed {
+                    st.tooltip_bounds = None;
+                }
+                if explorer_pid != 0 {
+                    st.target_pid = explorer_pid;
+                }
+                if changed && st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker {
+                    st.wake_seq = st.wake_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                if explorer_pid != 0 {
+                    self.ensure_worker_started();
+                }
+                if self.worker.is_some() {
+                    self.shared.1.notify_all();
+                }
+            }
+        }
+
+        fn update_style_color_pair(
+            &mut self,
+            explorer_pid: u32,
+            colors: Option<(u32, u32)>,
+            select: fn(
+                &mut TapWorkerShared,
+            ) -> (&mut Option<(u32, u32)>, &mut Option<(u32, u32)>),
+        ) {
+            let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+                let changed = {
+                    let (desired_slot, synced_slot) = select(&mut st);
+                    let changed = *desired_slot != colors;
+                    *desired_slot = colors;
+                    if colors.is_none() {
+                        *synced_slot = None;
+                    }
+                    changed
+                };
+                if explorer_pid != 0 {
+                    st.target_pid = explorer_pid;
+                }
+                if changed
+                    && colors.is_some()
+                    && st.desired_hidden
+                    && !st.guard.is_tripped()
+                    && !st.stop_worker
+                {
+                    st.wake_seq = st.wake_seq.wrapping_add(1);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_wake {
+                if explorer_pid != 0 {
+                    self.ensure_worker_started();
+                }
+                if self.worker.is_some() {
+                    self.shared.1.notify_all();
+                }
+            }
+        }
+
+        pub fn set_alt_tab_item_colors(
+            &mut self,
+            explorer_pid: u32,
+            colors: Option<(u32, u32)>,
+        ) {
+            self.update_style_color_pair(explorer_pid, colors, |st| {
+                (&mut st.alt_tab_item_colors, &mut st.synced_alt_tab_item_colors)
+            });
+        }
+
+        pub fn set_osd_fallback_colors(
+            &mut self,
+            explorer_pid: u32,
+            colors: Option<(u32, u32)>,
+        ) {
+            self.update_style_color_pair(explorer_pid, colors, |st| {
+                (&mut st.osd_fallback_colors, &mut st.synced_osd_fallback_colors)
+            });
+        }
+
+        pub fn set_tooltip_fallback_colors(
+            &mut self,
+            explorer_pid: u32,
+            colors: Option<(u32, u32)>,
+        ) {
+            self.update_style_color_pair(explorer_pid, colors, |st| {
+                (
+                    &mut st.tooltip_fallback_colors,
+                    &mut st.synced_tooltip_fallback_colors,
+                )
+            });
         }
 
         pub fn is_circuit_tripped(&self) -> bool {
@@ -326,6 +672,15 @@ mod win {
                 }
                 st.attached_pid = None;
                 st.last_ping_ok = None;
+                st.synced_alt_tab_item_colors = None;
+                st.synced_osd_fallback_colors = None;
+                st.synced_osd_suppressed = None;
+                st.osd_suppressed = false;
+                st.osd_bounds = None;
+                st.synced_tooltip_fallback_colors = None;
+                st.synced_tooltip_suppressed = None;
+                st.tooltip_suppressed = false;
+                st.tooltip_bounds = None;
                 st.target_pid = 0;
                 st.wake_seq = st.wake_seq.wrapping_add(1);
                 self.shared.1.notify_all();
@@ -346,6 +701,14 @@ mod win {
                 st.target_pid = explorer_pid;
                 if !hide {
                     st.conflict_detected = false;
+                    st.osd_suppressed = false;
+                    st.synced_osd_suppressed = None;
+                    st.synced_osd_fallback_colors = None;
+                    st.osd_bounds = None;
+                    st.tooltip_suppressed = false;
+                    st.synced_tooltip_suppressed = None;
+                    st.synced_tooltip_fallback_colors = None;
+                    st.tooltip_bounds = None;
                 }
                 st.wake_seq = st.wake_seq.wrapping_add(1);
                 hide || st.attached_pid.is_some()
@@ -370,6 +733,13 @@ mod win {
                     st.desired_hidden = false;
                     st.attached_pid = None;
                     st.last_ping_ok = None;
+                    st.synced_alt_tab_item_colors = None;
+                    st.synced_osd_fallback_colors = None;
+                    st.synced_osd_suppressed = None;
+                    st.osd_bounds = None;
+                    st.synced_tooltip_fallback_colors = None;
+                    st.synced_tooltip_suppressed = None;
+                    st.tooltip_bounds = None;
                     st.target_pid = explorer_pid;
                     return;
                 }
@@ -378,6 +748,13 @@ mod win {
                 if st.attached_pid.is_some_and(|p| p != explorer_pid) {
                     st.attached_pid = None;
                     st.last_ping_ok = None;
+                    st.synced_alt_tab_item_colors = None;
+                    st.synced_osd_fallback_colors = None;
+                    st.synced_osd_suppressed = None;
+                    st.osd_bounds = None;
+                    st.synced_tooltip_fallback_colors = None;
+                    st.synced_tooltip_suppressed = None;
+                    st.tooltip_bounds = None;
                 }
 
                 if st.desired_hidden && !st.guard.is_tripped() {
@@ -473,23 +850,59 @@ mod win {
         cleanup_stale_shadow_dlls(&shadow_cache_dir(), None);
         let (lock, wake_cv, done_cv) = &*shared;
         loop {
-            let (desired_hidden, target_pid, attached_pid, stop_worker, last_try) = {
+            let (
+                desired_hidden,
+                osd_suppressed,
+                tooltip_suppressed,
+                target_pid,
+                attached_pid,
+                stop_worker,
+                last_try,
+                need_cmd_sync,
+                want_alt_tab_query,
+                want_hover_flyout_query,
+                want_osd_query,
+                want_tooltip_query,
+            ) = {
                 let Ok(mut st) = lock.lock() else {
                     break;
                 };
-                while !st.stop_worker && st.wake_seq == st.last_processed_seq {
+                while !st.stop_worker
+                    && st.wake_seq == st.last_processed_seq
+                    && st.alt_tab_query_seq == st.last_alt_tab_query_seq
+                    && st.hover_flyout_query_seq == st.last_hover_flyout_query_seq
+                    && st.osd_query_seq == st.last_osd_query_seq
+                    && st.tooltip_query_seq == st.last_tooltip_query_seq
+                {
                     st = match wake_cv.wait(st) {
                         Ok(next) => next,
                         Err(_) => return,
                     };
                 }
+                let cmd_dirty = st.wake_seq != st.last_processed_seq;
+                let rect_dirty = st.alt_tab_query_seq != st.last_alt_tab_query_seq;
+                let hover_rect_dirty =
+                    st.hover_flyout_query_seq != st.last_hover_flyout_query_seq;
+                let osd_rect_dirty = st.osd_query_seq != st.last_osd_query_seq;
+                let tooltip_rect_dirty = st.tooltip_query_seq != st.last_tooltip_query_seq;
                 st.last_processed_seq = st.wake_seq;
+                st.last_alt_tab_query_seq = st.alt_tab_query_seq;
+                st.last_hover_flyout_query_seq = st.hover_flyout_query_seq;
+                st.last_osd_query_seq = st.osd_query_seq;
+                st.last_tooltip_query_seq = st.tooltip_query_seq;
                 (
                     st.desired_hidden && !st.guard.is_tripped(),
+                    st.osd_suppressed,
+                    st.tooltip_suppressed,
                     st.target_pid,
                     st.attached_pid,
                     st.stop_worker,
                     st.last_inject_try,
+                    cmd_dirty,
+                    rect_dirty,
+                    hover_rect_dirty,
+                    osd_rect_dirty,
+                    tooltip_rect_dirty,
                 )
             };
 
@@ -500,6 +913,17 @@ mod win {
                 }
                 if let Ok(mut st) = lock.lock() {
                     st.attached_pid = None;
+                    st.alt_tab_bounds = None;
+                    st.hover_flyout_bounds = None;
+                    st.osd_bounds = None;
+                    st.osd_suppressed = false;
+                    st.synced_osd_suppressed = None;
+                    st.synced_osd_fallback_colors = None;
+                    st.tooltip_bounds = None;
+                    st.tooltip_suppressed = false;
+                    st.synced_tooltip_suppressed = None;
+                    st.synced_tooltip_fallback_colors = None;
+                    st.synced_alt_tab_item_colors = None;
                     st.shutdown_done = true;
                 }
                 cleanup_stale_shadow_dlls(&shadow_cache_dir(), None);
@@ -512,24 +936,35 @@ mod win {
             }
 
             let mut cur_attached = attached_pid.filter(|&p| p == target_pid);
+            let mut did_cmd_sync = false;
             if let Some(pid) = cur_attached {
-                let latest_hide = lock
-                    .lock()
-                    .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
-                    .unwrap_or(false);
-                let cmd = if latest_hide { CMD_HIDE } else { CMD_RESTORE };
-                if send_command(pid, cmd, 250) {
-                    if let Ok(mut st) = lock.lock() {
-                        st.last_ping_ok = Some(Instant::now());
-                        st.guard.record_success();
-                    }
-                    continue;
-                }
-                cur_attached = None;
-                if let Ok(mut st) = lock.lock() {
-                    if st.attached_pid == Some(pid) {
-                        st.attached_pid = None;
-                        st.last_ping_ok = None;
+                if need_cmd_sync {
+                    let latest_hide = lock
+                        .lock()
+                        .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
+                        .unwrap_or(false);
+                    let cmd = if latest_hide { CMD_HIDE } else { CMD_RESTORE };
+                    if send_command(pid, cmd, 250) {
+                        did_cmd_sync = true;
+                        if let Ok(mut st) = lock.lock() {
+                            st.last_ping_ok = Some(Instant::now());
+                            st.guard.record_success();
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                                st.synced_alt_tab_item_colors = None;
+                                st.synced_osd_fallback_colors = None;
+                                st.synced_osd_suppressed = None;
+                                st.osd_bounds = None;
+                                st.synced_tooltip_fallback_colors = None;
+                                st.synced_tooltip_suppressed = None;
+                                st.tooltip_bounds = None;
+                            }
+                        }
                     }
                 }
             }
@@ -539,6 +974,11 @@ mod win {
                 if let Ok(mut st) = lock.lock() {
                     st.attached_pid = Some(target_pid);
                     st.last_ping_ok = Some(Instant::now());
+                    st.synced_alt_tab_item_colors = None;
+                    st.synced_osd_fallback_colors = None;
+                    st.synced_osd_suppressed = None;
+                    st.synced_tooltip_fallback_colors = None;
+                    st.synced_tooltip_suppressed = None;
                     st.conflict_detected = false;
                     st.guard.record_success();
                 }
@@ -575,6 +1015,11 @@ mod win {
                         if let Ok(mut st) = lock.lock() {
                             st.attached_pid = Some(target_pid);
                             st.last_ping_ok = Some(Instant::now());
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
                             st.guard.record_success();
                         }
                     } else if let Ok(mut st) = lock.lock() {
@@ -583,23 +1028,492 @@ mod win {
                 }
             }
 
-            if let Some(pid) = cur_attached {
-                let latest_hide = lock
-                    .lock()
-                    .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
-                    .unwrap_or(false);
-                let cmd = if latest_hide { CMD_HIDE } else { CMD_RESTORE };
-                if send_command(pid, cmd, 250) {
-                    if let Ok(mut st) = lock.lock() {
-                        st.last_ping_ok = Some(Instant::now());
-                    }
-                } else if let Ok(mut st) = lock.lock() {
-                    if st.attached_pid == Some(pid) {
-                        st.attached_pid = None;
-                        st.last_ping_ok = None;
+            if !did_cmd_sync {
+                if let Some(pid) = cur_attached {
+                    if need_cmd_sync
+                        || (!want_alt_tab_query
+                            && !want_hover_flyout_query
+                            && !want_osd_query
+                            && !want_tooltip_query)
+                    {
+                        let latest_hide = lock
+                            .lock()
+                            .map(|st| {
+                                st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker
+                            })
+                            .unwrap_or(false);
+                        let cmd = if latest_hide { CMD_HIDE } else { CMD_RESTORE };
+                        if send_command(pid, cmd, 250) {
+                            if let Ok(mut st) = lock.lock() {
+                                st.last_ping_ok = Some(Instant::now());
+                            }
+                        } else {
+                            cur_attached = None;
+                            if let Ok(mut st) = lock.lock() {
+                                if st.attached_pid == Some(pid) {
+                                    st.attached_pid = None;
+                                    st.last_ping_ok = None;
+                                    st.synced_alt_tab_item_colors = None;
+                                    st.synced_osd_fallback_colors = None;
+                                    st.synced_osd_suppressed = None;
+                                    st.osd_bounds = None;
+                                    st.synced_tooltip_fallback_colors = None;
+                                    st.synced_tooltip_suppressed = None;
+                                    st.tooltip_bounds = None;
+                                }
+                            }
+                        }
                     }
                 }
             }
+
+            if let Some(pid) = cur_attached {
+                let desired_colors = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.alt_tab_item_colors != st.synced_alt_tab_item_colors)
+                        .then_some(st.alt_tab_item_colors)
+                        .flatten()
+                });
+                if let Some((bg_argb, border_argb)) = desired_colors {
+                    if send_alt_tab_item_style(pid, bg_argb, border_argb, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_alt_tab_item_colors = Some((bg_argb, border_argb));
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                        }
+                    }
+                }
+            }
+
+            if let Some(pid) = cur_attached {
+                let desired_osd_colors = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.osd_fallback_colors != st.synced_osd_fallback_colors)
+                        .then_some(st.osd_fallback_colors)
+                        .flatten()
+                });
+                if let Some((bg_argb, border_argb)) = desired_osd_colors {
+                    if send_osd_fallback_style(pid, bg_argb, border_argb, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_osd_fallback_colors = Some((bg_argb, border_argb));
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                        }
+                    }
+                }
+            }
+
+            if let Some(pid) = cur_attached {
+                let desired_osd_suppress = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.synced_osd_suppressed != Some(st.osd_suppressed))
+                        .then_some(st.osd_suppressed)
+                });
+                if let Some(suppressed) = desired_osd_suppress {
+                    if send_osd_suppress(pid, suppressed, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_osd_suppressed = Some(suppressed);
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                        }
+                    }
+                }
+            }
+
+            if let Some(pid) = cur_attached {
+                let desired_tooltip_colors = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.tooltip_fallback_colors != st.synced_tooltip_fallback_colors)
+                        .then_some(st.tooltip_fallback_colors)
+                        .flatten()
+                });
+                if let Some((bg_argb, border_argb)) = desired_tooltip_colors {
+                    if send_tooltip_fallback_style(pid, bg_argb, border_argb, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_tooltip_fallback_colors = Some((bg_argb, border_argb));
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                        }
+                    }
+                }
+            }
+
+            if let Some(pid) = cur_attached {
+                let desired_tooltip_suppress = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.synced_tooltip_suppressed != Some(st.tooltip_suppressed))
+                        .then_some(st.tooltip_suppressed)
+                });
+                if let Some(suppressed) = desired_tooltip_suppress {
+                    if send_tooltip_suppress(pid, suppressed, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_tooltip_suppressed = Some(suppressed);
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                        }
+                    }
+                }
+            }
+
+            if want_alt_tab_query {
+                let query_pid = cur_attached.filter(|_| {
+                    lock.lock()
+                        .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
+                        .unwrap_or(false)
+                });
+                if let Some(pid) = query_pid {
+                    match query_card_rect(pid, CMD_ALTTAB_RECT, 120) {
+                        Ok(Some((thread_id, rect_dip))) => {
+                            let notify = if let Ok(mut st) = lock.lock() {
+                                st.alt_tab_bounds = Some(AltTabBoundsCache {
+                                    thread_id,
+                                    rect_dip,
+                                    updated_at: Instant::now(),
+                                });
+                                st.last_ping_ok = Some(Instant::now());
+                                (st.notify_hwnd_raw, st.notify_msg)
+                            } else {
+                                (0, 0)
+                            };
+                            if notify.0 != 0 && notify.1 != 0 {
+                                unsafe {
+                                    let _ = PostMessageW(
+                                        HWND(notify.0 as *mut std::ffi::c_void),
+                                        notify.1,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if let Ok(mut st) = lock.lock() {
+                                st.alt_tab_bounds = None;
+                            }
+                        }
+                        Err(()) => {
+                            cur_attached = None;
+                            if let Ok(mut st) = lock.lock() {
+                                st.alt_tab_bounds = None;
+                                st.hover_flyout_bounds = None;
+                                st.osd_bounds = None;
+                                st.tooltip_bounds = None;
+                                if st.attached_pid == Some(pid) {
+                                    st.attached_pid = None;
+                                    st.last_ping_ok = None;
+                                    st.synced_alt_tab_item_colors = None;
+                                    st.synced_osd_fallback_colors = None;
+                                    st.synced_osd_suppressed = None;
+                                    st.synced_tooltip_fallback_colors = None;
+                                    st.synced_tooltip_suppressed = None;
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(mut st) = lock.lock() {
+                    st.alt_tab_bounds = None;
+                }
+            }
+
+            if want_hover_flyout_query {
+                let query_pid = cur_attached.filter(|_| {
+                    lock.lock()
+                        .map(|st| st.desired_hidden && !st.guard.is_tripped() && !st.stop_worker)
+                        .unwrap_or(false)
+                });
+                if let Some(pid) = query_pid {
+                    match query_card_rect(pid, CMD_HOVER_FLYOUT_RECT, 120) {
+                        Ok(Some((thread_id, rect_dip))) => {
+                            let notify = if let Ok(mut st) = lock.lock() {
+                                let changed = match st.hover_flyout_bounds {
+                                    None => true,
+                                    Some(prev) => {
+                                        prev.thread_id != thread_id
+                                            || (prev.rect_dip[0] - rect_dip[0]).abs() > 0.25
+                                            || (prev.rect_dip[1] - rect_dip[1]).abs() > 0.25
+                                            || (prev.rect_dip[2] - rect_dip[2]).abs() > 0.25
+                                            || (prev.rect_dip[3] - rect_dip[3]).abs() > 0.25
+                                    }
+                                };
+                                st.hover_flyout_bounds = Some(AltTabBoundsCache {
+                                    thread_id,
+                                    rect_dip,
+                                    updated_at: Instant::now(),
+                                });
+                                st.last_ping_ok = Some(Instant::now());
+                                if changed {
+                                    (st.notify_hwnd_raw, st.notify_msg)
+                                } else {
+                                    (0, 0)
+                                }
+                            } else {
+                                (0, 0)
+                            };
+                            if notify.0 != 0 && notify.1 != 0 {
+                                unsafe {
+                                    let _ = PostMessageW(
+                                        HWND(notify.0 as *mut std::ffi::c_void),
+                                        notify.1,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let notify = if let Ok(mut st) = lock.lock() {
+                                let had_bounds = st.hover_flyout_bounds.take().is_some();
+                                if had_bounds {
+                                    (st.notify_hwnd_raw, st.notify_msg)
+                                } else {
+                                    (0, 0)
+                                }
+                            } else {
+                                (0, 0)
+                            };
+                            if notify.0 != 0 && notify.1 != 0 {
+                                unsafe {
+                                    let _ = PostMessageW(
+                                        HWND(notify.0 as *mut std::ffi::c_void),
+                                        notify.1,
+                                        WPARAM(0),
+                                        LPARAM(0),
+                                    );
+                                }
+                            }
+                        }
+                        Err(()) => {
+                            cur_attached = None;
+                            if let Ok(mut st) = lock.lock() {
+                                st.hover_flyout_bounds = None;
+                                st.alt_tab_bounds = None;
+                                st.osd_bounds = None;
+                                st.tooltip_bounds = None;
+                                if st.attached_pid == Some(pid) {
+                                    st.attached_pid = None;
+                                    st.last_ping_ok = None;
+                                    st.synced_alt_tab_item_colors = None;
+                                    st.synced_osd_fallback_colors = None;
+                                    st.synced_osd_suppressed = None;
+                                    st.synced_tooltip_fallback_colors = None;
+                                    st.synced_tooltip_suppressed = None;
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(mut st) = lock.lock() {
+                    st.hover_flyout_bounds = None;
+                }
+            }
+
+            if want_osd_query {
+                sync_suppressed_card_rect_query(
+                    lock,
+                    cur_attached,
+                    CMD_OSD_RECT,
+                    osd_suppressed,
+                    |st| st.osd_suppressed,
+                    |st| &mut st.osd_bounds,
+                );
+            }
+
+            if want_tooltip_query {
+                sync_suppressed_card_rect_query(
+                    lock,
+                    cur_attached,
+                    CMD_TOOLTIP_RECT,
+                    tooltip_suppressed,
+                    |st| st.tooltip_suppressed,
+                    |st| &mut st.tooltip_bounds,
+                );
+            }
+        }
+    }
+
+    fn sync_suppressed_card_rect_query(
+        lock: &Mutex<TapWorkerShared>,
+        cur_attached: Option<u32>,
+        cmd: u8,
+        cached_suppressed: bool,
+        get_suppressed: fn(&TapWorkerShared) -> bool,
+        get_bounds_mut: fn(&mut TapWorkerShared) -> &mut Option<AltTabBoundsCache>,
+    ) {
+        let query_pid = if cached_suppressed {
+            None
+        } else {
+            cur_attached.filter(|_| {
+                lock.lock()
+                    .map(|st| {
+                        st.desired_hidden
+                            && !get_suppressed(&st)
+                            && !st.guard.is_tripped()
+                            && !st.stop_worker
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        if let Some(pid) = query_pid {
+            match query_card_rect(pid, cmd, 120) {
+                Ok(Some((thread_id, rect_dip))) => {
+                    let notify = if let Ok(mut st) = lock.lock() {
+                        let slot = get_bounds_mut(&mut st);
+                        let changed = match *slot {
+                            None => true,
+                            Some(prev) => {
+                                prev.thread_id != thread_id
+                                    || (prev.rect_dip[0] - rect_dip[0]).abs() > 0.25
+                                    || (prev.rect_dip[1] - rect_dip[1]).abs() > 0.25
+                                    || (prev.rect_dip[2] - rect_dip[2]).abs() > 0.25
+                                    || (prev.rect_dip[3] - rect_dip[3]).abs() > 0.25
+                            }
+                        };
+                        *slot = Some(AltTabBoundsCache {
+                            thread_id,
+                            rect_dip,
+                            updated_at: Instant::now(),
+                        });
+                        st.last_ping_ok = Some(Instant::now());
+                        if changed {
+                            (st.notify_hwnd_raw, st.notify_msg)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    };
+                    if notify.0 != 0 && notify.1 != 0 {
+                        unsafe {
+                            let _ = PostMessageW(
+                                HWND(notify.0 as *mut std::ffi::c_void),
+                                notify.1,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let notify = if let Ok(mut st) = lock.lock() {
+                        let had_bounds = get_bounds_mut(&mut st).take().is_some();
+                        if had_bounds {
+                            (st.notify_hwnd_raw, st.notify_msg)
+                        } else {
+                            (0, 0)
+                        }
+                    } else {
+                        (0, 0)
+                    };
+                    if notify.0 != 0 && notify.1 != 0 {
+                        unsafe {
+                            let _ = PostMessageW(
+                                HWND(notify.0 as *mut std::ffi::c_void),
+                                notify.1,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }
+                    }
+                }
+                Err(()) => {
+                    if let Ok(mut st) = lock.lock() {
+                        st.osd_bounds = None;
+                        st.tooltip_bounds = None;
+                        st.hover_flyout_bounds = None;
+                        st.alt_tab_bounds = None;
+                        if st.attached_pid == Some(pid) {
+                            st.attached_pid = None;
+                            st.last_ping_ok = None;
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                        }
+                    }
+                }
+            }
+        } else if let Ok(mut st) = lock.lock() {
+            *get_bounds_mut(&mut st) = None;
         }
     }
 
@@ -699,6 +1613,193 @@ mod win {
                 }
             }
         }
+    }
+
+    fn query_card_rect(
+        explorer_pid: u32,
+        cmd: u8,
+        wait_ms: u32,
+    ) -> Result<Option<(u32, [f32; 4])>, ()> {
+        let handle = open_pipe(explorer_pid, wait_ms).ok_or(())?;
+        unsafe {
+            let host_pid = GetCurrentProcessId().to_le_bytes();
+            let req = [cmd, host_pid[0], host_pid[1], host_pid[2], host_pid[3]];
+            let mut written = 0u32;
+            let write_ok = WriteFile(handle, Some(&req), Some(&mut written), None).is_ok()
+                && written == req.len() as u32;
+            if !write_ok {
+                let _ = CloseHandle(handle);
+                return Err(());
+            }
+
+            let mut tag = [0u8; 1];
+            let mut tag_read = 0u32;
+            if ReadFile(handle, Some(&mut tag), Some(&mut tag_read), None).is_err() || tag_read != 1
+            {
+                let _ = CloseHandle(handle);
+                return Err(());
+            }
+            if tag[0] == 0xFF {
+                let _ = CloseHandle(handle);
+                return Ok(None);
+            }
+            if tag[0] != cmd {
+                let _ = CloseHandle(handle);
+                return Err(());
+            }
+
+            let mut payload = [0u8; 21];
+            let mut off = 0usize;
+            while off < payload.len() {
+                let mut r = 0u32;
+                if ReadFile(handle, Some(&mut payload[off..]), Some(&mut r), None).is_err()
+                    || r == 0
+                {
+                    let _ = CloseHandle(handle);
+                    return Err(());
+                }
+                off += r as usize;
+            }
+            let _ = CloseHandle(handle);
+
+            if payload[0] == 0 {
+                return Ok(None);
+            }
+            let tid = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let l = f32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+            let t = f32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+            let r = f32::from_le_bytes([payload[13], payload[14], payload[15], payload[16]]);
+            let b = f32::from_le_bytes([payload[17], payload[18], payload[19], payload[20]]);
+            Ok(Some((tid, [l, t, r, b])))
+        }
+    }
+
+    fn send_style_colors_cmd(
+        explorer_pid: u32,
+        cmd: u8,
+        bg_argb: u32,
+        border_argb: u32,
+        wait_ms: u32,
+    ) -> bool {
+        let Some(handle) = open_pipe(explorer_pid, wait_ms) else {
+            return false;
+        };
+        unsafe {
+            let host_pid = GetCurrentProcessId().to_le_bytes();
+            let bg = bg_argb.to_le_bytes();
+            let bd = border_argb.to_le_bytes();
+            let req = [
+                cmd,
+                host_pid[0],
+                host_pid[1],
+                host_pid[2],
+                host_pid[3],
+                bg[0],
+                bg[1],
+                bg[2],
+                bg[3],
+                bd[0],
+                bd[1],
+                bd[2],
+                bd[3],
+            ];
+            let mut written = 0u32;
+            let write_ok = WriteFile(handle, Some(&req), Some(&mut written), None).is_ok()
+                && written == req.len() as u32;
+
+            let mut ack = [0u8; 1];
+            let mut read = 0u32;
+            let read_ok = write_ok
+                && ReadFile(handle, Some(&mut ack), Some(&mut read), None).is_ok()
+                && read == 1
+                && (ack[0] == cmd || ack[0] == 0xFF);
+
+            let _ = CloseHandle(handle);
+            read_ok
+        }
+    }
+
+    fn send_alt_tab_item_style(
+        explorer_pid: u32,
+        bg_argb: u32,
+        border_argb: u32,
+        wait_ms: u32,
+    ) -> bool {
+        send_style_colors_cmd(
+            explorer_pid,
+            CMD_SET_ALTTAB_ITEM_STYLE,
+            bg_argb,
+            border_argb,
+            wait_ms,
+        )
+    }
+
+    fn send_osd_fallback_style(
+        explorer_pid: u32,
+        bg_argb: u32,
+        border_argb: u32,
+        wait_ms: u32,
+    ) -> bool {
+        send_style_colors_cmd(
+            explorer_pid,
+            CMD_SET_OSD_FALLBACK_STYLE,
+            bg_argb,
+            border_argb,
+            wait_ms,
+        )
+    }
+
+    fn send_tooltip_fallback_style(
+        explorer_pid: u32,
+        bg_argb: u32,
+        border_argb: u32,
+        wait_ms: u32,
+    ) -> bool {
+        send_style_colors_cmd(
+            explorer_pid,
+            CMD_SET_TOOLTIP_FALLBACK_STYLE,
+            bg_argb,
+            border_argb,
+            wait_ms,
+        )
+    }
+
+    fn send_bool_flag_cmd(explorer_pid: u32, cmd: u8, flag: bool, wait_ms: u32) -> bool {
+        let Some(handle) = open_pipe(explorer_pid, wait_ms) else {
+            return false;
+        };
+        unsafe {
+            let host_pid = GetCurrentProcessId().to_le_bytes();
+            let req = [
+                cmd,
+                host_pid[0],
+                host_pid[1],
+                host_pid[2],
+                host_pid[3],
+                u8::from(flag),
+            ];
+            let mut written = 0u32;
+            let write_ok = WriteFile(handle, Some(&req), Some(&mut written), None).is_ok()
+                && written == req.len() as u32;
+
+            let mut ack = [0u8; 1];
+            let mut read = 0u32;
+            let read_ok = write_ok
+                && ReadFile(handle, Some(&mut ack), Some(&mut read), None).is_ok()
+                && read == 1
+                && (ack[0] == cmd || ack[0] == 0xFF);
+
+            let _ = CloseHandle(handle);
+            read_ok
+        }
+    }
+
+    fn send_osd_suppress(explorer_pid: u32, suppressed: bool, wait_ms: u32) -> bool {
+        send_bool_flag_cmd(explorer_pid, CMD_SET_OSD_SUPPRESS, suppressed, wait_ms)
+    }
+
+    fn send_tooltip_suppress(explorer_pid: u32, suppressed: bool, wait_ms: u32) -> bool {
+        send_bool_flag_cmd(explorer_pid, CMD_SET_TOOLTIP_SUPPRESS, suppressed, wait_ms)
     }
 
     fn send_command(explorer_pid: u32, cmd: u8, wait_ms: u32) -> bool {

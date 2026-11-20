@@ -100,9 +100,159 @@ pub(crate) fn pick_lowest_backdrop_anchor(
     best.map(|(id, _)| id).unwrap_or(taskbar_id)
 }
 
+/// Returns `true` when two axis-aligned screen rectangles `[left, top, right, bottom]` have positive intersection area.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rects_intersect(a: [i32; 4], b: [i32; 4]) -> bool {
+    a[0].max(b[0]) < a[2].min(b[2]) && a[1].max(b[1]) < a[3].min(b[3])
+}
+
+/// Horizontal gap (in DIPs) enforced between MediaBar and MonitorBar when adjacent on the taskbar.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const TASKBAR_BAR_GAP_DIP: f32 = 2.0;
+
+/// Deadband (in DIPs) past the peer's horizontal midpoint before dragging swaps to the opposite side.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const TASKBAR_BAR_SWAP_HYSTERESIS_DIP: f32 = 8.0;
+
+/// Identifies which taskbar widget occupies a registered horizontal collision slot.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TaskbarBarSlot {
+    MediaBar = 0,
+    MonitorBar = 1,
+}
+
+impl TaskbarBarSlot {
+    #[cfg(windows)]
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    #[cfg(windows)]
+    const fn peer(self) -> Self {
+        match self {
+            Self::MediaBar => Self::MonitorBar,
+            Self::MonitorBar => Self::MediaBar,
+        }
+    }
+}
+
+/// Strategy used when resolving a bar's horizontal position against an active peer bar.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BarCollisionMode {
+    /// Passive repositioning (startup, peer resize, display/taskbar change, Reset Position).
+    Passive,
+    /// Interactive horizontal drag: holds flush at `gap_px` and swaps across peer midpoint
+    /// only after exceeding `hysteresis_px`.
+    Drag,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn horizontal_overlap_px(x: i32, width: i32, peer_left: i32, peer_right: i32) -> i64 {
+    let left = i64::from(x).max(i64::from(peer_left));
+    let right = (i64::from(x) + i64::from(width)).min(i64::from(peer_right));
+    (right - left).max(0)
+}
+
+/// Resolves a bar's horizontal screen X coordinate inside `[min_x, max_x]` so it avoids
+/// overlapping `peer_span: Option<(peer_left, peer_right)>` with at least `gap_px` spacing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn resolve_taskbar_bar_x(
+    desired_x: i32,
+    bar_width_px: i32,
+    min_x: i32,
+    max_x: i32,
+    current_x: Option<i32>,
+    peer_span: Option<(i32, i32)>,
+    gap_px: i32,
+    hysteresis_px: i32,
+    mode: BarCollisionMode,
+) -> i32 {
+    let width = bar_width_px.max(1);
+    let effective_max = max_x.max(min_x);
+    let base_x = desired_x.clamp(min_x, effective_max);
+
+    let Some((peer_left, peer_right)) = peer_span else {
+        return base_x;
+    };
+    if peer_right <= peer_left {
+        return base_x;
+    }
+
+    let gap = i64::from(gap_px.max(0));
+    let left_candidate64 = i64::from(peer_left) - gap - i64::from(width);
+    let right_candidate64 = i64::from(peer_right) + gap;
+
+    if i64::from(base_x) <= left_candidate64 || i64::from(base_x) >= right_candidate64 {
+        return base_x;
+    }
+
+    let left_fits = left_candidate64 >= i64::from(min_x);
+    let right_fits = right_candidate64 <= i64::from(effective_max);
+
+    if left_fits || right_fits {
+        let peer_mid2 = i64::from(peer_left) + i64::from(peer_right);
+        let desired_mid2 = 2 * i64::from(desired_x) + i64::from(width);
+        let choose_left = match (left_fits, right_fits) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => match mode {
+                BarCollisionMode::Passive => {
+                    if desired_mid2 != peer_mid2 {
+                        desired_mid2 < peer_mid2
+                    } else if let Some(cur) = current_x {
+                        2 * i64::from(cur) + i64::from(width) <= peer_mid2
+                    } else {
+                        true
+                    }
+                }
+                BarCollisionMode::Drag => {
+                    let hyst2 = 2 * i64::from(hysteresis_px.max(0));
+                    let cur_left = current_x
+                        .map(|cur| 2 * i64::from(cur) + i64::from(width) <= peer_mid2)
+                        .unwrap_or(desired_mid2 <= peer_mid2);
+                    if cur_left {
+                        desired_mid2 <= peer_mid2 + hyst2
+                    } else {
+                        desired_mid2 < peer_mid2 - hyst2
+                    }
+                }
+            },
+            (false, false) => unreachable!(),
+        };
+
+        let target64 = if choose_left {
+            left_candidate64
+        } else {
+            right_candidate64
+        };
+        return target64.clamp(i64::from(min_x), i64::from(effective_max)) as i32;
+    }
+
+    // Narrow taskbar fallback: neither clear side fits inside [min_x, effective_max];
+    // pick the boundary that yields strictly smaller overlap with the peer.
+    let left_overlap = horizontal_overlap_px(min_x, width, peer_left, peer_right);
+    let right_overlap = horizontal_overlap_px(effective_max, width, peer_left, peer_right);
+    if left_overlap < right_overlap {
+        min_x
+    } else if right_overlap < left_overlap {
+        effective_max
+    } else {
+        let cur = current_x.unwrap_or(base_x);
+        if (i64::from(cur) - i64::from(min_x)).abs()
+            <= (i64::from(cur) - i64::from(effective_max)).abs()
+        {
+            min_x
+        } else {
+            effective_max
+        }
+    }
+}
+
 #[cfg(windows)]
 mod win {
-    use crate::color::{derive_background_accent, Rgb};
+    use crate::color::{derive_background_accent, enforce_ui_accent_deadzone, Rgb};
     use std::cell::RefCell;
     use std::mem::size_of;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering as WinOrdering};
@@ -123,7 +273,7 @@ mod win {
         HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_SZ, REG_VALUE_TYPE,
     };
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -219,12 +369,18 @@ mod win {
 
     /// Resolves `(ui_accent, halo_dark_base)` across Tray, MediaBar, and MonitorBar:
     /// prefers MediaBar's published album accent when active; otherwise lifts backdrop lightness preserving hue.
+    /// Applies deadzone protection only to `ui_accent`, keeping silk halo base colors soft.
     pub fn resolve_unified_accent(backdrop_bg: Rgb, light_glass: bool) -> (Rgb, Rgb) {
         if let Some((al, ad)) = get_mediabar_shared_accent() {
-            return (if light_glass { al } else { ad }, ad);
+            let ui_accent =
+                enforce_ui_accent_deadzone(if light_glass { al } else { ad }, light_glass);
+            return (ui_accent, ad);
         }
         (
-            derive_background_accent(backdrop_bg, light_glass),
+            enforce_ui_accent_deadzone(
+                derive_background_accent(backdrop_bg, light_glass),
+                light_glass,
+            ),
             derive_background_accent(backdrop_bg, false),
         )
     }
@@ -380,6 +536,112 @@ mod win {
         is_window_above(taskbar_hwnd, bar_hwnd)
     }
 
+    unsafe fn is_window_above_or_equal_check(target: HWND, taskbar_hwnd: HWND) -> bool {
+        !is_taskbar_above_window(target, taskbar_hwnd)
+    }
+
+    enum FullscreenActive {
+        None,
+        GlobalNotification,
+        Window(HWND),
+    }
+
+    unsafe fn detect_fullscreen_on_monitor(anchor_hwnd: HWND) -> FullscreenActive {
+        if let Ok(state) = SHQueryUserNotificationState() {
+            if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
+                return FullscreenActive::GlobalNotification;
+            }
+        }
+
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return FullscreenActive::None;
+        }
+        let root = GetAncestor(fg, GA_ROOT);
+        let target = if root.is_invalid() { fg } else { root };
+
+        if target == anchor_hwnd
+            || target == GetShellWindow()
+            || target == GetDesktopWindow()
+            || !IsWindowVisible(target).as_bool()
+            || IsIconic(target).as_bool()
+        {
+            return FullscreenActive::None;
+        }
+
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            target,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return FullscreenActive::None;
+        }
+
+        if is_shell_or_flyout_class(target) || is_shell_flyout_process(target) {
+            return FullscreenActive::None;
+        }
+
+        let ex_style = GetWindowLongW(target, GWL_EXSTYLE) as u32;
+        if (ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0)) != 0 {
+            return FullscreenActive::None;
+        }
+
+        if let Ok(owner) = GetWindow(target, GW_OWNER) {
+            if !owner.is_invalid()
+                && (is_shell_or_flyout_class(owner) || is_shell_flyout_process(owner))
+            {
+                return FullscreenActive::None;
+            }
+        }
+
+        let anchor_mon = MonitorFromWindow(anchor_hwnd, MONITOR_DEFAULTTONEAREST);
+        let fg_mon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+        if anchor_mon != fg_mon {
+            return FullscreenActive::None;
+        }
+
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(anchor_mon, &mut mi).as_bool() {
+            return FullscreenActive::None;
+        }
+
+        let mut fg_rect = RECT::default();
+        if GetWindowRect(target, &mut fg_rect).is_err() {
+            return FullscreenActive::None;
+        }
+        let covers_monitor = fg_rect.left <= mi.rcMonitor.left
+            && fg_rect.top <= mi.rcMonitor.top
+            && fg_rect.right >= mi.rcMonitor.right
+            && fg_rect.bottom >= mi.rcMonitor.bottom;
+        if covers_monitor {
+            FullscreenActive::Window(target)
+        } else {
+            FullscreenActive::None
+        }
+    }
+
+    /// Returns `true` when the active session is in exclusive D3D fullscreen or presentation mode
+    /// (`QUNS_RUNNING_D3D_FULL_SCREEN` / `QUNS_PRESENTATION_MODE`).
+    ///
+    /// Regular borderless fullscreen windows and desktop video players intentionally return `false`
+    /// so custom translucent overlays (such as the hardware OSD capsule backdrop) can remain active
+    /// unless occluded by an external topmost window.
+    pub fn is_exclusive_fullscreen_or_presentation() -> bool {
+        unsafe {
+            SHQueryUserNotificationState().is_ok_and(|state| {
+                state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE
+            })
+        }
+    }
+
     /// Detects whether a genuine fullscreen/presentation window is currently occluding `taskbar_hwnd`.
     ///
     /// Desktop surfaces (`Progman`/`WorkerW`), system shell flyouts (Quick Settings, Start Menu,
@@ -387,88 +649,131 @@ mod win {
     /// windows sitting below `taskbar_hwnd` in Z-order (such as after `Win+D`) do not count.
     pub fn is_fullscreen_occluding_taskbar(taskbar_hwnd: HWND) -> bool {
         unsafe {
-            if let Ok(state) = SHQueryUserNotificationState() {
-                if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
+            match detect_fullscreen_on_monitor(taskbar_hwnd) {
+                FullscreenActive::None => false,
+                FullscreenActive::GlobalNotification => true,
+                // If `taskbar_hwnd` sits above `target` in Z-order (e.g. `Win+D` or desktop companion),
+                // the taskbar is visible and not occluded.
+                FullscreenActive::Window(target) => {
+                    is_window_above_or_equal_check(target, taskbar_hwnd)
+                }
+            }
+        }
+    }
+
+    unsafe fn is_external_topmost_window_intersecting(
+        cur: HWND,
+        my_pid: u32,
+        card_arr: [i32; 4],
+    ) -> bool {
+        if !IsWindowVisible(cur).as_bool() {
+            return false;
+        }
+        let mut cloaked: u32 = 0;
+        let is_cloaked = DwmGetWindowAttribute(
+            cur,
+            DWMWA_CLOAKED,
+            (&mut cloaked as *mut u32).cast(),
+            size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0;
+        if is_cloaked {
+            return false;
+        }
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(cur, Some(&mut pid));
+        if pid == 0
+            || pid == my_pid
+            || is_shell_or_flyout_class(cur)
+            || is_shell_flyout_process(cur)
+        {
+            return false;
+        }
+        let mut r = RECT::default();
+        let got_rect = DwmGetWindowAttribute(
+            cur,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&mut r as *mut RECT).cast(),
+            size_of::<RECT>() as u32,
+        )
+        .is_ok()
+            || GetWindowRect(cur, &mut r).is_ok();
+        got_rect && super::rects_intersect([r.left, r.top, r.right, r.bottom], card_arr)
+    }
+
+    /// Returns `true` when the `band=1` `ShellCardGlassBackdrop` behind the OSD would fail to
+    /// composite cleanly above foreground content: either the system is in D3D exclusive fullscreen /
+    /// presentation mode, or an external `WS_EX_TOPMOST` window overlaps `card_rect`.
+    ///
+    /// In those cases the OSD switches to calibrated inline XAML translucent glass (`band=18`)
+    /// instead of hiding its backdrop altogether.
+    pub fn should_suppress_osd_backdrop(osd_host_hwnd: HWND, card_rect: RECT) -> bool {
+        if is_exclusive_fullscreen_or_presentation() {
+            return true;
+        }
+        unsafe {
+            let my_pid = GetCurrentProcessId();
+            let card_arr = [
+                card_rect.left,
+                card_rect.top,
+                card_rect.right,
+                card_rect.bottom,
+            ];
+            let mut cur = GetTopWindow(None).unwrap_or_default();
+            for _ in 0..64 {
+                if cur.is_invalid() {
+                    break;
+                }
+                let ex = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+                if (ex & WS_EX_TOPMOST.0) == 0 {
+                    break;
+                }
+                if cur != osd_host_hwnd
+                    && is_external_topmost_window_intersecting(cur, my_pid, card_arr)
+                {
                     return true;
                 }
+                cur = GetWindow(cur, GW_HWNDNEXT).unwrap_or_default();
             }
-
-            let fg = GetForegroundWindow();
-            if fg.is_invalid() {
-                return false;
-            }
-            let root = GetAncestor(fg, GA_ROOT);
-            let target = if root.is_invalid() { fg } else { root };
-
-            if target == taskbar_hwnd
-                || target == GetShellWindow()
-                || target == GetDesktopWindow()
-                || !IsWindowVisible(target).as_bool()
-                || IsIconic(target).as_bool()
-            {
-                return false;
-            }
-
-            let mut cloaked: u32 = 0;
-            if DwmGetWindowAttribute(
-                target,
-                DWMWA_CLOAKED,
-                (&mut cloaked as *mut u32).cast(),
-                size_of::<u32>() as u32,
-            )
-            .is_ok()
-                && cloaked != 0
-            {
-                return false;
-            }
-
-            if is_shell_or_flyout_class(target) || is_shell_flyout_process(target) {
-                return false;
-            }
-
-            let ex_style = GetWindowLongW(target, GWL_EXSTYLE) as u32;
-            if (ex_style & (WS_EX_TOOLWINDOW.0 | WS_EX_TRANSPARENT.0)) != 0 {
-                return false;
-            }
-
-            if let Ok(owner) = GetWindow(target, GW_OWNER) {
-                if !owner.is_invalid()
-                    && (is_shell_or_flyout_class(owner) || is_shell_flyout_process(owner))
-                {
-                    return false;
-                }
-            }
-
-            let bar_mon = MonitorFromWindow(taskbar_hwnd, MONITOR_DEFAULTTONEAREST);
-            let fg_mon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
-            if bar_mon != fg_mon {
-                return false;
-            }
-
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if !GetMonitorInfoW(bar_mon, &mut mi).as_bool() {
-                return false;
-            }
-
-            let mut fg_rect = RECT::default();
-            if GetWindowRect(target, &mut fg_rect).is_err() {
-                return false;
-            }
-            let covers_monitor = fg_rect.left <= mi.rcMonitor.left
-                && fg_rect.top <= mi.rcMonitor.top
-                && fg_rect.right >= mi.rcMonitor.right
-                && fg_rect.bottom >= mi.rcMonitor.bottom;
-            if !covers_monitor {
-                return false;
-            }
-
-            // If `taskbar_hwnd` sits above `target` in Z-order (e.g. `Win+D` or desktop companion),
-            // the taskbar is visible and not occluded.
-            !is_taskbar_above_window(target, taskbar_hwnd)
         }
+        false
+    }
+
+    /// Returns `true` when the behind-ToolTip `ShellCardGlassBackdrop` would be occluded or fail to
+    /// composite cleanly: either the session is in D3D exclusive fullscreen / presentation mode, or an
+    /// external `WS_EX_TOPMOST` window strictly above `tooltip_host_hwnd` overlaps `card_rect`.
+    ///
+    /// Windows ordered below `tooltip_host_hwnd` in the topmost band (such as the taskbar overflow
+    /// island or taskbar itself) do not occlude the backdrop anchored right behind `tooltip_host_hwnd`.
+    pub fn should_suppress_tooltip_backdrop(tooltip_host_hwnd: HWND, card_rect: RECT) -> bool {
+        if is_exclusive_fullscreen_or_presentation() {
+            return true;
+        }
+        unsafe {
+            let my_pid = GetCurrentProcessId();
+            let card_arr = [
+                card_rect.left,
+                card_rect.top,
+                card_rect.right,
+                card_rect.bottom,
+            ];
+            let mut cur = GetTopWindow(None).unwrap_or_default();
+            for _ in 0..64 {
+                if cur.is_invalid() || cur == tooltip_host_hwnd {
+                    break;
+                }
+                let ex = GetWindowLongW(cur, GWL_EXSTYLE) as u32;
+                if (ex & WS_EX_TOPMOST.0) == 0 {
+                    break;
+                }
+                if is_external_topmost_window_intersecting(cur, my_pid, card_arr) {
+                    return true;
+                }
+                cur = GetWindow(cur, GW_HWNDNEXT).unwrap_or_default();
+            }
+        }
+        false
     }
 
     /// Places `bar_hwnd` immediately above `taskbar_hwnd` without covering higher shell flyouts,
@@ -1062,7 +1367,11 @@ mod win {
         let cls = String::from_utf16_lossy(&cls_buf[..len as usize]);
         if matches!(
             cls.as_str(),
-            "TopLevelWindowForOverflowXamlIsland" | "NotifyIconOverflowWindow"
+            "TopLevelWindowForOverflowXamlIsland"
+                | "NotifyIconOverflowWindow"
+                | "XamlExplorerHostIslandWindow"
+                | "XamlExplorerHostIslandWindow_WASDK"
+                | "Xaml_WindowedPopupClass"
         ) && !OVERFLOW_NOTIFY_PENDING.swap(true, WinOrdering::AcqRel)
         {
             if PostMessageW(
@@ -1091,8 +1400,46 @@ mod win {
         }
     }
 
-    /// RAII process-scoped WinEvent hook notifying the tray host immediately when the Explorer
-    /// system tray overflow flyout shows, moves/resizes, cloaks, or hides.
+    /// Returns `true` when any visible external topmost window in the same ZBID band sits above `hwnd`.
+    pub fn is_occluded_by_same_band_topmost(hwnd: HWND) -> bool {
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let my_pid = unsafe { GetCurrentProcessId() };
+        let my_band = window_band(hwnd);
+        let mut cur = hwnd;
+        for _ in 0..32 {
+            let Ok(prev) = (unsafe { GetWindow(cur, GW_HWNDPREV) }) else {
+                break;
+            };
+            if prev.is_invalid() || prev == cur {
+                break;
+            }
+            cur = prev;
+            if !unsafe { IsWindowVisible(cur).as_bool() } {
+                continue;
+            }
+            let ex = unsafe { GetWindowLongW(cur, GWL_EXSTYLE) as u32 };
+            if (ex & WS_EX_TOPMOST.0) == 0 {
+                continue;
+            }
+            if window_band(cur) != my_band {
+                continue;
+            }
+            let mut pid = 0u32;
+            unsafe {
+                let _ = GetWindowThreadProcessId(cur, Some(&mut pid));
+            }
+            if pid != 0 && pid != my_pid {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// RAII process-scoped WinEvent hook notifying the tray host immediately when Explorer
+    /// tray overflow flyouts or the Alt+Tab switcher (`XamlExplorerHostIslandWindow`) show, move,
+    /// cloak, or hide.
     pub struct OverflowEventHook {
         host_hwnd: HWND,
         notify_msg: u32,
@@ -1185,6 +1532,119 @@ mod win {
             OVERFLOW_NOTIFY_PENDING.store(false, WinOrdering::Release);
             OVERFLOW_NOTIFY_HWND.store(0, WinOrdering::Release);
             OVERFLOW_NOTIFY_MSG.store(0, WinOrdering::Release);
+        }
+    }
+
+    #[derive(Clone, Copy, Default)]
+    struct TaskbarBarSlotEntry {
+        hwnd_raw: isize,
+        resync_msg: u32,
+        span: Option<(i32, i32)>,
+    }
+
+    fn taskbar_bar_registry() -> &'static Mutex<[TaskbarBarSlotEntry; 2]> {
+        static REGISTRY: OnceLock<Mutex<[TaskbarBarSlotEntry; 2]>> = OnceLock::new();
+        REGISTRY.get_or_init(|| Mutex::new([TaskbarBarSlotEntry::default(); 2]))
+    }
+
+    /// Registers a taskbar widget window handle and its async resync `WM_APP_*` message ID.
+    /// Preserves any bounds span published during window creation before handle registration.
+    pub fn register_taskbar_bar(slot: super::TaskbarBarSlot, hwnd: HWND, resync_msg: u32) {
+        let mut guard = match taskbar_bar_registry().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let entry = &mut guard[slot.index()];
+        entry.hwnd_raw = hwnd.0 as isize;
+        entry.resync_msg = resync_msg;
+    }
+
+    /// Unregisters a taskbar widget handle (only if matching `hwnd`) and notifies its peer
+    /// to re-evaluate whether it can return toward its saved position.
+    pub fn unregister_taskbar_bar(slot: super::TaskbarBarSlot, hwnd: HWND) {
+        let peer_to_notify = {
+            let mut guard = match taskbar_bar_registry().lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let idx = slot.index();
+            if guard[idx].hwnd_raw == hwnd.0 as isize {
+                guard[idx] = TaskbarBarSlotEntry::default();
+            }
+            let peer = guard[slot.peer().index()];
+            if peer.hwnd_raw != 0 && peer.resync_msg != 0 {
+                Some((
+                    HWND(peer.hwnd_raw as *mut core::ffi::c_void),
+                    peer.resync_msg,
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((peer_hwnd, msg)) = peer_to_notify {
+            unsafe {
+                if IsWindow(peer_hwnd).as_bool() {
+                    let _ = PostMessageW(peer_hwnd, msg, WPARAM(0), LPARAM(0));
+                }
+            }
+        }
+    }
+
+    /// Updates the current horizontal screen span `(left, right)` of `slot` (or `None` when hidden).
+    pub fn update_taskbar_bar_bounds(slot: super::TaskbarBarSlot, span: Option<(i32, i32)>) {
+        let mut guard = match taskbar_bar_registry().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard[slot.index()].span = span.filter(|&(l, r)| r > l);
+    }
+
+    /// Returns the peer bar's active horizontal screen span `(left, right)`, ignoring stale
+    /// or hidden windows once the peer handle has been registered.
+    pub fn peer_taskbar_bar_span(slot: super::TaskbarBarSlot) -> Option<(i32, i32)> {
+        let peer = {
+            let guard = match taskbar_bar_registry().lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard[slot.peer().index()]
+        };
+        let span = peer.span?;
+        if peer.hwnd_raw != 0 {
+            let hwnd = HWND(peer.hwnd_raw as *mut core::ffi::c_void);
+            let alive_and_visible =
+                unsafe { IsWindow(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() };
+            if !alive_and_visible {
+                return None;
+            }
+        }
+        Some(span)
+    }
+
+    /// Asynchronously notifies the active peer bar to re-evaluate its position.
+    /// Must only be called after user drag commit, position reset, config width change, or close.
+    pub fn notify_peer_taskbar_bar_resync(slot: super::TaskbarBarSlot) {
+        let peer_to_notify = {
+            let guard = match taskbar_bar_registry().lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let peer = guard[slot.peer().index()];
+            if peer.hwnd_raw != 0 && peer.resync_msg != 0 {
+                Some((
+                    HWND(peer.hwnd_raw as *mut core::ffi::c_void),
+                    peer.resync_msg,
+                ))
+            } else {
+                None
+            }
+        };
+        if let Some((peer_hwnd, msg)) = peer_to_notify {
+            unsafe {
+                if IsWindow(peer_hwnd).as_bool() {
+                    let _ = PostMessageW(peer_hwnd, msg, WPARAM(0), LPARAM(0));
+                }
+            }
         }
     }
 }
@@ -1305,5 +1765,199 @@ mod tests {
                 "should NOT mark {keep} as transient occluder"
             );
         }
+    }
+
+    #[test]
+    fn rects_intersect_checks_positive_overlap_strictly() {
+        let osd = [875, 971, 1044, 1032];
+        assert!(rects_intersect(osd, [800, 950, 920, 1000]));
+        assert!(rects_intersect(osd, [0, 0, 1920, 1080]));
+        // Edge-touching only must not count as overlapping
+        assert!(!rects_intersect(osd, [0, 0, 875, 1080]));
+        assert!(!rects_intersect(osd, [1044, 971, 1200, 1032]));
+        assert!(!rects_intersect(osd, [875, 1032, 1044, 1080]));
+        // Degenerate / empty rect must not intersect
+        assert!(!rects_intersect(osd, [900, 980, 900, 1020]));
+    }
+
+    #[test]
+    fn resolve_bar_x_returns_clamped_desired_without_valid_peer() {
+        assert_eq!(
+            resolve_taskbar_bar_x(100, 256, 4, 1200, None, None, 2, 8, BarCollisionMode::Passive),
+            100
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(-50, 256, 4, 1200, None, Some((500, 500)), 2, 8, BarCollisionMode::Passive),
+            4
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(1500, 256, 4, 1200, None, Some((700, 600)), 2, 8, BarCollisionMode::Drag),
+            1200
+        );
+    }
+
+    #[test]
+    fn resolve_bar_x_passive_yields_to_peer_without_moving_peer() {
+        // Right-anchored MonitorBar collides on startup/enable with MediaBar parked at right edge:
+        // right side does not fit, so MonitorBar yields flush to the left of MediaBar.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                1516,
+                200,
+                4,
+                1516,
+                None,
+                Some((1400, 1656)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            1198
+        );
+
+        // MediaBar Reset Position when MonitorBar occupies the left anchor:
+        // left side does not fit (< min_x), so MediaBar yields flush to the right of MonitorBar.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                164,
+                256,
+                4,
+                1460,
+                Some(600),
+                Some((150, 350)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            352
+        );
+
+        // When both sides fit, Passive mode picks the nearer side cleanly.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                410,
+                256,
+                4,
+                1200,
+                Some(200),
+                Some((500, 700)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            242
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                520,
+                256,
+                4,
+                1200,
+                Some(800),
+                Some((500, 700)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            702
+        );
+    }
+
+    #[test]
+    fn resolve_bar_x_passive_narrow_taskbar_minimizes_overlap() {
+        // Peer [180, 420], range [4, 400], bar_w = 256: neither side clears peer.
+        // Overlap at min_x = 4 ([4, 260]) is 80px; overlap at max_x = 400 ([400, 656]) is 20px.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                120,
+                256,
+                4,
+                400,
+                None,
+                Some((180, 420)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            400
+        );
+
+        // Peer [200, 440], range [4, 400], bar_w = 256:
+        // Overlap at min_x = 4 ([4, 260]) is 60px; overlap at max_x = 400 ([400, 656]) is 40px -> 400.
+        // Symmetric left-win case: Peer [340, 620], range [4, 400], bar_w = 256:
+        // Overlap at min_x = 4 ([4, 260]) is 0 -> already clear, or Peer [240, 620]:
+        // min_x overlap = 20px vs max_x overlap = 220px -> picks min_x = 4.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                180,
+                256,
+                4,
+                400,
+                None,
+                Some((240, 620)),
+                2,
+                8,
+                BarCollisionMode::Passive,
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn resolve_bar_x_drag_stops_flush_and_swaps_with_symmetric_hysteresis() {
+        let peer = Some((500, 700)); // peer_mid = 600, bar_w = 256 => mid at desired_x = 472
+        // Left candidate = 500 - 2 - 256 = 242, right candidate = 700 + 2 = 702.
+
+        // Dragging from left to right: holds flush at 242 until desired center > 600 + 8.
+        assert_eq!(
+            resolve_taskbar_bar_x(260, 256, 4, 1200, Some(200), peer, 2, 8, BarCollisionMode::Drag),
+            242
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(472, 256, 4, 1200, Some(242), peer, 2, 8, BarCollisionMode::Drag),
+            242
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(480, 256, 4, 1200, Some(242), peer, 2, 8, BarCollisionMode::Drag),
+            242
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(481, 256, 4, 1200, Some(242), peer, 2, 8, BarCollisionMode::Drag),
+            702
+        );
+
+        // Dragging back from right to left: holds flush at 702 until desired center < 600 - 8.
+        assert_eq!(
+            resolve_taskbar_bar_x(472, 256, 4, 1200, Some(702), peer, 2, 8, BarCollisionMode::Drag),
+            702
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(464, 256, 4, 1200, Some(702), peer, 2, 8, BarCollisionMode::Drag),
+            702
+        );
+        assert_eq!(
+            resolve_taskbar_bar_x(463, 256, 4, 1200, Some(702), peer, 2, 8, BarCollisionMode::Drag),
+            242
+        );
+    }
+
+    #[test]
+    fn resolve_bar_x_drag_stays_flush_when_opposite_side_cannot_fit() {
+        // Peer parked on far right [1200, 1400], dragged bar max_x = 1184:
+        // right_candidate = 1402 > max_x, so dragging past peer midpoint stays flush at 942.
+        assert_eq!(
+            resolve_taskbar_bar_x(
+                1184,
+                256,
+                4,
+                1184,
+                Some(942),
+                Some((1200, 1400)),
+                2,
+                8,
+                BarCollisionMode::Drag,
+            ),
+            942
+        );
     }
 }
