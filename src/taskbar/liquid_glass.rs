@@ -2537,10 +2537,10 @@ fn render_layered_backdrop(
                 // Tier 1: Frosted Glass (毛玻璃) — creamy uniform frost tint + soft white
                 // volumetric scattering veil + fine acid-etched micro-grain + gentle hairline.
                 let base_alpha = match (light_glass, has_live_blur) {
-                    (false, true) => 0.24,
-                    (false, false) => 0.36,
-                    (true, true) => 0.34,
-                    (true, false) => 0.44,
+                    (false, true) => 0.34,
+                    (false, false) => 0.45,
+                    (true, true) => 0.41,
+                    (true, false) => 0.51,
                 };
                 let base_col = if light_glass {
                     D2D1_COLOR_F {
@@ -2670,10 +2670,10 @@ fn render_layered_backdrop(
             TaskbarStyle::Acrylic => {
                 // Tier 2: Classic Win11 dense frosted acrylic with steady tint, vertical finish & 128x128 grain.
                 let base_alpha = match (light_glass, has_live_blur) {
-                    (false, true) => 0.42,
-                    (false, false) => 0.50,
-                    (true, true) => 0.50,
-                    (true, false) => 0.58,
+                    (false, true) => 0.47,
+                    (false, false) => 0.56,
+                    (true, true) => 0.54,
+                    (true, false) => 0.63,
                 };
                 let base_col = if light_glass {
                     D2D1_COLOR_F {
@@ -2744,24 +2744,24 @@ fn render_layered_backdrop(
                 // soft bottom legibility gradient + wide-aspect liquid silk ribbons + gentle diffuse glow.
                 let base_stops = match (light_glass, has_live_blur) {
                     (false, true) => [
-                        (0.0, 0.03),
-                        (0.52, 0.07),
-                        (1.0, 0.20),
+                        (0.0, 0.14),
+                        (0.52, 0.19),
+                        (1.0, 0.31),
                     ],
                     (false, false) => [
-                        (0.0, 0.10),
-                        (0.52, 0.15),
-                        (1.0, 0.28),
+                        (0.0, 0.22),
+                        (0.52, 0.28),
+                        (1.0, 0.40),
                     ],
                     (true, true) => [
-                        (0.0, 0.10),
-                        (0.55, 0.15),
-                        (1.0, 0.24),
+                        (0.0, 0.19),
+                        (0.55, 0.25),
+                        (1.0, 0.34),
                     ],
                     (true, false) => [
-                        (0.0, 0.18),
-                        (0.55, 0.24),
-                        (1.0, 0.34),
+                        (0.0, 0.28),
+                        (0.55, 0.34),
+                        (1.0, 0.44),
                     ],
                 };
                 let (br, bg, bb) = if light_glass {
@@ -3067,20 +3067,20 @@ fn render_shell_card_layered_backdrop(
 
             let (tr, tg, tb) = recipe.tint_rgb;
             let base_a = match (style, light_glass, has_live_blur) {
-                (TaskbarStyle::Transparent, false, _) => 0.22,
-                (TaskbarStyle::Transparent, true, _) => 0.26,
-                (TaskbarStyle::Blur, false, true) => 0.26,
-                (TaskbarStyle::Blur, false, false) => 0.38,
-                (TaskbarStyle::Blur, true, true) => 0.34,
-                (TaskbarStyle::Blur, true, false) => 0.48,
-                (TaskbarStyle::Acrylic, false, true) => 0.42,
-                (TaskbarStyle::Acrylic, false, false) => 0.52,
-                (TaskbarStyle::Acrylic, true, true) => 0.50,
-                (TaskbarStyle::Acrylic, true, false) => 0.62,
-                (TaskbarStyle::LiquidGlass, false, true) => 0.14,
-                (TaskbarStyle::LiquidGlass, false, false) => 0.28,
-                (TaskbarStyle::LiquidGlass, true, true) => 0.20,
-                (TaskbarStyle::LiquidGlass, true, false) => 0.34,
+                (TaskbarStyle::Transparent, false, _) => 0.31,
+                (TaskbarStyle::Transparent, true, _) => 0.34,
+                (TaskbarStyle::Blur, false, true) => 0.36,
+                (TaskbarStyle::Blur, false, false) => 0.47,
+                (TaskbarStyle::Blur, true, true) => 0.42,
+                (TaskbarStyle::Blur, true, false) => 0.54,
+                (TaskbarStyle::Acrylic, false, true) => 0.47,
+                (TaskbarStyle::Acrylic, false, false) => 0.57,
+                (TaskbarStyle::Acrylic, true, true) => 0.54,
+                (TaskbarStyle::Acrylic, true, false) => 0.65,
+                (TaskbarStyle::LiquidGlass, false, true) => 0.26,
+                (TaskbarStyle::LiquidGlass, false, false) => 0.38,
+                (TaskbarStyle::LiquidGlass, true, true) => 0.31,
+                (TaskbarStyle::LiquidGlass, true, false) => 0.43,
                 (TaskbarStyle::Default, _, _) => 0.0,
             };
             let base_col = D2D1_COLOR_F {

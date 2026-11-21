@@ -491,35 +491,35 @@ pub const fn alt_tab_item_card_colors(
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x30_181B22,
+            bg_argb: 0x41_181B22,
             border_argb: 0x30_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x3E_1A1C22,
+            bg_argb: 0x50_1A1C22,
             border_argb: 0x34_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x46_181A20,
+            bg_argb: 0x58_181A20,
             border_argb: 0x38_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x38_1A1D24,
+            bg_argb: 0x49_1A1D24,
             border_argb: 0x42_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x48_FAFBFD,
+            bg_argb: 0x56_FAFBFD,
             border_argb: 0x22_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x5A_F8FAFC,
+            bg_argb: 0x67_F8FAFC,
             border_argb: 0x22_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x64_F6F8FB,
+            bg_argb: 0x70_F6F8FB,
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x52_FAFCFF,
+            bg_argb: 0x5F_FAFCFF,
             border_argb: 0x20_1E2430,
         }),
     }
@@ -543,35 +543,35 @@ pub const fn osd_fallback_card_colors(
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x26_12151D,
+            bg_argb: 0x47_12151D,
             border_argb: 0x38_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x3A_161922,
+            bg_argb: 0x5C_161922,
             border_argb: 0x42_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x4C_181B24,
+            bg_argb: 0x69_181B24,
             border_argb: 0x48_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x3E_141822,
+            bg_argb: 0x52_141822,
             border_argb: 0x52_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x42_FAFBFD,
+            bg_argb: 0x5B_FAFBFD,
             border_argb: 0x24_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x56_F8FAFC,
+            bg_argb: 0x6D_F8FAFC,
             border_argb: 0x28_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x68_F6F8FB,
+            bg_argb: 0x7D_F6F8FB,
             border_argb: 0x2C_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x52_FAFCFF,
+            bg_argb: 0x66_FAFCFF,
             border_argb: 0x2A_1E2430,
         }),
     }
@@ -590,35 +590,35 @@ pub const fn tooltip_fallback_card_colors(
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x36_12151D,
+            bg_argb: 0x52_12151D,
             border_argb: 0x3C_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x42_161922,
+            bg_argb: 0x62_161922,
             border_argb: 0x44_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x52_181B24,
+            bg_argb: 0x6F_181B24,
             border_argb: 0x4A_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x44_141822,
+            bg_argb: 0x5C_141822,
             border_argb: 0x54_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x48_FAFBFD,
+            bg_argb: 0x60_FAFBFD,
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x5A_F8FAFC,
+            bg_argb: 0x71_F8FAFC,
             border_argb: 0x2A_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x6C_F6F8FB,
+            bg_argb: 0x81_F6F8FB,
             border_argb: 0x2E_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x56_FAFCFF,
+            bg_argb: 0x6A_FAFCFF,
             border_argb: 0x2C_1E2430,
         }),
     }
@@ -637,35 +637,35 @@ pub const fn menu_flyout_fallback_card_colors(
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x38_12151D,
+            bg_argb: 0x55_12151D,
             border_argb: 0x3E_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x46_161922,
+            bg_argb: 0x66_161922,
             border_argb: 0x46_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x56_181B24,
+            bg_argb: 0x73_181B24,
             border_argb: 0x4C_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x48_141822,
+            bg_argb: 0x60_141822,
             border_argb: 0x56_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x4C_FAFBFD,
+            bg_argb: 0x64_FAFBFD,
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x5E_F8FAFC,
+            bg_argb: 0x75_F8FAFC,
             border_argb: 0x2A_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x70_F6F8FB,
+            bg_argb: 0x85_F6F8FB,
             border_argb: 0x2E_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x5A_FAFCFF,
+            bg_argb: 0x6E_FAFCFF,
             border_argb: 0x2C_1E2430,
         }),
     }
@@ -1026,18 +1026,28 @@ mod tests {
             let dark_bg_alpha = (dark.bg_argb >> 24) & 0xFF;
             let light_bg_alpha = (light.bg_argb >> 24) & 0xFF;
             assert!(
-                (0x28..=0x50).contains(&dark_bg_alpha),
-                "dark alpha {dark_bg_alpha:#x} out of lightweight glass range"
+                (0x38..=0x60).contains(&dark_bg_alpha),
+                "dark alpha {dark_bg_alpha:#x} out of calibrated glass range"
             );
             assert!(
-                (0x40..=0x70).contains(&light_bg_alpha),
-                "light alpha {light_bg_alpha:#x} out of lightweight frost range"
+                (0x4C..=0x78).contains(&light_bg_alpha),
+                "light alpha {light_bg_alpha:#x} out of calibrated frost range"
             );
             // Dark theme uses white glass edge; light theme uses subtle dark ink edge.
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert!((dark.bg_argb & 0xFF) < 0x40);
             assert!((light.bg_argb & 0xFF) > 0xE0);
+        }
+
+        for light in [false, true] {
+            let t = alt_tab_item_card_colors(TaskbarStyle::Transparent, light).unwrap();
+            let lg = alt_tab_item_card_colors(TaskbarStyle::LiquidGlass, light).unwrap();
+            let b = alt_tab_item_card_colors(TaskbarStyle::Blur, light).unwrap();
+            let a = alt_tab_item_card_colors(TaskbarStyle::Acrylic, light).unwrap();
+            assert!((t.bg_argb >> 24) < (lg.bg_argb >> 24));
+            assert!((lg.bg_argb >> 24) < (b.bg_argb >> 24));
+            assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
         }
     }
 
@@ -1058,19 +1068,23 @@ mod tests {
                 osd_fallback_card_colors(style, true).expect("non-default light osd colors");
             let dark_alpha = dark.bg_argb >> 24;
             let light_alpha = light.bg_argb >> 24;
-            assert!((0x20..=0x58).contains(&dark_alpha));
-            assert!((0x38..=0x78).contains(&light_alpha));
+            assert!((0x40..=0x74).contains(&dark_alpha));
+            assert!((0x54..=0x88).contains(&light_alpha));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert!((dark.bg_argb & 0xFF) < 0x40);
             assert!((light.bg_argb & 0xFF) > 0xE0);
         }
 
-        let t = osd_fallback_card_colors(TaskbarStyle::Transparent, false).unwrap();
-        let b = osd_fallback_card_colors(TaskbarStyle::Blur, false).unwrap();
-        let a = osd_fallback_card_colors(TaskbarStyle::Acrylic, false).unwrap();
-        assert!((t.bg_argb >> 24) < (b.bg_argb >> 24));
-        assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        for light in [false, true] {
+            let t = osd_fallback_card_colors(TaskbarStyle::Transparent, light).unwrap();
+            let lg = osd_fallback_card_colors(TaskbarStyle::LiquidGlass, light).unwrap();
+            let b = osd_fallback_card_colors(TaskbarStyle::Blur, light).unwrap();
+            let a = osd_fallback_card_colors(TaskbarStyle::Acrylic, light).unwrap();
+            assert!((t.bg_argb >> 24) < (lg.bg_argb >> 24));
+            assert!((lg.bg_argb >> 24) < (b.bg_argb >> 24));
+            assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        }
     }
 
     #[test]
@@ -1179,19 +1193,23 @@ mod tests {
                 tooltip_fallback_card_colors(style, true).expect("non-default light tooltip");
             let dark_alpha = dark.bg_argb >> 24;
             let light_alpha = light.bg_argb >> 24;
-            assert!((0x30..=0x60).contains(&dark_alpha));
-            assert!((0x40..=0x78).contains(&light_alpha));
+            assert!((0x48..=0x78).contains(&dark_alpha));
+            assert!((0x58..=0x8C).contains(&light_alpha));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert!((dark.bg_argb & 0xFF) < 0x40);
             assert!((light.bg_argb & 0xFF) > 0xE0);
         }
 
-        let t = tooltip_fallback_card_colors(TaskbarStyle::Transparent, false).unwrap();
-        let b = tooltip_fallback_card_colors(TaskbarStyle::Blur, false).unwrap();
-        let a = tooltip_fallback_card_colors(TaskbarStyle::Acrylic, false).unwrap();
-        assert!((t.bg_argb >> 24) < (b.bg_argb >> 24));
-        assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        for light in [false, true] {
+            let t = tooltip_fallback_card_colors(TaskbarStyle::Transparent, light).unwrap();
+            let lg = tooltip_fallback_card_colors(TaskbarStyle::LiquidGlass, light).unwrap();
+            let b = tooltip_fallback_card_colors(TaskbarStyle::Blur, light).unwrap();
+            let a = tooltip_fallback_card_colors(TaskbarStyle::Acrylic, light).unwrap();
+            assert!((t.bg_argb >> 24) < (lg.bg_argb >> 24));
+            assert!((lg.bg_argb >> 24) < (b.bg_argb >> 24));
+            assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        }
     }
 
     #[test]
@@ -1260,16 +1278,20 @@ mod tests {
                 menu_flyout_fallback_card_colors(style, false).expect("non-default dark menu");
             let light =
                 menu_flyout_fallback_card_colors(style, true).expect("non-default light menu");
-            assert!((0x30..=0x60).contains(&(dark.bg_argb >> 24)));
-            assert!((0x48..=0x78).contains(&(light.bg_argb >> 24)));
+            assert!((0x4C..=0x7C).contains(&(dark.bg_argb >> 24)));
+            assert!((0x5C..=0x90).contains(&(light.bg_argb >> 24)));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
         }
-        let t = menu_flyout_fallback_card_colors(TaskbarStyle::Transparent, false).unwrap();
-        let b = menu_flyout_fallback_card_colors(TaskbarStyle::Blur, false).unwrap();
-        let a = menu_flyout_fallback_card_colors(TaskbarStyle::Acrylic, false).unwrap();
-        assert!((t.bg_argb >> 24) < (b.bg_argb >> 24));
-        assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        for light in [false, true] {
+            let t = menu_flyout_fallback_card_colors(TaskbarStyle::Transparent, light).unwrap();
+            let lg = menu_flyout_fallback_card_colors(TaskbarStyle::LiquidGlass, light).unwrap();
+            let b = menu_flyout_fallback_card_colors(TaskbarStyle::Blur, light).unwrap();
+            let a = menu_flyout_fallback_card_colors(TaskbarStyle::Acrylic, light).unwrap();
+            assert!((t.bg_argb >> 24) < (lg.bg_argb >> 24));
+            assert!((lg.bg_argb >> 24) < (b.bg_argb >> 24));
+            assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+        }
     }
 
     #[test]

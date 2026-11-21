@@ -131,6 +131,15 @@ pub fn cleanup_stale_shadow_dlls(cache_dir: &Path, keep_filename: Option<&str>) 
 /// never locks the source DLL beside `PrettyWindows.exe`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn prepare_shadow_dll_in_dir(src_dll: &Path, cache_dir: &Path) -> Option<PathBuf> {
+    static SHADOW_COPY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SHADOW_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    // Serialize intra-process callers (Taskbar/ShellExp/ShellHost workers) so cleanup and `.tmp`
+    // staging never race and fall back to locking the source DLL directly.
+    let _guard = SHADOW_COPY_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let bytes = std::fs::read(src_dll).ok()?;
     if bytes.is_empty() {
         return None;
@@ -148,7 +157,8 @@ pub fn prepare_shadow_dll_in_dir(src_dll: &Path, cache_dir: &Path) -> Option<Pat
         return Some(dest);
     }
 
-    let tmp = cache_dir.join(format!("{filename}.{}.tmp", std::process::id()));
+    let seq = SHADOW_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = cache_dir.join(format!("{filename}.{}.{seq}.tmp", std::process::id()));
     std::fs::write(&tmp, &bytes).ok()?;
     if std::fs::rename(&tmp, &dest).is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -3964,5 +3974,53 @@ mod tests {
         assert!(!copy1.exists(), "stale v1 shadow DLL should be cleaned up");
         assert!(!stale_tmp.exists(), "stale tmp file should be cleaned up");
         assert!(unrelated.exists(), "unrelated files must remain untouched");
+    }
+
+    #[test]
+    fn prepare_shadow_dll_is_safe_under_concurrent_threads() {
+        let guard = WorkspaceTmpGuard::new("shadow_copy_concurrent_test");
+        let src_dir = guard.root.join("src");
+        let cache_dir = guard.root.join("cache");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        let payload = b"binary-payload-concurrent-v1";
+        let src_dll = src_dir.join("PrettyWindowsTap.dll");
+        std::fs::write(&src_dll, payload).expect("write src dll");
+        let expected_dest = cache_dir.join(shadow_dll_filename(payload));
+
+        let thread_count = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let mut handles = Vec::with_capacity(thread_count);
+        for _ in 0..thread_count {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let src_dll = src_dll.clone();
+            let cache_dir = cache_dir.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                prepare_shadow_dll_in_dir(&src_dll, &cache_dir)
+            }));
+        }
+
+        for handle in handles {
+            let resolved = handle
+                .join()
+                .expect("worker thread panicked")
+                .expect("shadow copy must succeed under contention");
+            assert_eq!(resolved, expected_dest);
+            assert_eq!(
+                std::fs::read(&resolved).expect("read resolved shadow copy"),
+                payload
+            );
+        }
+
+        let leftover_tmp = std::fs::read_dir(&cache_dir)
+            .expect("read cache dir")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(
+            !leftover_tmp,
+            "no stale .tmp staging files should remain after concurrent shadow copy"
+        );
     }
 }
