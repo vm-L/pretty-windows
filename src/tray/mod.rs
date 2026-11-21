@@ -137,6 +137,9 @@ mod win {
                 taskbar.set_overlay_notify_target(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 let mut overflow_hook = OverflowEventHook::new(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 overflow_hook.refresh_for_explorer_pid(taskbar.explorer_pid());
+                overflow_hook
+                    .refresh_for_shell_experience_pid(taskbar.shell_experience_pid());
+                overflow_hook.refresh_for_shell_host_pid(taskbar.shell_host_pid());
 
                 let mut host = Self {
                     hwnd,
@@ -258,6 +261,10 @@ mod win {
 
         fn set_taskbar_style(&mut self, style: TaskbarStyle) {
             self.taskbar.set_style(style);
+            self.overflow_hook
+                .refresh_for_shell_experience_pid(self.taskbar.shell_experience_pid());
+            self.overflow_hook
+                .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
             self.sync_taskbar_timer();
             self.sync_menu_state();
         }
@@ -331,6 +338,10 @@ mod win {
             let reverted = self.taskbar.on_taskbar_created();
             self.overflow_hook
                 .refresh_for_explorer_pid(self.taskbar.explorer_pid());
+            self.overflow_hook
+                .refresh_for_shell_experience_pid(self.taskbar.shell_experience_pid());
+            self.overflow_hook
+                .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
             self.sync_taskbar_timer();
             if reverted {
                 self.sync_menu_state();
@@ -500,6 +511,14 @@ mod win {
                         if state.taskbar.tick() {
                             state.sync_menu_state();
                         }
+                        let shell_exp_pid = state.taskbar.shell_experience_pid();
+                        state
+                            .overflow_hook
+                            .refresh_for_shell_experience_pid(shell_exp_pid);
+                        let shell_host_pid = state.taskbar.shell_host_pid();
+                        state
+                            .overflow_hook
+                            .refresh_for_shell_host_pid(shell_host_pid);
                         state.sync_taskbar_timer();
                     }
                 }

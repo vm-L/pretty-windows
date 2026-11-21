@@ -76,6 +76,14 @@ pub const OSD_SHADOW_PAD_DIP: f32 = 10.0;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const TOOLTIP_SHADOW_PAD_DIP: f32 = 6.0;
 
+/// Soft ambient shadow outer padding (DIP at 96 DPI) reserved around standalone menu/JumpList glass cards.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const MENU_FLYOUT_SHADOW_PAD_DIP: f32 = 10.0;
+
+/// Maximum number of simultaneous menu/JumpList surfaces tracked concurrently (main + 2 nested submenus).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const MAX_MENU_FLYOUT_SLOTS: usize = 3;
+
 /// Expands a card screen rect evenly on all four sides by `shadow_pad_dip` (scaled by `dpi`),
 /// returning `(expanded_rect, pad_px)`. Non-positive padding leaves `card_rect` unchanged.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -169,36 +177,38 @@ pub fn map_xaml_card_rect_to_screen(
     map_xaml_card_rect_to_screen_with_min(host_rect, dpi, card_dip, 80.0, 60.0)
 }
 
-/// Maps `ToolTip > ContentPresenter#LayoutRoot` DIP bounds inside `Xaml_WindowedPopupClass` to
-/// clamped screen pixels, preferring exact Island-origin mapping and popup-local coordinates with
-/// downward `ThemeShadow`-weighted fallback while rejecting mismatched/oversized popups (`MenuFlyout`).
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn map_tooltip_card_rect_to_screen(
+fn map_popup_card_rect_with_bounds(
     host_rect: [i32; 4],
     dpi: u32,
     card_dip: [f32; 4],
     island_origins: &[[i32; 2]],
+    min_w_dip: f32,
+    max_w_dip: f32,
+    min_h_dip: f32,
+    max_h_dip: f32,
+    max_pad_dip: f32,
 ) -> Option<[i32; 4]> {
     if card_dip.iter().any(|v| !v.is_finite()) {
         return None;
     }
     let rw = card_dip[2] - card_dip[0];
     let rh = card_dip[3] - card_dip[1];
-    if rw < 20.0 || rh < 16.0 || rw > 680.0 || rh > 420.0 {
+    if rw < min_w_dip || rh < min_h_dip || rw > max_w_dip || rh > max_h_dip {
         return None;
     }
     let scale = (dpi.max(96) as f32) / 96.0;
     let host_w = host_rect[2] - host_rect[0];
     let host_h = host_rect[3] - host_rect[1];
-    let min_w = (20.0 * scale).round() as i32;
-    let min_h = (16.0 * scale).round() as i32;
+    let min_w = (min_w_dip * scale).round() as i32;
+    let min_h = (min_h_dip * scale).round() as i32;
     if host_w < min_w || host_h < min_h {
         return None;
     }
     let w_px = (rw * scale).round() as i32;
     let h_px = (rh * scale).round() as i32;
     let tol = (4.0 * scale).round().max(4.0) as i32;
-    let max_pad = (48.0 * scale).round() as i32;
+    let max_pad = (max_pad_dip * scale).round() as i32;
 
     if w_px > host_w + tol * 2
         || h_px > host_h + tol * 2
@@ -238,7 +248,9 @@ pub fn map_tooltip_card_rect_to_screen(
         && (card_dip[2] * scale).round() as i32 <= host_w + tol
         && (card_dip[3] * scale).round() as i32 <= host_h + tol
     {
-        return map_xaml_card_rect_to_screen_with_min(host_rect, dpi, card_dip, 20.0, 16.0);
+        return map_xaml_card_rect_to_screen_with_min(
+            host_rect, dpi, card_dip, min_w_dip, min_h_dip,
+        );
     }
 
     // Branch 3: Fallback when owning Island origin is unavailable (account for downward ThemeShadow pad).
@@ -252,6 +264,213 @@ pub fn map_tooltip_card_rect_to_screen(
         host_rect[0] + dx + cw,
         host_rect[1] + dy + ch,
     ])
+}
+
+/// Maps `ToolTip > ContentPresenter#LayoutRoot` DIP bounds inside `Xaml_WindowedPopupClass` to
+/// clamped screen pixels, preferring exact Island-origin mapping and popup-local coordinates with
+/// downward `ThemeShadow`-weighted fallback while rejecting mismatched/oversized popups (`MenuFlyout`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn map_tooltip_card_rect_to_screen(
+    host_rect: [i32; 4],
+    dpi: u32,
+    card_dip: [f32; 4],
+    island_origins: &[[i32; 2]],
+) -> Option<[i32; 4]> {
+    map_popup_card_rect_with_bounds(
+        host_rect,
+        dpi,
+        card_dip,
+        island_origins,
+        20.0,
+        680.0,
+        16.0,
+        420.0,
+        48.0,
+    )
+}
+
+/// Maps `MenuFlyoutPresenter` / `JumpList` surface DIP bounds inside `Xaml_WindowedPopupClass`
+/// to clamped screen pixels.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn map_menu_flyout_card_rect_to_screen(
+    host_rect: [i32; 4],
+    dpi: u32,
+    card_dip: [f32; 4],
+    island_origins: &[[i32; 2]],
+) -> Option<[i32; 4]> {
+    map_popup_card_rect_with_bounds(
+        host_rect,
+        dpi,
+        card_dip,
+        island_origins,
+        64.0,
+        760.0,
+        28.0,
+        1080.0,
+        64.0,
+    )
+}
+
+/// Matches up to `MAX_MENU_FLYOUT_SLOTS` visible `Xaml_WindowedPopupClass` host windows
+/// against TAP-reported active menu/JumpList card rectangles in 1-to-1 greedy best-fit order.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn match_menu_flyout_hosts_to_rects(
+    hosts: &[([i32; 4], u32, u32)],
+    tap_rects: &[(u32, [f32; 4])],
+    island_origins_per_host: &[Vec<[i32; 2]>],
+) -> Vec<(usize, [i32; 4])> {
+    let mut candidates: Vec<(i32, usize, usize, [i32; 4])> = Vec::new();
+    for (hi, &(host_rect, dpi, host_tid)) in hosts.iter().enumerate() {
+        let origins = island_origins_per_host
+            .get(hi)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let scale = (dpi.max(96) as f32) / 96.0;
+        let host_w = host_rect[2] - host_rect[0];
+        let host_h = host_rect[3] - host_rect[1];
+        for (ti, &(tap_tid, card_dip)) in tap_rects.iter().enumerate() {
+            if tap_tid != 0 && tap_tid != host_tid {
+                continue;
+            }
+            let Some(card_rect) =
+                map_menu_flyout_card_rect_to_screen(host_rect, dpi, card_dip, origins)
+            else {
+                continue;
+            };
+            let card_w = ((card_dip[2] - card_dip[0]) * scale).round() as i32;
+            let card_h = ((card_dip[3] - card_dip[1]) * scale).round() as i32;
+            let score = (host_w - card_w).abs() + (host_h - card_h).abs();
+            candidates.push((score, hi, ti, card_rect));
+        }
+    }
+    candidates.sort_by_key(|&(score, hi, ti, _)| (score, hi, ti));
+
+    let mut used_hosts = vec![false; hosts.len()];
+    let mut used_taps = vec![false; tap_rects.len()];
+    let mut matched = Vec::with_capacity(MAX_MENU_FLYOUT_SLOTS.min(hosts.len()));
+    for (_, hi, ti, card_rect) in candidates {
+        if used_hosts[hi] || used_taps[ti] {
+            continue;
+        }
+        used_hosts[hi] = true;
+        used_taps[ti] = true;
+        matched.push((hi, card_rect));
+        if matched.len() >= MAX_MENU_FLYOUT_SLOTS {
+            break;
+        }
+    }
+    matched
+}
+
+/// Maximum number of concurrent Tier-1 Shell flyout/card backdrops managed across
+/// `ShellExperienceHost.exe` and `ShellHost.exe` (Quick Settings, Media Card,
+/// Notification Center, Calendar, Floating Toasts, JumpList and cascading submenus).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const MAX_SHELL_CARD_SLOTS: usize = 8;
+
+/// Computes intersection-over-union in `[0.0, 1.0]` for two screen pixel rectangles.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn rect_iou_px(a: [i32; 4], b: [i32; 4]) -> f32 {
+    let ix0 = a[0].max(b[0]);
+    let iy0 = a[1].max(b[1]);
+    let ix1 = a[2].min(b[2]);
+    let iy1 = a[3].min(b[3]);
+    let iw = (ix1 - ix0).max(0) as f64;
+    let ih = (iy1 - iy0).max(0) as f64;
+    let inter = iw * ih;
+    if inter <= 0.0 {
+        return 0.0;
+    }
+    let area_a = ((a[2] - a[0]).max(0) as f64) * ((a[3] - a[1]).max(0) as f64);
+    let area_b = ((b[2] - b[0]).max(0) as f64) * ((b[3] - b[1]).max(0) as f64);
+    let union = area_a + area_b - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        (inter / union) as f32
+    }
+}
+
+/// Matches visible Shell host windows (`CoreWindow`, `ControlCenterWindow`, and secondary
+/// `Xaml_WindowedPopupClass` popups) against TAP-reported DIP card bounds, allowing multi-card
+/// hosts (Notification Center + Calendar, Quick Settings + Media Card) while binding each popup
+/// host 1-to-1 and deduplicating nearly identical rectangles before returning deterministic
+/// `(host_hwnd_raw, screen_card_rect)` pairs.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn match_shell_host_cards_to_screen(
+    hosts: &[([i32; 4], u32, u32, isize, bool)],
+    tap_rects: &[(u32, [f32; 4])],
+) -> Vec<(isize, [i32; 4])> {
+    if hosts.is_empty() || tap_rects.is_empty() {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<(u8, i32, usize, usize, isize, [i32; 4])> = Vec::new();
+    for (hi, &(host_rect, dpi, host_tid, hwnd_raw, is_popup)) in hosts.iter().enumerate() {
+        let scale = (dpi.max(96) as f32) / 96.0;
+        let host_w = host_rect[2] - host_rect[0];
+        let host_h = host_rect[3] - host_rect[1];
+        let tol = (4.0 * scale).round().max(4.0) as i32;
+        for (ti, &(tap_tid, card_dip)) in tap_rects.iter().enumerate() {
+            if tap_tid != 0 && tap_tid != host_tid {
+                continue;
+            }
+            if card_dip.iter().any(|v| !v.is_finite()) {
+                continue;
+            }
+            let rw = card_dip[2] - card_dip[0];
+            let rh = card_dip[3] - card_dip[1];
+            if rw < 64.0 || rh < 28.0 {
+                continue;
+            }
+            let w_px = (rw * scale).round() as i32;
+            let h_px = (rh * scale).round() as i32;
+            if w_px > host_w + tol * 2 || h_px > host_h + tol * 2 {
+                continue;
+            }
+            let card_rect_opt = if is_popup {
+                map_menu_flyout_card_rect_to_screen(host_rect, dpi, card_dip, &[])
+            } else {
+                map_xaml_card_rect_to_screen_with_min(host_rect, dpi, card_dip, 64.0, 28.0)
+            };
+            let Some(card_rect) = card_rect_opt else {
+                continue;
+            };
+            let tier = if is_popup { 0 } else { 1 };
+            let score = (host_w - w_px).abs() + (host_h - h_px).abs();
+            candidates.push((tier, score, hi, ti, hwnd_raw, card_rect));
+        }
+    }
+    candidates.sort_by_key(|&(tier, score, hi, ti, _, _)| (tier, score, hi, ti));
+
+    let mut used_popup_hosts = vec![false; hosts.len()];
+    let mut used_taps = vec![false; tap_rects.len()];
+    let mut matched: Vec<(isize, [i32; 4])> = Vec::with_capacity(MAX_SHELL_CARD_SLOTS);
+    for (tier, _, hi, ti, hwnd_raw, card_rect) in candidates {
+        if used_taps[ti] || (tier == 0 && used_popup_hosts[hi]) {
+            continue;
+        }
+        let overlaps_existing = matched.iter().any(|&(_, prev)| {
+            let near_all_edges = (prev[0] - card_rect[0]).abs() <= 6
+                && (prev[1] - card_rect[1]).abs() <= 6
+                && (prev[2] - card_rect[2]).abs() <= 6
+                && (prev[3] - card_rect[3]).abs() <= 6;
+            near_all_edges || rect_iou_px(prev, card_rect) > 0.85
+        });
+        if overlaps_existing {
+            continue;
+        }
+        used_taps[ti] = true;
+        if tier == 0 {
+            used_popup_hosts[hi] = true;
+        }
+        matched.push((hwnd_raw, card_rect));
+        if matched.len() >= MAX_SHELL_CARD_SLOTS {
+            break;
+        }
+    }
+    matched.sort_by_key(|&(hwnd_raw, r)| (hwnd_raw, r[1], r[0], r[3], r[2]));
+    matched
 }
 
 /// Calibrated translucent title-card fill and hairline border (`0xAARRGGBB`) for
@@ -400,6 +619,53 @@ pub const fn tooltip_fallback_card_colors(
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(TooltipFallbackCardColors {
             bg_argb: 0x56_FAFCFF,
+            border_argb: 0x2C_1E2430,
+        }),
+    }
+}
+
+/// 任务栏与托盘现代右键菜单 / JumpList 在独占全屏或上层置顶窗口遮挡场景下切换为原地
+/// 半透明内联玻璃时使用的背景与边框色彩（AARRGGBB）。
+pub type MenuFlyoutFallbackCardColors = OsdFallbackCardColors;
+
+/// 根据当前任务栏主题风格与深浅色返回右键菜单 / JumpList 内联半透明玻璃配色（`Default` 返回 `None`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const fn menu_flyout_fallback_card_colors(
+    style: TaskbarStyle,
+    light_glass: bool,
+) -> Option<MenuFlyoutFallbackCardColors> {
+    match (style, light_glass) {
+        (TaskbarStyle::Default, _) => None,
+        (TaskbarStyle::Transparent, false) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x38_12151D,
+            border_argb: 0x3E_FFFFFF,
+        }),
+        (TaskbarStyle::Blur, false) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x46_161922,
+            border_argb: 0x46_FFFFFF,
+        }),
+        (TaskbarStyle::Acrylic, false) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x56_181B24,
+            border_argb: 0x4C_FFFFFF,
+        }),
+        (TaskbarStyle::LiquidGlass, false) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x48_141822,
+            border_argb: 0x56_FFFFFF,
+        }),
+        (TaskbarStyle::Transparent, true) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x4C_FAFBFD,
+            border_argb: 0x26_1A1D24,
+        }),
+        (TaskbarStyle::Blur, true) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x5E_F8FAFC,
+            border_argb: 0x2A_1A1D24,
+        }),
+        (TaskbarStyle::Acrylic, true) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x70_F6F8FB,
+            border_argb: 0x2E_1A1D24,
+        }),
+        (TaskbarStyle::LiquidGlass, true) => Some(MenuFlyoutFallbackCardColors {
+            bg_argb: 0x5A_FAFCFF,
             border_argb: 0x2C_1E2430,
         }),
     }
@@ -926,5 +1192,116 @@ mod tests {
         let a = tooltip_fallback_card_colors(TaskbarStyle::Acrylic, false).unwrap();
         assert!((t.bg_argb >> 24) < (b.bg_argb >> 24));
         assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+    }
+
+    #[test]
+    fn map_menu_flyout_handles_tall_jumplist_negative_monitor_and_cascade_matching() {
+        // Tall JumpList card (w=320, h=620 DIP) at 150% HiDPI on negative secondary monitor
+        assert_eq!(
+            map_menu_flyout_card_rect_to_screen(
+                [-1936, 360, -1424, 1344],
+                144,
+                [4.0, -648.0, 324.0, -28.0],
+                &[[-1920, 1344]]
+            ),
+            Some([-1914, 372, -1434, 1302])
+        );
+
+        // Size mismatch must be rejected
+        assert_eq!(
+            map_menu_flyout_card_rect_to_screen(
+                [100, 100, 150, 130],
+                96,
+                [0.0, 0.0, 260.0, 400.0],
+                &[]
+            ),
+            None
+        );
+
+        // 3 concurrent cascading MenuFlyouts match 1-to-1 by tightest size fit without cross-stealing
+        let hosts = [
+            ([100, 500, 380, 920], 96, 101u32), // main: 280x420
+            ([376, 620, 576, 810], 96, 101u32), // sub1: 200x190
+            ([572, 680, 742, 810], 96, 101u32), // sub2: 170x130
+        ];
+        // Deliberately reversed order from TAP
+        let tap_rects = [
+            (101u32, [6.0, 6.0, 152.0, 112.0]),  // 146x106 -> sub2
+            (101u32, [8.0, 8.0, 264.0, 396.0]),  // 256x388 -> main
+            (101u32, [6.0, 6.0, 182.0, 168.0]),  // 176x162 -> sub1
+        ];
+        let origins = [Vec::new(), Vec::new(), Vec::new()];
+        let matched = match_menu_flyout_hosts_to_rects(&hosts, &tap_rects, &origins);
+        assert_eq!(matched.len(), 3);
+        let mapped_for = |host_idx: usize| {
+            matched
+                .iter()
+                .find(|(hi, _)| *hi == host_idx)
+                .map(|&(_, r)| r)
+                .expect("expected host matched")
+        };
+        assert_eq!(mapped_for(0)[2] - mapped_for(0)[0], 256);
+        assert_eq!(mapped_for(1)[2] - mapped_for(1)[0], 176);
+        assert_eq!(mapped_for(2)[2] - mapped_for(2)[0], 146);
+    }
+
+    #[test]
+    fn menu_flyout_fallback_card_colors_scale_across_styles_and_themes() {
+        assert_eq!(menu_flyout_fallback_card_colors(TaskbarStyle::Default, false), None);
+        assert_eq!(menu_flyout_fallback_card_colors(TaskbarStyle::Default, true), None);
+
+        for style in [
+            TaskbarStyle::Transparent,
+            TaskbarStyle::Blur,
+            TaskbarStyle::Acrylic,
+            TaskbarStyle::LiquidGlass,
+        ] {
+            let dark =
+                menu_flyout_fallback_card_colors(style, false).expect("non-default dark menu");
+            let light =
+                menu_flyout_fallback_card_colors(style, true).expect("non-default light menu");
+            assert!((0x30..=0x60).contains(&(dark.bg_argb >> 24)));
+            assert!((0x48..=0x78).contains(&(light.bg_argb >> 24)));
+            assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
+            assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
+        }
+        let t = menu_flyout_fallback_card_colors(TaskbarStyle::Transparent, false).unwrap();
+        let b = menu_flyout_fallback_card_colors(TaskbarStyle::Blur, false).unwrap();
+        let a = menu_flyout_fallback_card_colors(TaskbarStyle::Acrylic, false).unwrap();
+        assert!((t.bg_argb >> 24) < (b.bg_argb >> 24));
+        assert!((b.bg_argb >> 24) < (a.bg_argb >> 24));
+    }
+
+    #[test]
+    fn match_shell_host_cards_handles_multi_card_hosts_popup_isolation_and_dedup() {
+        // Notification Center + Calendar inside a single CoreWindow (tid=201),
+        // plus Quick Settings + Media card + cascading menu popup in ShellHost (tid=301).
+        let hosts = [
+            ([1560, 0, 1920, 1032], 96, 201u32, 1001isize, false), // Notification/Calendar CoreWindow
+            ([1536, 0, 1920, 1032], 96, 301u32, 2001isize, false), // ControlCenterWindow
+            ([1600, 720, 1820, 910], 96, 301u32, 2002isize, true), // Popup menu inside Quick Settings
+        ];
+        let tap_rects = [
+            (201u32, [12.0, 20.0, 348.0, 540.0]),  // NotificationCenterGrid
+            (201u32, [12.0, 552.0, 348.0, 996.0]), // CalendarCenterGrid
+            (201u32, [13.0, 21.0, 347.0, 539.0]),  // Duplicate overlapping rect -> deduped
+            (999u32, [0.0, 0.0, 360.0, 100.0]),    // Hidden/cloaked thread not in hosts -> ignored
+            (301u32, [8.0, 8.0, 212.0, 182.0]),    // Popup menu inside ControlCenter
+            (301u32, [12.0, 480.0, 372.0, 600.0]), // MediaTransportControlsRegion
+            (301u32, [12.0, 612.0, 372.0, 1016.0]), // RootGridBorder / L1Grid
+        ];
+
+        let matched = match_shell_host_cards_to_screen(&hosts, &tap_rects);
+        assert_eq!(matched.len(), 5);
+        assert_eq!(
+            matched,
+            vec![
+                (1001isize, [1572, 20, 1908, 540]),
+                (1001isize, [1572, 552, 1908, 996]),
+                (2001isize, [1548, 480, 1908, 600]),
+                (2001isize, [1548, 612, 1908, 1016]),
+                (2002isize, [1608, 728, 1812, 902]),
+            ]
+        );
     }
 }

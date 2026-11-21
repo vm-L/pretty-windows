@@ -2,7 +2,8 @@ use super::config::TaskbarStyle;
 use super::swca::{
     backdrop_layer_plan, expand_card_rect_for_shadow, generate_acrylic_noise_bgra,
     gpu_backdrop_recipe, inset_overflow_card_rect, overflow_backdrop_layer_plan,
-    OSD_SHADOW_PAD_DIP, TOOLTIP_SHADOW_PAD_DIP,
+    MAX_MENU_FLYOUT_SLOTS, MAX_SHELL_CARD_SLOTS, MENU_FLYOUT_SHADOW_PAD_DIP, OSD_SHADOW_PAD_DIP,
+    TOOLTIP_SHADOW_PAD_DIP,
 };
 use crate::color::NEUTRAL_BACKDROP_FALLBACK;
 use crate::system::{
@@ -410,6 +411,10 @@ pub struct LiquidGlassManager {
     hover_flyout: Option<ShellCardGlassBackdrop>,
     osd: Option<ShellCardGlassBackdrop>,
     tooltip: Option<ShellCardGlassBackdrop>,
+    shell_cards: [Option<ShellCardGlassBackdrop>; MAX_SHELL_CARD_SLOTS],
+    shell_card_keys: [(isize, usize); MAX_SHELL_CARD_SLOTS],
+    menu_flyouts: [Option<ShellCardGlassBackdrop>; MAX_MENU_FLYOUT_SLOTS],
+    menu_flyout_host_hwnds: [isize; MAX_MENU_FLYOUT_SLOTS],
 }
 
 fn hide_card_backdrop(slot: &mut Option<ShellCardGlassBackdrop>) {
@@ -450,6 +455,10 @@ impl LiquidGlassManager {
             hover_flyout: None,
             osd: None,
             tooltip: None,
+            shell_cards: std::array::from_fn(|_| None),
+            shell_card_keys: [(0, 0); MAX_SHELL_CARD_SLOTS],
+            menu_flyouts: std::array::from_fn(|_| None),
+            menu_flyout_host_hwnds: [0; MAX_MENU_FLYOUT_SLOTS],
         }
     }
 
@@ -473,6 +482,16 @@ impl LiquidGlassManager {
                 .tooltip
                 .as_ref()
                 .is_some_and(|tt| tt.glass_visible || tt.blur_visible)
+            || self
+                .shell_cards
+                .iter()
+                .flatten()
+                .any(|sc| sc.glass_visible || sc.blur_visible)
+            || self
+                .menu_flyouts
+                .iter()
+                .flatten()
+                .any(|mf| mf.glass_visible || mf.blur_visible)
     }
 
     pub fn hide_overflow_backdrop(&mut self) {
@@ -495,6 +514,20 @@ impl LiquidGlassManager {
         hide_card_backdrop(&mut self.tooltip);
     }
 
+    pub fn hide_shell_cards(&mut self) {
+        for slot in &mut self.shell_cards {
+            hide_card_backdrop(slot);
+        }
+        self.shell_card_keys = [(0, 0); MAX_SHELL_CARD_SLOTS];
+    }
+
+    pub fn hide_menu_flyout_backdrops(&mut self) {
+        for slot in &mut self.menu_flyouts {
+            hide_card_backdrop(slot);
+        }
+        self.menu_flyout_host_hwnds = [0; MAX_MENU_FLYOUT_SLOTS];
+    }
+
     pub fn set_style(&mut self, style: TaskbarStyle, taskbars: &[HWND]) {
         let style_changed = self.style != style;
         self.style = style;
@@ -509,6 +542,10 @@ impl LiquidGlassManager {
             self.hover_flyout = None;
             self.osd = None;
             self.tooltip = None;
+            self.shell_cards = std::array::from_fn(|_| None);
+            self.shell_card_keys = [(0, 0); MAX_SHELL_CARD_SLOTS];
+            self.menu_flyouts = std::array::from_fn(|_| None);
+            self.menu_flyout_host_hwnds = [0; MAX_MENU_FLYOUT_SLOTS];
         }
         if style_changed {
             if style == TaskbarStyle::LiquidGlass {
@@ -531,6 +568,8 @@ impl LiquidGlassManager {
                 &mut self.tooltip,
             ]
             .into_iter()
+            .chain(self.shell_cards.iter_mut())
+            .chain(self.menu_flyouts.iter_mut())
             .flatten()
             {
                 card.blur_policy_dirty = true;
@@ -564,6 +603,8 @@ impl LiquidGlassManager {
                 &mut self.tooltip,
             ]
             .into_iter()
+            .chain(self.shell_cards.iter_mut())
+            .chain(self.menu_flyouts.iter_mut())
             .flatten()
             {
                 card.last_silk_tick = None;
@@ -589,6 +630,8 @@ impl LiquidGlassManager {
                 &mut self.tooltip,
             ]
             .into_iter()
+            .chain(self.shell_cards.iter_mut())
+            .chain(self.menu_flyouts.iter_mut())
             .flatten()
             {
                 card.blur_policy_dirty = true;
@@ -605,6 +648,10 @@ impl LiquidGlassManager {
         self.hover_flyout = None;
         self.osd = None;
         self.tooltip = None;
+        self.shell_cards = std::array::from_fn(|_| None);
+        self.shell_card_keys = [(0, 0); MAX_SHELL_CARD_SLOTS];
+        self.menu_flyouts = std::array::from_fn(|_| None);
+        self.menu_flyout_host_hwnds = [0; MAX_MENU_FLYOUT_SLOTS];
     }
 
     fn advance_liquid_glass_clock(&mut self) {
@@ -955,6 +1002,138 @@ impl LiquidGlassManager {
             dpi,
             TOOLTIP_SHADOW_PAD_DIP,
         )
+    }
+
+    /// Synchronizes up to `MAX_SHELL_CARD_SLOTS` concurrent rounded backdrops behind active
+    /// Shell flyout cards (`ShellExperienceHost.exe` and `ShellHost.exe`: Quick Settings, Media
+    /// Card, Notification Center, Calendar, Floating Toasts, JumpList, and submenus), preserving
+    /// stable `(host_hwnd, ordinal)` slot affinity so multi-card hosts never flicker.
+    pub fn sync_shell_cards(&mut self, active: &[(HWND, RECT, u32)]) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if (!plan.use_gpu_blur && !plan.use_layered_surface) || active.is_empty() {
+            self.hide_shell_cards();
+            return false;
+        }
+
+        let count = active.len().min(MAX_SHELL_CARD_SLOTS);
+        let active_slice = &active[..count];
+        let mut keys = [(0isize, 0usize); MAX_SHELL_CARD_SLOTS];
+        for (idx, &(h, _, _)) in active_slice.iter().enumerate() {
+            let raw = h.0 as isize;
+            let ordinal = active_slice[..idx]
+                .iter()
+                .filter(|&&(ph, _, _)| (ph.0 as isize) == raw)
+                .count();
+            keys[idx] = (raw, ordinal);
+        }
+
+        for slot_idx in 0..MAX_SHELL_CARD_SLOTS {
+            let bound = self.shell_card_keys[slot_idx];
+            if bound.0 != 0 && !keys[..count].contains(&bound) {
+                hide_card_backdrop(&mut self.shell_cards[slot_idx]);
+                self.shell_card_keys[slot_idx] = (0, 0);
+            }
+        }
+
+        self.advance_liquid_glass_clock();
+        let mut any_ok = false;
+        for (i, &(host_hwnd, card_rect, dpi)) in active_slice.iter().enumerate() {
+            if host_hwnd.is_invalid() {
+                continue;
+            }
+            let key = keys[i];
+            let slot_idx = self
+                .shell_card_keys
+                .iter()
+                .position(|&k| k == key)
+                .or_else(|| self.shell_card_keys.iter().position(|&k| k.0 == 0));
+            let Some(idx) = slot_idx else {
+                break;
+            };
+            self.shell_card_keys[idx] = key;
+            if sync_shell_card_backdrop(
+                &self.d2d_factory,
+                self.comp.as_ref(),
+                &mut self.shell_cards[idx],
+                w!("Pretty Windows Shell Blur"),
+                w!("Pretty Windows Shell Glass"),
+                self.style,
+                self.light_glass,
+                self.transparency_enabled,
+                self.flow_phase,
+                &self.halo_colors,
+                host_hwnd,
+                card_rect,
+                dpi,
+                MENU_FLYOUT_SHADOW_PAD_DIP,
+            ) {
+                any_ok = true;
+            }
+        }
+        any_ok
+    }
+
+    /// Synchronizes up to `MAX_MENU_FLYOUT_SLOTS` concurrent rounded backdrops behind active
+    /// `MenuFlyout` / JumpList popups (main + cascading submenus) while preserving slot affinity
+    /// per `host_hwnd` to eliminate flicker.
+    pub fn sync_menu_flyouts(&mut self, active: &[(HWND, RECT, u32)]) -> bool {
+        let plan = overflow_backdrop_layer_plan(self.style, self.transparency_enabled);
+        if (!plan.use_gpu_blur && !plan.use_layered_surface) || active.is_empty() {
+            self.hide_menu_flyout_backdrops();
+            return false;
+        }
+
+        let count = active.len().min(MAX_MENU_FLYOUT_SLOTS);
+        let active_slice = &active[..count];
+
+        for slot_idx in 0..MAX_MENU_FLYOUT_SLOTS {
+            let bound = self.menu_flyout_host_hwnds[slot_idx];
+            if bound != 0
+                && !active_slice
+                    .iter()
+                    .any(|&(h, _, _)| (h.0 as isize) == bound)
+            {
+                hide_card_backdrop(&mut self.menu_flyouts[slot_idx]);
+                self.menu_flyout_host_hwnds[slot_idx] = 0;
+            }
+        }
+
+        self.advance_liquid_glass_clock();
+        let mut any_ok = false;
+        for &(host_hwnd, card_rect, dpi) in active_slice {
+            if host_hwnd.is_invalid() {
+                continue;
+            }
+            let hwnd_raw = host_hwnd.0 as isize;
+            let slot_idx = self
+                .menu_flyout_host_hwnds
+                .iter()
+                .position(|&h| h == hwnd_raw)
+                .or_else(|| self.menu_flyout_host_hwnds.iter().position(|&h| h == 0));
+            let Some(idx) = slot_idx else {
+                break;
+            };
+            self.menu_flyout_host_hwnds[idx] = hwnd_raw;
+            if sync_shell_card_backdrop(
+                &self.d2d_factory,
+                self.comp.as_ref(),
+                &mut self.menu_flyouts[idx],
+                w!("Pretty Windows Menu Blur"),
+                w!("Pretty Windows Menu Glass"),
+                self.style,
+                self.light_glass,
+                self.transparency_enabled,
+                self.flow_phase,
+                &self.halo_colors,
+                host_hwnd,
+                card_rect,
+                dpi,
+                MENU_FLYOUT_SHADOW_PAD_DIP,
+            ) {
+                any_ok = true;
+            }
+        }
+        any_ok
     }
 }
 
@@ -1631,6 +1810,56 @@ pub fn find_visible_osd_host_window(
     found
 }
 
+/// Enumerates visible uncloaked `Xaml_WindowedPopupClass` host windows belonging to
+/// `explorer_pid` whose dimensions match `MenuFlyout` / `JumpList` surfaces, returning
+/// `(hwnd, rect, dpi, thread_id)` sorted by thread preference.
+pub fn find_visible_menu_flyout_host_windows(
+    explorer_pid: u32,
+    preferred_tids: &[u32],
+    taskbar_tids: &[u32],
+    exclude_hwnds: &[HWND],
+) -> Vec<(HWND, RECT, u32, u32)> {
+    if explorer_pid == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<(u8, HWND, RECT, u32, u32)> = Vec::new();
+    let mut prev = HWND::default();
+    for _ in 0..256 {
+        let Ok(hwnd) = (unsafe { FindWindowExW(None, prev, w!("Xaml_WindowedPopupClass"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev {
+            break;
+        }
+        prev = hwnd;
+        if exclude_hwnds.contains(&hwnd) {
+            continue;
+        }
+        let Some((rect, dpi, tid)) =
+            inspect_visible_explorer_window(hwnd, explorer_pid, 64, 28)
+        else {
+            continue;
+        };
+        let scale = (dpi.max(96) as f32) / 96.0;
+        let w_dip = ((rect.right - rect.left) as f32) / scale;
+        let h_dip = ((rect.bottom - rect.top) as f32) / scale;
+        if !(64.0..=760.0).contains(&w_dip) || !(28.0..=1080.0).contains(&h_dip) {
+            continue;
+        }
+        let prio = if preferred_tids.contains(&tid) {
+            2u8
+        } else if taskbar_tids.contains(&tid) {
+            1u8
+        } else {
+            0u8
+        };
+        out.push((prio, hwnd, rect, dpi, tid));
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().map(|(_, h, r, d, t)| (h, r, d, t)).collect()
+}
+
 /// Locates the active uncloaked `Xaml_WindowedPopupClass` host window belonging to `explorer_pid`
 /// for a system/taskbar/overflow `ToolTip`, preferring matching dimensions and known/taskbar UI threads.
 pub fn find_visible_tooltip_host_window(
@@ -1638,6 +1867,7 @@ pub fn find_visible_tooltip_host_window(
     preferred_tid: Option<u32>,
     taskbar_tids: &[u32],
     expected_size_dip: Option<(f32, f32)>,
+    exclude_hwnds: &[HWND],
 ) -> Option<(HWND, RECT, u32, u32)> {
     if explorer_pid == 0 {
         return None;
@@ -1654,6 +1884,9 @@ pub fn find_visible_tooltip_host_window(
             break;
         }
         prev = hwnd;
+        if exclude_hwnds.contains(&hwnd) {
+            continue;
+        }
         let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, explorer_pid, 20, 16)
         else {
             continue;
@@ -1703,6 +1936,101 @@ pub fn find_visible_tooltip_host_window(
         }
     }
     best.map(|(_, _, h, r, d, t)| (h, r, d, t))
+}
+
+/// Enumerates visible uncloaked `CoreWindow` (`BAND` 4 or 6) and `Xaml_WindowedPopupClass`
+/// windows owned by `shell_exp_pid` (Notification Center, Calendar, Floating Toasts, JumpLists,
+/// Legacy Quick Settings), excluding `1x1` dormant host windows. Returns `(hwnd, rect, dpi, tid, is_popup)`.
+pub fn find_visible_shell_experience_host_windows(
+    shell_exp_pid: u32,
+) -> Vec<(HWND, RECT, u32, u32, bool)> {
+    if shell_exp_pid == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut prev = HWND::default();
+    for _ in 0..128 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev, w!("Windows.UI.Core.CoreWindow"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev {
+            break;
+        }
+        prev = hwnd;
+        let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, shell_exp_pid, 64, 28)
+        else {
+            continue;
+        };
+        if !matches!(crate::system::window_band(hwnd), Some(4 | 6)) {
+            continue;
+        }
+        out.push((hwnd, rect, dpi, tid, false));
+    }
+    let mut prev_popup = HWND::default();
+    for _ in 0..128 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev_popup, w!("Xaml_WindowedPopupClass"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev_popup {
+            break;
+        }
+        prev_popup = hwnd;
+        if let Some((rect, dpi, tid)) = inspect_visible_explorer_window(hwnd, shell_exp_pid, 64, 28)
+        {
+            out.push((hwnd, rect, dpi, tid, true));
+        }
+    }
+    out
+}
+
+/// Enumerates visible uncloaked `ControlCenterWindow` and secondary `Xaml_WindowedPopupClass`
+/// windows owned by `shell_host_pid` (Win11 24H2/26H2 Quick Settings & Media Card).
+/// Returns `(hwnd, rect, dpi, tid, is_popup)`.
+pub fn find_visible_shell_host_windows(
+    shell_host_pid: u32,
+) -> Vec<(HWND, RECT, u32, u32, bool)> {
+    if shell_host_pid == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut prev = HWND::default();
+    for _ in 0..64 {
+        let Ok(hwnd) = (unsafe { FindWindowExW(None, prev, w!("ControlCenterWindow"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev {
+            break;
+        }
+        prev = hwnd;
+        if let Some((rect, dpi, tid)) =
+            inspect_visible_explorer_window(hwnd, shell_host_pid, 64, 28)
+        {
+            out.push((hwnd, rect, dpi, tid, false));
+        }
+    }
+    let mut prev_popup = HWND::default();
+    for _ in 0..128 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev_popup, w!("Xaml_WindowedPopupClass"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev_popup {
+            break;
+        }
+        prev_popup = hwnd;
+        if let Some((rect, dpi, tid)) =
+            inspect_visible_explorer_window(hwnd, shell_host_pid, 64, 28)
+        {
+            out.push((hwnd, rect, dpi, tid, true));
+        }
+    }
+    out
 }
 
 unsafe fn xaml_island_screen_origin(hwnd: HWND) -> Option<[i32; 2]> {

@@ -502,7 +502,7 @@ mod win {
         })
     }
 
-    fn window_band(hwnd: HWND) -> Option<u32> {
+    pub fn window_band(hwnd: HWND) -> Option<u32> {
         if hwnd.is_invalid() {
             return None;
         }
@@ -1372,6 +1372,8 @@ mod win {
                 | "XamlExplorerHostIslandWindow"
                 | "XamlExplorerHostIslandWindow_WASDK"
                 | "Xaml_WindowedPopupClass"
+                | "Windows.UI.Core.CoreWindow"
+                | "ControlCenterWindow"
         ) && !OVERFLOW_NOTIFY_PENDING.swap(true, WinOrdering::AcqRel)
         {
             if PostMessageW(
@@ -1437,9 +1439,79 @@ mod win {
         false
     }
 
-    /// RAII process-scoped WinEvent hook notifying the tray host immediately when Explorer
-    /// tray overflow flyouts or the Alt+Tab switcher (`XamlExplorerHostIslandWindow`) show, move,
-    /// cloak, or hide.
+    unsafe fn install_window_event_hooks(pid: u32) -> (HWINEVENTHOOK, HWINEVENTHOOK, HWINEVENTHOOK) {
+        if pid == 0 {
+            return (
+                HWINEVENTHOOK::default(),
+                HWINEVENTHOOK::default(),
+                HWINEVENTHOOK::default(),
+            );
+        }
+        let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+        (
+            SetWinEventHook(
+                EVENT_OBJECT_SHOW,
+                EVENT_OBJECT_HIDE,
+                HMODULE::default(),
+                Some(overflow_win_event_proc),
+                pid,
+                0,
+                flags,
+            ),
+            SetWinEventHook(
+                EVENT_OBJECT_LOCATIONCHANGE,
+                EVENT_OBJECT_LOCATIONCHANGE,
+                HMODULE::default(),
+                Some(overflow_win_event_proc),
+                pid,
+                0,
+                flags,
+            ),
+            SetWinEventHook(
+                EVENT_OBJECT_CLOAKED,
+                EVENT_OBJECT_UNCLOAKED,
+                HMODULE::default(),
+                Some(overflow_win_event_proc),
+                pid,
+                0,
+                flags,
+            ),
+        )
+    }
+
+    unsafe fn unhook_triplet(hooks: [&mut HWINEVENTHOOK; 3]) {
+        for hook in hooks {
+            if !hook.is_invalid() {
+                let _ = UnhookWinEvent(*hook);
+                *hook = HWINEVENTHOOK::default();
+            }
+        }
+    }
+
+    fn refresh_win_event_triplet(
+        pid_slot: &mut u32,
+        hooks: [&mut HWINEVENTHOOK; 3],
+        new_pid: u32,
+    ) {
+        if *pid_slot == new_pid && (!hooks[0].is_invalid() || new_pid == 0) {
+            return;
+        }
+        let [h0, h1, h2] = hooks;
+        unsafe {
+            unhook_triplet([h0, h1, h2]);
+        }
+        *pid_slot = new_pid;
+        if new_pid == 0 {
+            return;
+        }
+        let (nh0, nh1, nh2) = unsafe { install_window_event_hooks(new_pid) };
+        *h0 = nh0;
+        *h1 = nh1;
+        *h2 = nh2;
+    }
+
+    /// RAII process-scoped WinEvent hook notifying the tray host immediately when Explorer,
+    /// `ShellExperienceHost`, or `ShellHost` flyouts show, move, cloak, or hide.
     pub struct OverflowEventHook {
         host_hwnd: HWND,
         notify_msg: u32,
@@ -1447,6 +1519,14 @@ mod win {
         show_hide_hook: HWINEVENTHOOK,
         location_hook: HWINEVENTHOOK,
         cloak_hook: HWINEVENTHOOK,
+        shell_exp_pid: u32,
+        shell_show_hide_hook: HWINEVENTHOOK,
+        shell_location_hook: HWINEVENTHOOK,
+        shell_cloak_hook: HWINEVENTHOOK,
+        shell_host_pid: u32,
+        shell_host_show_hide_hook: HWINEVENTHOOK,
+        shell_host_location_hook: HWINEVENTHOOK,
+        shell_host_cloak_hook: HWINEVENTHOOK,
     }
 
     impl OverflowEventHook {
@@ -1461,68 +1541,80 @@ mod win {
                 show_hide_hook: HWINEVENTHOOK::default(),
                 location_hook: HWINEVENTHOOK::default(),
                 cloak_hook: HWINEVENTHOOK::default(),
+                shell_exp_pid: 0,
+                shell_show_hide_hook: HWINEVENTHOOK::default(),
+                shell_location_hook: HWINEVENTHOOK::default(),
+                shell_cloak_hook: HWINEVENTHOOK::default(),
+                shell_host_pid: 0,
+                shell_host_show_hide_hook: HWINEVENTHOOK::default(),
+                shell_host_location_hook: HWINEVENTHOOK::default(),
+                shell_host_cloak_hook: HWINEVENTHOOK::default(),
             }
         }
 
         pub fn refresh_for_explorer_pid(&mut self, pid: u32) {
             OVERFLOW_NOTIFY_HWND.store(self.host_hwnd.0 as usize, WinOrdering::Release);
             OVERFLOW_NOTIFY_MSG.store(self.notify_msg, WinOrdering::Release);
-            if self.explorer_pid == pid
-                && (!self.show_hide_hook.is_invalid() || pid == 0)
-            {
-                return;
-            }
-            self.unhook_all();
-            self.explorer_pid = pid;
-            if pid == 0 {
-                return;
-            }
-            let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
-            unsafe {
-                self.show_hide_hook = SetWinEventHook(
-                    EVENT_OBJECT_SHOW,
-                    EVENT_OBJECT_HIDE,
-                    HMODULE::default(),
-                    Some(overflow_win_event_proc),
-                    pid,
-                    0,
-                    flags,
-                );
-                self.location_hook = SetWinEventHook(
-                    EVENT_OBJECT_LOCATIONCHANGE,
-                    EVENT_OBJECT_LOCATIONCHANGE,
-                    HMODULE::default(),
-                    Some(overflow_win_event_proc),
-                    pid,
-                    0,
-                    flags,
-                );
-                self.cloak_hook = SetWinEventHook(
-                    EVENT_OBJECT_CLOAKED,
-                    EVENT_OBJECT_UNCLOAKED,
-                    HMODULE::default(),
-                    Some(overflow_win_event_proc),
-                    pid,
-                    0,
-                    flags,
-                );
-            }
+            refresh_win_event_triplet(
+                &mut self.explorer_pid,
+                [
+                    &mut self.show_hide_hook,
+                    &mut self.location_hook,
+                    &mut self.cloak_hook,
+                ],
+                pid,
+            );
+        }
+
+        pub fn refresh_for_shell_experience_pid(&mut self, pid: u32) {
+            OVERFLOW_NOTIFY_HWND.store(self.host_hwnd.0 as usize, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(self.notify_msg, WinOrdering::Release);
+            refresh_win_event_triplet(
+                &mut self.shell_exp_pid,
+                [
+                    &mut self.shell_show_hide_hook,
+                    &mut self.shell_location_hook,
+                    &mut self.shell_cloak_hook,
+                ],
+                pid,
+            );
+        }
+
+        pub fn refresh_for_shell_host_pid(&mut self, pid: u32) {
+            OVERFLOW_NOTIFY_HWND.store(self.host_hwnd.0 as usize, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(self.notify_msg, WinOrdering::Release);
+            refresh_win_event_triplet(
+                &mut self.shell_host_pid,
+                [
+                    &mut self.shell_host_show_hide_hook,
+                    &mut self.shell_host_location_hook,
+                    &mut self.shell_host_cloak_hook,
+                ],
+                pid,
+            );
         }
 
         fn unhook_all(&mut self) {
             unsafe {
-                for hook in [
+                unhook_triplet([
                     &mut self.show_hide_hook,
                     &mut self.location_hook,
                     &mut self.cloak_hook,
-                ] {
-                    if !hook.is_invalid() {
-                        let _ = UnhookWinEvent(*hook);
-                        *hook = HWINEVENTHOOK::default();
-                    }
-                }
+                ]);
+                unhook_triplet([
+                    &mut self.shell_show_hide_hook,
+                    &mut self.shell_location_hook,
+                    &mut self.shell_cloak_hook,
+                ]);
+                unhook_triplet([
+                    &mut self.shell_host_show_hide_hook,
+                    &mut self.shell_host_location_hook,
+                    &mut self.shell_host_cloak_hook,
+                ]);
             }
             self.explorer_pid = 0;
+            self.shell_exp_pid = 0;
+            self.shell_host_pid = 0;
         }
     }
 

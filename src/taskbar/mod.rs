@@ -15,16 +15,21 @@ mod win {
     use super::config::{portable_config_path, TaskbarConfig, TaskbarStyle};
     use super::liquid_glass::{
         collect_tooltip_island_origins, find_visible_alttab_host_window,
-        find_visible_hover_flyout_host_window, find_visible_osd_host_window,
-        find_visible_tooltip_host_window, LiquidGlassManager,
+        find_visible_hover_flyout_host_window, find_visible_menu_flyout_host_windows,
+        find_visible_osd_host_window, find_visible_shell_experience_host_windows,
+        find_visible_shell_host_windows, find_visible_tooltip_host_window, LiquidGlassManager,
     };
     use super::swca::{
         alt_tab_item_card_colors, enumerate_taskbar_windows, explorer_pid_from_taskbars,
         map_tooltip_card_rect_to_screen, map_xaml_card_rect_to_screen,
-        map_xaml_card_rect_to_screen_with_min, osd_fallback_card_colors, taskbar_thread_ids,
-        tooltip_fallback_card_colors,
+        map_xaml_card_rect_to_screen_with_min, match_menu_flyout_hosts_to_rects,
+        match_shell_host_cards_to_screen, menu_flyout_fallback_card_colors,
+        osd_fallback_card_colors, taskbar_thread_ids, tooltip_fallback_card_colors,
+        MAX_MENU_FLYOUT_SLOTS, MAX_SHELL_CARD_SLOTS,
     };
-    use super::tap_host::TapClient;
+    use super::tap_host::{
+        find_shell_experience_host_pid, find_shell_host_pid, ShellFlyoutTapClient, TapClient,
+    };
     use crate::color::Rgb;
     use crate::system::{
         is_exclusive_fullscreen_or_presentation, is_transparency_enabled,
@@ -36,7 +41,57 @@ mod win {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Direct2D::ID2D1Factory1;
 
-    /// Coordinates Windows 11 taskbar, overflow flyout, Alt+Tab switcher, hover flyout, hardware OSD, and ToolTip appearance across all monitors.
+    struct ShellFlyoutHostState {
+        tap: ShellFlyoutTapClient,
+        cached_pid: u32,
+        last_pid_scan: Instant,
+        active: bool,
+        last_query: Instant,
+        last_sig: Vec<(isize, [i32; 4])>,
+        suppressed: bool,
+        find_pid: fn() -> u32,
+    }
+
+    impl ShellFlyoutHostState {
+        fn new(tap: ShellFlyoutTapClient, find_pid: fn() -> u32) -> Self {
+            let past = Instant::now() - Duration::from_secs(10);
+            Self {
+                tap,
+                cached_pid: 0,
+                last_pid_scan: past,
+                active: false,
+                last_query: past,
+                last_sig: Vec::new(),
+                suppressed: false,
+                find_pid,
+            }
+        }
+
+        fn resolve_pid(&mut self, force: bool) -> u32 {
+            if force
+                || self.cached_pid == 0
+                || self.last_pid_scan.elapsed() >= Duration::from_secs(2)
+            {
+                self.cached_pid = (self.find_pid)();
+                self.last_pid_scan = Instant::now();
+            }
+            self.cached_pid
+        }
+
+        fn reset_tracking(&mut self, clear_colors: bool) {
+            self.active = false;
+            self.last_sig.clear();
+            self.suppressed = false;
+            self.tap.clear_flyout_rects();
+            self.tap.set_flyout_suppressed(0, false);
+            if clear_colors {
+                self.tap.set_flyout_fallback_colors(0, None);
+            }
+        }
+    }
+
+    /// Coordinates Windows 11 taskbar, overflow flyout, Alt+Tab switcher, hover flyout, hardware OSD,
+    /// menu flyouts/JumpLists, Quick Settings, Notification Center, Floating Toasts, and ToolTips across all monitors.
     pub struct TaskbarController {
         config_path: PathBuf,
         style: TaskbarStyle,
@@ -62,6 +117,14 @@ mod win {
         last_tooltip_host_rect: Option<RECT>,
         known_tooltip_tid: Option<u32>,
         tooltip_suppressed: bool,
+        menu_flyout_host_active: bool,
+        last_menu_flyout_query: Instant,
+        last_menu_flyout_sig: Vec<(isize, [i32; 4])>,
+        known_menu_flyout_tids: Vec<u32>,
+        menu_flyout_suppressed: bool,
+        active_menu_flyout_hwnds: Vec<HWND>,
+        shell_exp_host: ShellFlyoutHostState,
+        shell_host: ShellFlyoutHostState,
     }
 
     impl TaskbarController {
@@ -94,6 +157,20 @@ mod win {
                 last_tooltip_host_rect: None,
                 known_tooltip_tid: None,
                 tooltip_suppressed: false,
+                menu_flyout_host_active: false,
+                last_menu_flyout_query: Instant::now() - Duration::from_secs(10),
+                last_menu_flyout_sig: Vec::new(),
+                known_menu_flyout_tids: Vec::new(),
+                menu_flyout_suppressed: false,
+                active_menu_flyout_hwnds: Vec::new(),
+                shell_exp_host: ShellFlyoutHostState::new(
+                    ShellFlyoutTapClient::new_shell_experience(),
+                    find_shell_experience_host_pid,
+                ),
+                shell_host: ShellFlyoutHostState::new(
+                    ShellFlyoutTapClient::new_shell_host(),
+                    find_shell_host_pid,
+                ),
             };
             set_active_taskbar_surface_style(ctrl.style.into());
             if ctrl.style != TaskbarStyle::Default {
@@ -111,8 +188,18 @@ mod win {
             explorer_pid_from_taskbars(&taskbars).unwrap_or(0)
         }
 
+        pub fn shell_experience_pid(&self) -> u32 {
+            self.shell_exp_host.cached_pid
+        }
+
+        pub fn shell_host_pid(&self) -> u32 {
+            self.shell_host.cached_pid
+        }
+
         pub fn set_overlay_notify_target(&mut self, hwnd: HWND, msg: u32) {
             self.tap.set_notify_target(hwnd, msg);
+            self.shell_exp_host.tap.set_notify_target(hwnd, msg);
+            self.shell_host.tap.set_notify_target(hwnd, msg);
         }
 
         pub fn needs_fast_tick(&self) -> bool {
@@ -122,6 +209,9 @@ mod win {
                 || self.hover_flyout_host_active
                 || self.osd_host_active
                 || self.tooltip_host_active
+                || self.menu_flyout_host_active
+                || self.shell_exp_host.active
+                || self.shell_host.active
         }
 
         pub fn needs_timer(&self) -> bool {
@@ -139,19 +229,30 @@ mod win {
                 self.tooltip_host_active = false;
                 self.last_tooltip_host_rect = None;
                 self.tooltip_suppressed = false;
+                self.menu_flyout_host_active = false;
+                self.last_menu_flyout_sig.clear();
+                self.menu_flyout_suppressed = false;
+                self.active_menu_flyout_hwnds.clear();
+                self.shell_exp_host.reset_tracking(true);
+                self.shell_host.reset_tracking(true);
                 self.tap.clear_alt_tab_rect();
                 self.tap.clear_hover_flyout_rect();
                 self.tap.clear_osd_rect();
                 self.tap.clear_tooltip_rect();
+                self.tap.clear_menu_flyout_rects();
                 self.tap.set_osd_suppressed(0, false);
                 self.tap.set_osd_fallback_colors(0, None);
                 self.tap.set_tooltip_suppressed(0, false);
                 self.tap.set_tooltip_fallback_colors(0, None);
+                self.tap.set_menu_flyout_suppressed(0, false);
+                self.tap.set_menu_flyout_fallback_colors(0, None);
                 self.glass.hide_overflow_backdrop();
                 self.glass.hide_alt_tab_backdrop();
                 self.glass.hide_hover_flyout_backdrop();
                 self.glass.hide_osd_backdrop();
                 self.glass.hide_tooltip_backdrop();
+                self.glass.hide_shell_cards();
+                self.glass.hide_menu_flyout_backdrops();
                 return;
             }
             let taskbars = enumerate_taskbar_windows();
@@ -163,7 +264,9 @@ mod win {
             self.sync_alt_tab_state(explorer_pid, &taskbar_tids);
             self.sync_hover_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_osd_state(explorer_pid, &taskbar_tids);
+            self.sync_menu_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_tooltip_state(explorer_pid, &taskbar_tids);
+            self.sync_shell_flyouts_state();
         }
 
         pub fn hide_overflow_backdrop(&mut self) {
@@ -203,6 +306,7 @@ mod win {
             self.known_hover_flyout_tid = None;
             self.known_osd_tid = None;
             self.known_tooltip_tid = None;
+            self.known_menu_flyout_tids.clear();
             self.alt_tab_host_active = false;
             self.hover_flyout_host_active = false;
             self.last_hover_flyout_host_rect = None;
@@ -212,14 +316,25 @@ mod win {
             self.tooltip_host_active = false;
             self.last_tooltip_host_rect = None;
             self.tooltip_suppressed = false;
+            self.menu_flyout_host_active = false;
+            self.last_menu_flyout_sig.clear();
+            self.menu_flyout_suppressed = false;
+            self.active_menu_flyout_hwnds.clear();
+            self.shell_exp_host.reset_tracking(true);
+            self.shell_host.reset_tracking(true);
+            self.shell_exp_host.resolve_pid(true);
+            self.shell_host.resolve_pid(true);
             self.tap.clear_alt_tab_rect();
             self.tap.clear_hover_flyout_rect();
             self.tap.clear_osd_rect();
             self.tap.clear_tooltip_rect();
+            self.tap.clear_menu_flyout_rects();
             self.tap.set_osd_suppressed(0, false);
             self.tap.set_osd_fallback_colors(0, None);
             self.tap.set_tooltip_suppressed(0, false);
             self.tap.set_tooltip_fallback_colors(0, None);
+            self.tap.set_menu_flyout_suppressed(0, false);
+            self.tap.set_menu_flyout_fallback_colors(0, None);
             self.tap.on_explorer_restarted();
             self.glass.reset_windows();
             if self.tap.is_circuit_tripped() {
@@ -248,6 +363,10 @@ mod win {
                     self.fallback_to_default_on_trip(&taskbars);
                     return true;
                 }
+                let shell_exp_pid = self.shell_exp_host.resolve_pid(false);
+                self.shell_exp_host.tap.maintain(shell_exp_pid);
+                let shell_host_pid = self.shell_host.resolve_pid(false);
+                self.shell_host.tap.maintain(shell_host_pid);
                 let trans_now = is_transparency_enabled();
                 let trans_changed = trans_now != self.transparency_enabled;
                 if trans_changed {
@@ -271,7 +390,9 @@ mod win {
             self.sync_alt_tab_state(explorer_pid, &taskbar_tids);
             self.sync_hover_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_osd_state(explorer_pid, &taskbar_tids);
+            self.sync_menu_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_tooltip_state(explorer_pid, &taskbar_tids);
+            self.sync_shell_flyouts_state();
             false
         }
 
@@ -286,17 +407,28 @@ mod win {
             self.tooltip_host_active = false;
             self.last_tooltip_host_rect = None;
             self.tooltip_suppressed = false;
+            self.menu_flyout_host_active = false;
+            self.last_menu_flyout_sig.clear();
+            self.menu_flyout_suppressed = false;
+            self.active_menu_flyout_hwnds.clear();
+            self.shell_exp_host.reset_tracking(true);
+            self.shell_host.reset_tracking(true);
             self.tap.clear_alt_tab_rect();
             self.tap.clear_hover_flyout_rect();
             self.tap.clear_osd_rect();
             self.tap.clear_tooltip_rect();
+            self.tap.clear_menu_flyout_rects();
             self.tap.set_osd_suppressed(0, false);
             self.tap.set_alt_tab_item_colors(0, None);
             self.tap.set_osd_fallback_colors(0, None);
             self.tap.set_tooltip_suppressed(0, false);
             self.tap.set_tooltip_fallback_colors(0, None);
+            self.tap.set_menu_flyout_suppressed(0, false);
+            self.tap.set_menu_flyout_fallback_colors(0, None);
             self.glass.set_style(TaskbarStyle::Default, &taskbars);
             set_active_taskbar_surface_style(TaskbarStyle::Default.into());
+            self.shell_exp_host.tap.shutdown();
+            self.shell_host.tap.shutdown();
             self.tap.shutdown();
         }
 
@@ -311,15 +443,26 @@ mod win {
             self.tooltip_host_active = false;
             self.last_tooltip_host_rect = None;
             self.tooltip_suppressed = false;
+            self.menu_flyout_host_active = false;
+            self.last_menu_flyout_sig.clear();
+            self.menu_flyout_suppressed = false;
+            self.active_menu_flyout_hwnds.clear();
+            self.shell_exp_host.reset_tracking(true);
+            self.shell_host.reset_tracking(true);
+            self.shell_exp_host.tap.set_hide_background(0, false, false);
+            self.shell_host.tap.set_hide_background(0, false, false);
             self.tap.clear_alt_tab_rect();
             self.tap.clear_hover_flyout_rect();
             self.tap.clear_osd_rect();
             self.tap.clear_tooltip_rect();
+            self.tap.clear_menu_flyout_rects();
             self.tap.set_osd_suppressed(0, false);
             self.tap.set_alt_tab_item_colors(0, None);
             self.tap.set_osd_fallback_colors(0, None);
             self.tap.set_tooltip_suppressed(0, false);
             self.tap.set_tooltip_fallback_colors(0, None);
+            self.tap.set_menu_flyout_suppressed(0, false);
+            self.tap.set_menu_flyout_fallback_colors(0, None);
             set_active_taskbar_surface_style(TaskbarStyle::Default.into());
             self.glass.set_style(TaskbarStyle::Default, taskbars);
         }
@@ -636,6 +779,146 @@ mod win {
             self.glass.hide_osd_backdrop();
         }
 
+        fn sync_menu_flyout_state(&mut self, explorer_pid: u32, taskbar_tids: &[u32]) {
+            if self.style == TaskbarStyle::Default || explorer_pid == 0 {
+                if self.menu_flyout_host_active {
+                    self.menu_flyout_host_active = false;
+                    self.last_menu_flyout_sig.clear();
+                    self.active_menu_flyout_hwnds.clear();
+                    self.tap.clear_menu_flyout_rects();
+                }
+                if self.menu_flyout_suppressed {
+                    self.menu_flyout_suppressed = false;
+                    self.tap.set_menu_flyout_suppressed(explorer_pid, false);
+                }
+                self.glass.hide_menu_flyout_backdrops();
+                return;
+            }
+
+            let cached = self.tap.cached_menu_flyout_rects();
+            for c in &cached {
+                if c.thread_id != 0 && !self.known_menu_flyout_tids.contains(&c.thread_id) {
+                    if self.known_menu_flyout_tids.len() >= 8 {
+                        self.known_menu_flyout_tids.remove(0);
+                    }
+                    self.known_menu_flyout_tids.push(c.thread_id);
+                }
+            }
+
+            let hosts = find_visible_menu_flyout_host_windows(
+                explorer_pid,
+                &self.known_menu_flyout_tids,
+                taskbar_tids,
+                &[],
+            );
+            if hosts.is_empty() {
+                if self.menu_flyout_host_active {
+                    self.menu_flyout_host_active = false;
+                    self.last_menu_flyout_sig.clear();
+                    self.active_menu_flyout_hwnds.clear();
+                    self.tap.clear_menu_flyout_rects();
+                }
+                self.glass.hide_menu_flyout_backdrops();
+                let exclusive_fs = is_exclusive_fullscreen_or_presentation();
+                if self.menu_flyout_suppressed != exclusive_fs {
+                    self.menu_flyout_suppressed = exclusive_fs;
+                    self.tap
+                        .set_menu_flyout_suppressed(explorer_pid, exclusive_fs);
+                }
+                return;
+            }
+
+            let just_shown = !self.menu_flyout_host_active;
+            self.menu_flyout_host_active = true;
+            let sig: Vec<(isize, [i32; 4])> = hosts
+                .iter()
+                .map(|&(h, r, _, _)| (h.0 as isize, [r.left, r.top, r.right, r.bottom]))
+                .collect();
+            let sig_changed = self.last_menu_flyout_sig != sig;
+            if sig_changed {
+                self.last_menu_flyout_sig = sig;
+            }
+
+            let tap_pairs: Vec<(u32, [f32; 4])> = cached
+                .iter()
+                .map(|c| (c.thread_id, c.rect_dip))
+                .collect();
+            let host_tuples: Vec<([i32; 4], u32, u32)> = hosts
+                .iter()
+                .map(|&(_, r, dpi, tid)| ([r.left, r.top, r.right, r.bottom], dpi, tid))
+                .collect();
+            let origins_per_host: Vec<Vec<[i32; 2]>> = hosts
+                .iter()
+                .map(|&(h, _, _, tid)| collect_tooltip_island_origins(h, explorer_pid, tid))
+                .collect();
+
+            let matched_indices =
+                match_menu_flyout_hosts_to_rects(&host_tuples, &tap_pairs, &origins_per_host);
+            let mut matched_cards: Vec<(HWND, RECT, u32)> =
+                Vec::with_capacity(matched_indices.len().min(MAX_MENU_FLYOUT_SLOTS));
+            for (hi, [l, t, r, b]) in matched_indices {
+                if let Some(&(host_hwnd, _, dpi, _)) = hosts.get(hi) {
+                    matched_cards.push((
+                        host_hwnd,
+                        RECT {
+                            left: l,
+                            top: t,
+                            right: r,
+                            bottom: b,
+                        },
+                        dpi,
+                    ));
+                }
+            }
+
+            let any_suppressed = if !matched_cards.is_empty() {
+                matched_cards
+                    .iter()
+                    .any(|&(hh, cr, _)| should_suppress_tooltip_backdrop(hh, cr))
+            } else {
+                is_exclusive_fullscreen_or_presentation()
+                    || hosts
+                        .iter()
+                        .any(|&(hh, hr, _, _)| should_suppress_tooltip_backdrop(hh, hr))
+            };
+
+            if any_suppressed {
+                self.active_menu_flyout_hwnds =
+                    matched_cards.iter().map(|&(h, _, _)| h).collect();
+                if !self.menu_flyout_suppressed {
+                    self.menu_flyout_suppressed = true;
+                    self.tap.set_menu_flyout_suppressed(explorer_pid, true);
+                }
+                self.glass.hide_menu_flyout_backdrops();
+                return;
+            }
+
+            if self.menu_flyout_suppressed {
+                self.menu_flyout_suppressed = false;
+                self.tap.set_menu_flyout_suppressed(explorer_pid, false);
+            }
+
+            let retry_interval = if matched_cards.is_empty() {
+                Duration::from_millis(20)
+            } else {
+                Duration::from_millis(30)
+            };
+            if just_shown || sig_changed || self.last_menu_flyout_query.elapsed() >= retry_interval
+            {
+                self.tap.request_menu_flyout_rects(explorer_pid);
+                self.last_menu_flyout_query = Instant::now();
+            }
+
+            if !matched_cards.is_empty() {
+                self.active_menu_flyout_hwnds =
+                    matched_cards.iter().map(|&(h, _, _)| h).collect();
+                let _ = self.glass.sync_menu_flyouts(&matched_cards);
+            } else {
+                self.active_menu_flyout_hwnds.clear();
+                self.glass.hide_menu_flyout_backdrops();
+            }
+        }
+
         fn sync_tooltip_state(&mut self, explorer_pid: u32, taskbar_tids: &[u32]) {
             if self.style == TaskbarStyle::Default || explorer_pid == 0 {
                 if self.tooltip_host_active {
@@ -670,12 +953,19 @@ mod win {
                 preferred_tid,
                 taskbar_tids,
                 expected_size_dip,
+                &self.active_menu_flyout_hwnds,
             ) {
                 (Some(found), cached)
             } else if expected_size_dip.is_some() {
                 self.tap.clear_tooltip_rect();
                 (
-                    find_visible_tooltip_host_window(explorer_pid, preferred_tid, taskbar_tids, None),
+                    find_visible_tooltip_host_window(
+                        explorer_pid,
+                        preferred_tid,
+                        taskbar_tids,
+                        None,
+                        &self.active_menu_flyout_hwnds,
+                    ),
                     None,
                 )
             } else {
@@ -775,12 +1065,179 @@ mod win {
             self.glass.hide_tooltip_backdrop();
         }
 
+        fn sync_one_shell_flyout_host(
+            style: TaskbarStyle,
+            host: &mut ShellFlyoutHostState,
+            enumerate_windows: fn(u32) -> Vec<(HWND, RECT, u32, u32, bool)>,
+        ) -> Vec<(HWND, RECT, u32)> {
+            let pid = host.resolve_pid(false);
+            if style == TaskbarStyle::Default || pid == 0 || host.tap.is_circuit_tripped() {
+                if host.active {
+                    host.active = false;
+                    host.last_sig.clear();
+                    host.tap.clear_flyout_rects();
+                }
+                if host.suppressed {
+                    host.suppressed = false;
+                    host.tap.set_flyout_suppressed(pid, false);
+                }
+                return Vec::new();
+            }
+
+            let visible_windows = enumerate_windows(pid);
+            if visible_windows.is_empty() {
+                if host.active {
+                    host.active = false;
+                    host.last_sig.clear();
+                    host.tap.clear_flyout_rects();
+                }
+                let exclusive_fs = is_exclusive_fullscreen_or_presentation();
+                if host.suppressed != exclusive_fs {
+                    host.suppressed = exclusive_fs;
+                    host.tap.set_flyout_suppressed(pid, exclusive_fs);
+                }
+                return Vec::new();
+            }
+
+            let just_shown = !host.active;
+            host.active = true;
+            if just_shown {
+                host.tap.retry_attach_on_flyout_open(pid);
+            }
+
+            let mut cur_sig: Vec<(isize, [i32; 4])> = visible_windows
+                .iter()
+                .map(|&(h, r, _, _, _)| (h.0 as isize, [r.left, r.top, r.right, r.bottom]))
+                .collect();
+            cur_sig.sort_unstable();
+            let sig_changed = host.last_sig != cur_sig;
+            host.last_sig = cur_sig;
+
+            let cached = host.tap.cached_flyout_rects();
+            let hosts_input: Vec<([i32; 4], u32, u32, isize, bool)> = visible_windows
+                .iter()
+                .map(|&(h, r, dpi, tid, is_popup)| {
+                    (
+                        [r.left, r.top, r.right, r.bottom],
+                        dpi,
+                        tid,
+                        h.0 as isize,
+                        is_popup,
+                    )
+                })
+                .collect();
+            let tap_rects: Vec<(u32, [f32; 4])> = cached
+                .iter()
+                .map(|c| (c.thread_id, c.rect_dip))
+                .collect();
+            let matched = match_shell_host_cards_to_screen(&hosts_input, &tap_rects);
+
+            let occluded = if matched.is_empty() {
+                visible_windows
+                    .iter()
+                    .any(|&(hwnd, rect, _, _, _)| should_suppress_osd_backdrop(hwnd, rect))
+            } else {
+                matched.iter().any(|&(hwnd_raw, [l, t, r, b])| {
+                    should_suppress_osd_backdrop(
+                        HWND(hwnd_raw as *mut std::ffi::c_void),
+                        RECT {
+                            left: l,
+                            top: t,
+                            right: r,
+                            bottom: b,
+                        },
+                    )
+                })
+            };
+
+            if occluded {
+                if !host.suppressed {
+                    host.suppressed = true;
+                    host.tap.set_flyout_suppressed(pid, true);
+                }
+                return Vec::new();
+            }
+
+            if host.suppressed {
+                host.suppressed = false;
+                host.tap.set_flyout_suppressed(pid, false);
+            }
+
+            let retry_interval = if matched.is_empty() {
+                Duration::from_millis(20)
+            } else {
+                Duration::from_millis(30)
+            };
+            if just_shown || sig_changed || host.last_query.elapsed() >= retry_interval {
+                host.tap.request_flyout_rects(pid);
+                host.last_query = Instant::now();
+            }
+
+            let mut out = Vec::with_capacity(matched.len());
+            for (hwnd_raw, [l, t, r, b]) in matched {
+                if let Some(&(hwnd, _, dpi, _, _)) = visible_windows
+                    .iter()
+                    .find(|&&(h, _, _, _, _)| (h.0 as isize) == hwnd_raw)
+                {
+                    out.push((
+                        hwnd,
+                        RECT {
+                            left: l,
+                            top: t,
+                            right: r,
+                            bottom: b,
+                        },
+                        dpi,
+                    ));
+                }
+            }
+            out
+        }
+
+        fn sync_shell_flyouts_state(&mut self) {
+            if self.style == TaskbarStyle::Default {
+                let _ = Self::sync_one_shell_flyout_host(
+                    self.style,
+                    &mut self.shell_exp_host,
+                    find_visible_shell_experience_host_windows,
+                );
+                let _ = Self::sync_one_shell_flyout_host(
+                    self.style,
+                    &mut self.shell_host,
+                    find_visible_shell_host_windows,
+                );
+                self.glass.hide_shell_cards();
+                return;
+            }
+
+            let mut active_cards = Self::sync_one_shell_flyout_host(
+                self.style,
+                &mut self.shell_host,
+                find_visible_shell_host_windows,
+            );
+            let mut exp_cards = Self::sync_one_shell_flyout_host(
+                self.style,
+                &mut self.shell_exp_host,
+                find_visible_shell_experience_host_windows,
+            );
+            active_cards.append(&mut exp_cards);
+            active_cards.truncate(MAX_SHELL_CARD_SLOTS);
+
+            if active_cards.is_empty() {
+                self.glass.hide_shell_cards();
+            } else {
+                let _ = self.glass.sync_shell_cards(&active_cards);
+            }
+        }
+
         fn apply_current_style(&mut self, update_tap: bool, user_initiated: bool) {
             let taskbars = enumerate_taskbar_windows();
             let explorer_pid = explorer_pid_from_taskbars(&taskbars).unwrap_or(0);
             let taskbar_tids = taskbar_thread_ids(&taskbars);
 
             if self.style == TaskbarStyle::Default {
+                let shell_exp_pid = self.shell_exp_host.resolve_pid(false);
+                let shell_host_pid = self.shell_host.resolve_pid(false);
                 self.alt_tab_host_active = false;
                 self.hover_flyout_host_active = false;
                 self.last_hover_flyout_host_rect = None;
@@ -790,23 +1247,41 @@ mod win {
                 self.tooltip_host_active = false;
                 self.last_tooltip_host_rect = None;
                 self.tooltip_suppressed = false;
+                self.menu_flyout_host_active = false;
+                self.last_menu_flyout_sig.clear();
+                self.menu_flyout_suppressed = false;
+                self.active_menu_flyout_hwnds.clear();
+                self.shell_exp_host.reset_tracking(true);
+                self.shell_host.reset_tracking(true);
                 self.tap.clear_alt_tab_rect();
                 self.tap.clear_hover_flyout_rect();
                 self.tap.clear_osd_rect();
                 self.tap.clear_tooltip_rect();
+                self.tap.clear_menu_flyout_rects();
                 self.tap.set_osd_suppressed(explorer_pid, false);
                 self.tap.set_alt_tab_item_colors(explorer_pid, None);
                 self.tap.set_osd_fallback_colors(explorer_pid, None);
                 self.tap.set_tooltip_suppressed(explorer_pid, false);
                 self.tap.set_tooltip_fallback_colors(explorer_pid, None);
+                self.tap.set_menu_flyout_suppressed(explorer_pid, false);
+                self.tap
+                    .set_menu_flyout_fallback_colors(explorer_pid, None);
                 self.glass.set_style(TaskbarStyle::Default, &taskbars);
                 if update_tap {
                     self.tap
                         .set_hide_background(explorer_pid, false, user_initiated);
+                    self.shell_exp_host
+                        .tap
+                        .set_hide_background(shell_exp_pid, false, user_initiated);
+                    self.shell_host
+                        .tap
+                        .set_hide_background(shell_host_pid, false, user_initiated);
                 }
                 return;
             }
 
+            let shell_exp_pid = self.shell_exp_host.resolve_pid(true);
+            let shell_host_pid = self.shell_host.resolve_pid(true);
             let item_colors = alt_tab_item_card_colors(self.style, self.light_glass)
                 .map(|c| (c.bg_argb, c.border_argb));
             self.tap.set_alt_tab_item_colors(explorer_pid, item_colors);
@@ -817,6 +1292,16 @@ mod win {
                 .map(|c| (c.bg_argb, c.border_argb));
             self.tap
                 .set_tooltip_fallback_colors(explorer_pid, tooltip_colors);
+            let menu_colors = menu_flyout_fallback_card_colors(self.style, self.light_glass)
+                .map(|c| (c.bg_argb, c.border_argb));
+            self.tap
+                .set_menu_flyout_fallback_colors(explorer_pid, menu_colors);
+            self.shell_exp_host
+                .tap
+                .set_flyout_fallback_colors(shell_exp_pid, menu_colors);
+            self.shell_host
+                .tap
+                .set_flyout_fallback_colors(shell_host_pid, menu_colors);
 
             if update_tap {
                 self.tap
@@ -825,6 +1310,12 @@ mod win {
                     self.fallback_to_default_on_trip(&taskbars);
                     return;
                 }
+                self.shell_exp_host
+                    .tap
+                    .set_hide_background(shell_exp_pid, true, user_initiated);
+                self.shell_host
+                    .tap
+                    .set_hide_background(shell_host_pid, true, user_initiated);
             }
 
             self.glass.set_style(self.style, &taskbars);
@@ -834,7 +1325,9 @@ mod win {
             self.sync_alt_tab_state(explorer_pid, &taskbar_tids);
             self.sync_hover_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_osd_state(explorer_pid, &taskbar_tids);
+            self.sync_menu_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_tooltip_state(explorer_pid, &taskbar_tids);
+            self.sync_shell_flyouts_state();
             self.last_maintain = Instant::now();
         }
     }

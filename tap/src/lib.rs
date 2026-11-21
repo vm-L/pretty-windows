@@ -25,8 +25,21 @@ pub mod tree_match {
     pub const CMD_TOOLTIP_RECT: u8 = 0x0C;
     pub const CMD_SET_TOOLTIP_SUPPRESS: u8 = 0x0D;
     pub const CMD_SET_TOOLTIP_FALLBACK_STYLE: u8 = 0x0E;
-    pub const TAP_PROTOCOL_VERSION: u8 = 8;
+    pub const CMD_MENU_FLYOUT_RECTS: u8 = 0x0F;
+    pub const CMD_SET_MENU_FLYOUT_SUPPRESS: u8 = 0x10;
+    pub const CMD_SET_MENU_FLYOUT_FALLBACK_STYLE: u8 = 0x11;
+    pub const CMD_SHELL_CARD_RECTS: u8 = 0x12;
+    pub const MAX_MENU_FLYOUT_RECTS: usize = 3;
+    pub const MAX_SHELL_CARD_RECTS: usize = 8;
+    pub const TAP_PROTOCOL_VERSION: u8 = 11;
     pub const ALTTAB_ITEM_OVERLAY_NAME: &str = "PrettyWindowsAltTabItemBg";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TapHostScope {
+        Explorer,
+        ShellExperience,
+        ShellHost,
+    }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum TargetKind {
@@ -40,6 +53,9 @@ pub mod tree_match {
         HoverFlyoutShape,
         OsdPanel,
         ToolTipPresenter,
+        MenuFlyoutSurface,
+        ShellCardSurface,
+        ShellCardSubSurface,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -462,6 +478,92 @@ pub mod tree_match {
             )
         }
 
+        fn is_forbidden_menu_flyout_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("StartMenu")
+                || n.contains("StartMenu")
+                || t.contains("ToolTip")
+                || n.contains("ToolTip")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("ComboBox")
+                || n.contains("ComboBox")
+                || t.contains("TeachingTip")
+                || n.contains("TeachingTip")
+                || n == "OverflowRootGrid"
+                || t.contains("HoverFlyout")
+                || n.contains("HoverFlyout")
+                || t.contains("AltTab")
+                || n.contains("AltTab")
+                || t.contains("Confirmator")
+                || n.contains("Confirmator")
+                || t.contains("MenuFlyoutItem")
+                || t.contains("MenuFlyoutSubItem")
+                || t.contains("ListViewItem")
+                || t.contains("JumpListItem")
+                || t.contains("Button")
+        }
+
+        pub fn has_forbidden_menu_flyout_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_menu_flyout_node,
+                |_| false,
+                false,
+            )
+        }
+
+        fn is_forbidden_jumplist_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("JumpListItem")
+                || t.contains("SystemItemControl")
+                || t.contains("SystemItemListViewItem")
+                || t.contains("JumpListListViewItem")
+                || t.contains("JumpListCategoryHeader")
+                || t.contains("ListViewItem")
+                || t.contains("MenuFlyoutItem")
+                || t.contains("MenuFlyoutSubItem")
+                || t.contains("Button")
+                || t.contains("ToolTip")
+                || n.contains("ToolTip")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("Toast")
+                || n.contains("Toast")
+                || t.contains("Notification")
+                || n.contains("Notification")
+                || t.contains("ActionCenter")
+                || n.contains("ActionCenter")
+                || t.contains("ControlCenter")
+                || n.contains("ControlCenter")
+                || t.contains("MeetNow")
+                || n.contains("MeetNow")
+        }
+
+        fn is_valid_jumplist_container_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            t.contains("TaskbarJumpListFrame")
+                || t.contains("JumpListControl")
+                || t.contains("ControlHostMenuFlyoutPresenter")
+        }
+
+        pub fn has_valid_jumplist_ancestor(&self, handle: u64) -> bool {
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_jumplist_node,
+                Self::is_valid_jumplist_container_node,
+                true,
+            )
+        }
+
+        fn has_restyled_acrylic_on_thread(&self, thread_id: u32) -> bool {
+            self.nodes.values().any(|meta| {
+                meta.thread_id == thread_id && meta.name == "JumpListRestyledAcrylic"
+            })
+        }
+
         pub fn thread_has_alttab_container(&self, tid: u32) -> bool {
             self.nodes.iter().any(|(&h, meta)| {
                 meta.thread_id == tid
@@ -478,6 +580,22 @@ pub mod tree_match {
         }
 
         pub fn classify_target(&self, handle: u64) -> Option<TargetKind> {
+            self.classify_target_in_scope(handle, TapHostScope::Explorer)
+        }
+
+        pub fn classify_target_in_scope(
+            &self,
+            handle: u64,
+            scope: TapHostScope,
+        ) -> Option<TargetKind> {
+            match scope {
+                TapHostScope::Explorer => self.classify_explorer_target(handle),
+                TapHostScope::ShellExperience => self.classify_shell_experience_target(handle),
+                TapHostScope::ShellHost => self.classify_shell_host_target(handle),
+            }
+        }
+
+        fn classify_explorer_target(&self, handle: u64) -> Option<TargetKind> {
             let node = self.nodes.get(&handle)?;
             if node.name == ALTTAB_ITEM_OVERLAY_NAME {
                 return None;
@@ -559,7 +677,324 @@ pub mod tree_match {
             {
                 return Some(TargetKind::AltTabItemFocus);
             }
+            if !self.has_forbidden_menu_flyout_ancestor(handle) {
+                let is_border =
+                    node.type_name.ends_with(".Border") || node.type_name == "Border";
+                let is_grid = node.type_name.ends_with(".Grid") || node.type_name == "Grid";
+                let parent_opt = self.nodes.get(&node.parent);
+                if is_border
+                    && parent_opt.is_some_and(|p| p.type_name.contains("MenuFlyoutPresenter"))
+                {
+                    return Some(TargetKind::MenuFlyoutSurface);
+                }
+                if (is_border || is_grid)
+                    && matches!(
+                        node.name.as_str(),
+                        "MenuFlyoutPresenterBorder"
+                            | "JumpListBorder"
+                            | "JumpListBackground"
+                            | "BackgroundBorder"
+                            | "RootGrid"
+                            | "LayoutRoot"
+                    )
+                    && parent_opt.is_some_and(|p| {
+                        (p.type_name.contains("JumpList") || p.type_name.contains("JumpView"))
+                            && !p.type_name.contains("Item")
+                    })
+                {
+                    return Some(TargetKind::MenuFlyoutSurface);
+                }
+            }
             None
+        }
+
+        fn classify_jumplist_target(&self, handle: u64) -> Option<TargetKind> {
+            let node = self.nodes.get(&handle)?;
+            if !self.has_valid_jumplist_ancestor(handle) {
+                return None;
+            }
+            let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
+            let is_grid = node.type_name.ends_with(".Grid") || node.type_name == "Grid";
+            let parent_opt = self.nodes.get(&node.parent);
+            if (is_border || is_grid) && node.name == "JumpListRestyledAcrylic" {
+                return Some(TargetKind::MenuFlyoutSurface);
+            }
+            if is_border
+                && parent_opt.is_some_and(|p| p.type_name.contains("MenuFlyoutPresenter"))
+            {
+                return Some(TargetKind::MenuFlyoutSurface);
+            }
+            if !self.has_restyled_acrylic_on_thread(node.thread_id)
+                && (is_border || is_grid)
+                && matches!(
+                    node.name.as_str(),
+                    "JumpListBorder"
+                        | "JumpListBackground"
+                        | "JumpListGrid"
+                        | "BackgroundBorder"
+                        | "RootBorder"
+                        | "RootGrid"
+                        | "LayoutRoot"
+                )
+                && parent_opt.is_some_and(|p| {
+                    p.type_name.contains("TaskbarJumpListFrame")
+                        || p.type_name.contains("JumpListControl")
+                })
+            {
+                return Some(TargetKind::MenuFlyoutSurface);
+            }
+            None
+        }
+
+        fn is_forbidden_shell_card_item_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("ListViewItem")
+                || t.contains("GridViewItem")
+                || t.contains("Button")
+                || t.contains("ToggleButton")
+                || t.contains("RepeatButton")
+                || t.contains("Slider")
+                || t.contains("CheckBox")
+                || t.contains("ComboBox")
+                || t.contains("MenuFlyoutItem")
+                || t.contains("MenuFlyoutSubItem")
+                || t.contains("ScrollBar")
+                || t.contains("CalendarViewDayItem")
+                || t.contains("ToolTip")
+                || n.contains("ToolTip")
+                || t.contains("Tooltip")
+                || n.contains("Tooltip")
+                || t.contains("MeetNow")
+                || n.contains("MeetNow")
+        }
+
+        fn has_forbidden_shell_card_item_ancestor(&self, handle: u64) -> bool {
+            !self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_shell_card_item_node,
+                |_| false,
+                false,
+            )
+        }
+
+        fn is_notification_center_container_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            matches!(
+                n,
+                "NotificationCenterGrid"
+                    | "NotificationCenterView"
+                    | "NotificationCenterPage"
+                    | "NotificationCenterRoot"
+            ) || t.contains("NotificationCenter")
+        }
+
+        fn has_notification_center_ancestor(&self, handle: u64) -> bool {
+            let mut cur = self.nodes.get(&handle).map(|n| n.parent).unwrap_or(0);
+            let mut steps = 0usize;
+            while cur != 0 && steps < 64 {
+                let Some(meta) = self.nodes.get(&cur) else {
+                    break;
+                };
+                if Self::is_notification_center_container_node(meta) {
+                    return true;
+                }
+                cur = meta.parent;
+                steps += 1;
+            }
+            false
+        }
+
+        fn has_primary_shell_card_ancestor(&self, handle: u64) -> bool {
+            let mut cur = self.nodes.get(&handle).map(|n| n.parent).unwrap_or(0);
+            let mut steps = 0usize;
+            while cur != 0 && steps < 64 {
+                let Some(meta) = self.nodes.get(&cur) else {
+                    break;
+                };
+                if matches!(
+                    meta.name.as_str(),
+                    "NotificationCenterGrid"
+                        | "CalendarCenterGrid"
+                        | "ControlCenterRegion"
+                        | "RootGridBorder"
+                        | "L1Grid"
+                        | "L2Frame"
+                ) {
+                    return true;
+                }
+                cur = meta.parent;
+                steps += 1;
+            }
+            false
+        }
+
+        fn is_valid_floating_toast_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            t.contains("FlexibleNormalToastView")
+                || t.contains("FlexiblePriorityToastView")
+                || t.contains("FlexibleToastView")
+                || t.contains("ToastNotificationView")
+        }
+
+        fn is_valid_control_center_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("ControlCenter")
+                || t.contains("QuickActions")
+                || matches!(
+                    n,
+                    "ControlCenterRegion" | "RootGridBorder" | "L1Grid" | "L2Frame"
+                )
+        }
+
+        fn has_control_center_root_surface_on_thread(&self, thread_id: u32) -> bool {
+            self.nodes.iter().any(|(&h, meta)| {
+                meta.thread_id == thread_id
+                    && matches!(meta.name.as_str(), "RootGridBorder" | "ControlCenterRegion")
+                    && (meta.type_name.ends_with(".Border")
+                        || meta.type_name == "Border"
+                        || meta.type_name.ends_with(".Grid")
+                        || meta.type_name == "Grid")
+                    && !self.has_forbidden_shell_card_item_ancestor(h)
+            })
+        }
+
+        fn has_l1_or_l2_surface_on_thread(&self, thread_id: u32) -> bool {
+            self.nodes.iter().any(|(&h, meta)| {
+                meta.thread_id == thread_id
+                    && matches!(meta.name.as_str(), "L1Grid" | "L2Frame")
+                    && (meta.type_name.ends_with(".Border")
+                        || meta.type_name == "Border"
+                        || meta.type_name.ends_with(".Grid")
+                        || meta.type_name == "Grid")
+                    && !self.has_forbidden_shell_card_item_ancestor(h)
+            })
+        }
+
+        fn has_toast_background_border2_on_thread(&self, thread_id: u32) -> bool {
+            self.nodes.iter().any(|(&h, meta)| {
+                meta.thread_id == thread_id
+                    && meta.name == "ToastBackgroundBorder2"
+                    && (meta.type_name.ends_with(".Border") || meta.type_name == "Border")
+                    && !self.has_forbidden_shell_card_item_ancestor(h)
+                    && !self.has_notification_center_ancestor(h)
+            })
+        }
+
+        fn classify_control_center_card_node(&self, handle: u64, node: &NodeMeta) -> Option<TargetKind> {
+            let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
+            let is_grid = node.type_name.ends_with(".Grid") || node.type_name == "Grid";
+            if !is_border && !is_grid {
+                return None;
+            }
+            if matches!(
+                node.name.as_str(),
+                "BackgroundBlur" | "FooterGrid" | "Footer" | "PaneFooter"
+            ) {
+                return Some(TargetKind::ShellCardSubSurface);
+            }
+            if matches!(node.name.as_str(), "RootGridBorder" | "ControlCenterRegion") {
+                return Some(TargetKind::ShellCardSurface);
+            }
+            if matches!(
+                node.name.as_str(),
+                "MediaTransportControlsRegion" | "MediaTransportControlsGrid"
+            ) {
+                if self.has_primary_shell_card_ancestor(handle) {
+                    return Some(TargetKind::ShellCardSubSurface);
+                }
+                return Some(TargetKind::ShellCardSurface);
+            }
+            if matches!(node.name.as_str(), "L1Grid" | "L2Frame") {
+                if self.has_control_center_root_surface_on_thread(node.thread_id) {
+                    return Some(TargetKind::ShellCardSubSurface);
+                }
+                return Some(TargetKind::ShellCardSurface);
+            }
+            if node.name == "MainGrid"
+                && self.has_ancestor_matching(
+                    handle,
+                    Self::is_forbidden_shell_card_item_node,
+                    Self::is_valid_control_center_node,
+                    true,
+                )
+            {
+                if self.has_control_center_root_surface_on_thread(node.thread_id)
+                    || self.has_l1_or_l2_surface_on_thread(node.thread_id)
+                {
+                    return Some(TargetKind::ShellCardSubSurface);
+                }
+                return Some(TargetKind::ShellCardSurface);
+            }
+            None
+        }
+
+        fn classify_shell_experience_target(&self, handle: u64) -> Option<TargetKind> {
+            if self.has_valid_jumplist_ancestor(handle) {
+                return self.classify_jumplist_target(handle);
+            }
+            let node = self.nodes.get(&handle)?;
+            if self.has_forbidden_shell_card_item_ancestor(handle) {
+                return None;
+            }
+            let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
+            let is_grid = node.type_name.ends_with(".Grid") || node.type_name == "Grid";
+            if !is_border && !is_grid {
+                return None;
+            }
+
+            // Notification Center & Calendar (Win+N)
+            if is_grid && matches!(node.name.as_str(), "NotificationCenterGrid" | "CalendarCenterGrid") {
+                return Some(TargetKind::ShellCardSurface);
+            }
+            if is_border && node.name == "CalendarHeaderMinimizedOverlay" {
+                return Some(TargetKind::ShellCardSubSurface);
+            }
+
+            // Floating system Toasts (strictly isolated from Notification Center history)
+            if is_border && matches!(node.name.as_str(), "ToastBackgroundBorder2" | "ToastBackgroundBorder") {
+                if self.has_notification_center_ancestor(handle) {
+                    return None;
+                }
+                if !self.has_ancestor_matching(
+                    handle,
+                    Self::is_forbidden_shell_card_item_node,
+                    Self::is_valid_floating_toast_node,
+                    true,
+                ) {
+                    return None;
+                }
+                if node.name == "ToastBackgroundBorder2" {
+                    return Some(TargetKind::ShellCardSurface);
+                }
+                if self.has_toast_background_border2_on_thread(node.thread_id) {
+                    return Some(TargetKind::ShellCardSubSurface);
+                }
+                return Some(TargetKind::ShellCardSurface);
+            }
+
+            // Legacy Win11 22H2/23H2 ControlCenter & ActionCenter Media/Footer surfaces in ShellExperienceHost
+            self.classify_control_center_card_node(handle, node)
+        }
+
+        fn classify_shell_host_target(&self, handle: u64) -> Option<TargetKind> {
+            let node = self.nodes.get(&handle)?;
+            if self.has_forbidden_shell_card_item_ancestor(handle) {
+                return None;
+            }
+            let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
+            if is_border
+                && !self.has_forbidden_menu_flyout_ancestor(handle)
+                && self
+                    .nodes
+                    .get(&node.parent)
+                    .is_some_and(|p| p.type_name.contains("MenuFlyoutPresenter"))
+            {
+                return Some(TargetKind::MenuFlyoutSurface);
+            }
+            self.classify_control_center_card_node(handle, node)
         }
 
         /// Returns `true` only for `BackgroundFill`/`BackgroundStroke`/`ScreenEdgeStroke` rectangles inside a non-flyout taskbar container.
@@ -579,10 +1014,18 @@ pub mod tree_match {
             &self,
             thread_id: u32,
         ) -> Vec<(u64, TargetKind)> {
+            self.collect_classified_targets_for_thread_in_scope(thread_id, TapHostScope::Explorer)
+        }
+
+        pub fn collect_classified_targets_for_thread_in_scope(
+            &self,
+            thread_id: u32,
+            scope: TapHostScope,
+        ) -> Vec<(u64, TargetKind)> {
             self.nodes
                 .iter()
                 .filter(|(_, meta)| meta.thread_id == thread_id)
-                .filter_map(|(&h, _)| self.classify_target(h).map(|k| (h, k)))
+                .filter_map(|(&h, _)| self.classify_target_in_scope(h, scope).map(|k| (h, k)))
                 .collect()
         }
 
@@ -597,6 +1040,14 @@ pub mod tree_match {
 
     pub fn pipe_name_for_pid(pid: u32) -> String {
         format!(r"\\.\pipe\PrettyWindows_TaskbarTap_{pid}")
+    }
+
+    pub fn appcontainer_pipe_name_for_pid(pid: u32) -> String {
+        format!(r"\\.\pipe\PrettyWindows_ShellExpTap_{pid}")
+    }
+
+    pub fn shell_host_pipe_name_for_pid(pid: u32) -> String {
+        format!(r"\\.\pipe\PrettyWindows_ShellHostTap_{pid}")
     }
 }
 
@@ -1611,17 +2062,597 @@ mod tests {
         assert_eq!(idx.classify_target(2041), None);
         assert_eq!(idx.classify_target(2052), None);
     }
+
+    #[test]
+    fn classifies_menu_flyout_and_jumplist_surfaces_with_strict_isolation() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Standard cascading MenuFlyouts: main menu (3001) + submenu (3011)
+        idx.on_add_on_thread(
+            0,
+            3000,
+            "Windows.UI.Xaml.Controls.Primitives.PopupRoot".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3000,
+            3001,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3001,
+            3002,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3002,
+            3003,
+            "Windows.UI.Xaml.Controls.MenuFlyoutItem".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3003,
+            3004,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "LayoutRoot".into(),
+            100,
+        );
+
+        // Out-of-order submenu border arrives before presenter
+        idx.on_add_on_thread(
+            3011,
+            3012,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "LayoutRoot".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3000,
+            3011,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            100,
+        );
+
+        // 2. Standalone JumpList surface
+        idx.on_add_on_thread(
+            3000,
+            3020,
+            "JumpViewUI.JumpListControl".into(),
+            "JumpList".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3020,
+            3021,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "RootGrid".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3021,
+            3022,
+            "JumpViewUI.JumpListItemControl".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3022,
+            3023,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            100,
+        );
+
+        // 3. Forbidden containers (StartMenu, ComboBox, ToolTip) must never match
+        idx.on_add_on_thread(0, 3030, "StartMenu.StartInnerView".into(), "StartMenu".into(), 100);
+        idx.on_add_on_thread(
+            3030,
+            3031,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3031,
+            3032,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            100,
+        );
+        idx.on_add_on_thread(0, 3040, "Windows.UI.Xaml.Controls.ComboBox".into(), "".into(), 100);
+        idx.on_add_on_thread(
+            3040,
+            3041,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            100,
+        );
+        idx.on_add_on_thread(
+            3041,
+            3042,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            100,
+        );
+
+        assert_eq!(idx.classify_target(3002), Some(TargetKind::MenuFlyoutSurface));
+        assert_eq!(idx.classify_target(3012), Some(TargetKind::MenuFlyoutSurface));
+        assert_eq!(idx.classify_target(3021), Some(TargetKind::MenuFlyoutSurface));
+        assert_eq!(idx.classify_target(3004), None);
+        assert_eq!(idx.classify_target(3023), None);
+        assert_eq!(idx.classify_target(3032), None);
+        assert_eq!(idx.classify_target(3042), None);
+    }
+
+    #[test]
+    fn jumplist_scope_targets_taskbar_jumplist_and_excludes_notifications_and_items() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Win11 TaskbarJumpListFrame > Grid#JumpListGrid > Border#JumpListRestyledAcrylic + item chrome
+        idx.on_add_on_thread(
+            0,
+            4001,
+            "JumpViewUI.TaskbarJumpListFrame".into(),
+            "TaskbarJumpListFrame".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4001,
+            4002,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "JumpListGrid".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4002,
+            4003,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "JumpListRestyledAcrylic".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4002,
+            4004,
+            "JumpViewUI.JumpListItemControl".into(),
+            "".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4004,
+            4005,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "BackgroundBorder".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4002,
+            4006,
+            "JumpViewUI.SystemItemControl".into(),
+            "".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4006,
+            4007,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "LayoutRoot".into(),
+            200,
+        );
+
+        // 2. Nested context menu ControlHostMenuFlyoutPresenter inside JumpViewUI
+        idx.on_add_on_thread(
+            0,
+            4010,
+            "JumpViewUI.ControlHostMenuFlyoutPresenter".into(),
+            "".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4010,
+            4011,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            200,
+        );
+
+        // 3. Notifications / Action Center Toast and nested MenuFlyoutPresenter must be excluded
+        idx.on_add_on_thread(
+            0,
+            4020,
+            "ActionCenter.ToastNotificationView".into(),
+            "ToastRoot".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4020,
+            4021,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4021,
+            4022,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            200,
+        );
+        // Plain MenuFlyoutPresenter in ShellExperienceHost without JumpList ancestry must not match
+        idx.on_add_on_thread(
+            0,
+            4025,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            200,
+        );
+        idx.on_add_on_thread(
+            4025,
+            4026,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            200,
+        );
+
+        assert_eq!(
+            idx.classify_target_in_scope(4003, TapHostScope::ShellExperience),
+            Some(TargetKind::MenuFlyoutSurface)
+        );
+        // When JumpListRestyledAcrylic is present on the thread, Grid#JumpListGrid must not duplicate it
+        assert_eq!(
+            idx.classify_target_in_scope(4002, TapHostScope::ShellExperience),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4011, TapHostScope::ShellExperience),
+            Some(TargetKind::MenuFlyoutSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4005, TapHostScope::ShellExperience),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4007, TapHostScope::ShellExperience),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4022, TapHostScope::ShellExperience),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4026, TapHostScope::ShellExperience),
+            None
+        );
+
+        // 4. Legacy/variant thread without JumpListRestyledAcrylic falls back to TaskbarJumpListFrame > Border#LayoutRoot
+        idx.on_add_on_thread(
+            0,
+            4030,
+            "JumpViewUI.TaskbarJumpListFrame".into(),
+            "".into(),
+            201,
+        );
+        idx.on_add_on_thread(
+            4030,
+            4031,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "LayoutRoot".into(),
+            201,
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(4031, TapHostScope::ShellExperience),
+            Some(TargetKind::MenuFlyoutSurface)
+        );
+    }
+
+    #[test]
+    fn shell_experience_targets_notifications_calendar_toasts_and_isolates_history() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Notification Center + Calendar + minimized header overlay + history toast item
+        idx.on_add_on_thread(
+            0,
+            5001,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "NotificationCenterGrid".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5001,
+            5002,
+            "ActionCenter.FlexibleNormalToastView".into(),
+            "".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5002,
+            5003,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder2".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5001,
+            5004,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "FooterGrid".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            0,
+            5010,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "CalendarCenterGrid".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5010,
+            5011,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "CalendarHeaderMinimizedOverlay".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5010,
+            5012,
+            "Windows.UI.Xaml.Controls.Primitives.CalendarViewDayItem".into(),
+            "".into(),
+            301,
+        );
+        idx.on_add_on_thread(
+            5012,
+            5013,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder2".into(),
+            301,
+        );
+
+        assert_eq!(
+            idx.classify_target_in_scope(5001, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5003, TapHostScope::ShellExperience),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5004, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5010, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5011, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5013, TapHostScope::ShellExperience),
+            None
+        );
+
+        // 2. Floating Toast with both ToastBackgroundBorder2 and inner ToastBackgroundBorder + interactive Button
+        idx.on_add_on_thread(
+            0,
+            5100,
+            "ActionCenter.FlexibleNormalToastView".into(),
+            "".into(),
+            302,
+        );
+        idx.on_add_on_thread(
+            5100,
+            5101,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder2".into(),
+            302,
+        );
+        idx.on_add_on_thread(
+            5101,
+            5102,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder".into(),
+            302,
+        );
+        idx.on_add_on_thread(
+            5101,
+            5103,
+            "Windows.UI.Xaml.Controls.Button".into(),
+            "DismissButton".into(),
+            302,
+        );
+        idx.on_add_on_thread(
+            5103,
+            5104,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder".into(),
+            302,
+        );
+
+        assert_eq!(
+            idx.classify_target_in_scope(5101, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5102, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5104, TapHostScope::ShellExperience),
+            None
+        );
+
+        // 3. Single-border floating toast without ToastBackgroundBorder2 promotes ToastBackgroundBorder
+        idx.on_add_on_thread(
+            0,
+            5200,
+            "ActionCenter.FlexiblePriorityToastView".into(),
+            "".into(),
+            303,
+        );
+        idx.on_add_on_thread(
+            5200,
+            5201,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "ToastBackgroundBorder".into(),
+            303,
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5201, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+
+        // 4. Legacy Win11 ActionCenter Quick Settings + Media Card inside ShellExperienceHost
+        idx.on_add_on_thread(
+            0,
+            5300,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "ControlCenterRegion".into(),
+            304,
+        );
+        idx.on_add_on_thread(
+            0,
+            5301,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "MediaTransportControlsRegion".into(),
+            304,
+        );
+        idx.on_add_on_thread(
+            5300,
+            5302,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "FooterGrid".into(),
+            304,
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5300, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5301, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(5302, TapHostScope::ShellExperience),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+    }
+
+    #[test]
+    fn shell_host_targets_quick_settings_media_card_subsurfaces_and_fallback_order() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Thread without RootGridBorder: MainGrid + L1Grid delivered before RootGridBorder
+        idx.on_add_on_thread(0, 6000, "ControlCenter.ControlCenterView".into(), "".into(), 401);
+        idx.on_add_on_thread(6000, 6001, "Windows.UI.Xaml.Controls.Grid".into(), "RootGrid".into(), 401);
+        idx.on_add_on_thread(6001, 6002, "Windows.UI.Xaml.Controls.Grid".into(), "MainGrid".into(), 401);
+        idx.on_add_on_thread(6002, 6003, "Windows.UI.Xaml.Controls.Grid".into(), "L1Grid".into(), 401);
+        idx.on_add_on_thread(6003, 6004, "Windows.UI.Xaml.Controls.Border".into(), "BackgroundBlur".into(), 401);
+        idx.on_add_on_thread(6003, 6005, "Windows.UI.Xaml.Controls.Grid".into(), "PaneFooter".into(), 401);
+        idx.on_add_on_thread(
+            6001,
+            6006,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "MediaTransportControlsRegion".into(),
+            401,
+        );
+        // Interactive quick toggle tile border must stay untouched
+        idx.on_add_on_thread(
+            6003,
+            6007,
+            "Windows.UI.Xaml.Controls.Primitives.ToggleButton".into(),
+            "".into(),
+            401,
+        );
+        idx.on_add_on_thread(
+            6007,
+            6008,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "RootGridBorder".into(),
+            401,
+        );
+
+        assert_eq!(
+            idx.classify_target_in_scope(6002, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6003, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6004, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6005, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6006, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6008, TapHostScope::ShellHost),
+            None
+        );
+
+        // Once non-button RootGridBorder arrives on the same thread, L1Grid downgrades to SubSurface
+        idx.on_add_on_thread(
+            6002,
+            6009,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "RootGridBorder".into(),
+            401,
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6009, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6003, TapHostScope::ShellHost),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+
+        // 2. Context menu inside ShellHost matches MenuFlyoutSurface
+        idx.on_add_on_thread(
+            0,
+            6020,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            401,
+        );
+        idx.on_add_on_thread(
+            6020,
+            6021,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            401,
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(6021, TapHostScope::ShellHost),
+            Some(TargetKind::MenuFlyoutSurface)
+        );
+    }
 }
 
 #[cfg(windows)]
 mod win {
     use super::tree_match::{
-        pipe_name_for_pid, TargetKind, VisualTreeIndex, ALTTAB_ITEM_OVERLAY_NAME,
+        appcontainer_pipe_name_for_pid, pipe_name_for_pid, shell_host_pipe_name_for_pid,
+        TapHostScope, TargetKind, VisualTreeIndex, ALTTAB_ITEM_OVERLAY_NAME,
         CLSID_PRETTY_WINDOWS_TAP_U128, CMD_ALTTAB_RECT, CMD_HIDE, CMD_HOVER_FLYOUT_RECT,
-        CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE,
+        CMD_MENU_FLYOUT_RECTS, CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE,
+        CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS,
         CMD_SET_OSD_FALLBACK_STYLE, CMD_SET_OSD_SUPPRESS, CMD_SET_TOOLTIP_FALLBACK_STYLE,
-        CMD_SET_TOOLTIP_SUPPRESS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT, CMD_VERSION,
-        TAP_PROTOCOL_VERSION,
+        CMD_SET_TOOLTIP_SUPPRESS, CMD_SHELL_CARD_RECTS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT,
+        CMD_VERSION, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS, TAP_PROTOCOL_VERSION,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
@@ -1635,12 +2666,15 @@ mod win {
     use windows::System::{DispatcherQueue, DispatcherQueueHandler};
     use windows::Win32::Foundation::{
         CloseHandle, GetLastError, BOOL, CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE, E_POINTER,
-        ERROR_IO_PENDING, ERROR_PIPE_CONNECTED, HANDLE, HINSTANCE, INVALID_HANDLE_VALUE, S_FALSE,
-        S_OK, TRUE, WAIT_OBJECT_0,
+        ERROR_IO_PENDING, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE,
+        HANDLE, HINSTANCE, INVALID_HANDLE_VALUE, S_FALSE, S_OK, TRUE, WAIT_OBJECT_0,
     };
+    use windows::Win32::Security::{GetTokenInformation, TokenIsAppContainer, TOKEN_QUERY};
     use windows::Win32::Storage::FileSystem::{
-        FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX,
+        CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_NONE,
+        OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
+    use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
     use windows::Win32::System::Com::{
         CoCreateFreeThreadedMarshaler, CoCreateInstance, CoInitializeEx, CoUninitialize,
         IGlobalInterfaceTable, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -1648,14 +2682,36 @@ mod win {
     use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::LibraryLoader::DisableThreadLibraryCalls;
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
-        PIPE_TYPE_BYTE, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, WaitNamedPipeW,
+        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows::Win32::System::Threading::{
-        CreateEventW, GetCurrentProcessId, GetCurrentThreadId, OpenProcess, ResetEvent, SetEvent,
-        WaitForMultipleObjects, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+        CreateEventW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
+        OpenProcessToken, ResetEvent, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+        INFINITE, PROCESS_SYNCHRONIZE,
     };
     use windows::Win32::System::WinRT::{RoActivateInstance, RoGetActivationFactory};
+
+    unsafe fn is_current_process_appcontainer() -> bool {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err()
+            || token.is_invalid()
+        {
+            return false;
+        }
+        let mut is_ac = 0u32;
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenIsAppContainer,
+            Some((&mut is_ac as *mut u32).cast()),
+            size_of::<u32>() as u32,
+            &mut ret_len,
+        )
+        .is_ok();
+        let _ = CloseHandle(token);
+        ok && is_ac != 0
+    }
 
     const DLL_PROCESS_ATTACH_CODE: u32 = 1;
     const E_FAIL_HR: HRESULT = HRESULT(0x80004005u32 as i32);
@@ -2233,6 +3289,10 @@ mod win {
     const DIAG_OSD_SHADOW_APPLIED: u32 = 1 << 19;
     const DIAG_TOOLTIP_APPLIED: u32 = 1 << 20;
     const DIAG_TOOLTIP_SHADOW_APPLIED: u32 = 1 << 21;
+    const DIAG_MENU_FLYOUT_APPLIED: u32 = 1 << 22;
+    const DIAG_MENU_FLYOUT_SHADOW_APPLIED: u32 = 1 << 23;
+    const DIAG_SHELL_CARD_APPLIED: u32 = 1 << 24;
+    const DIAG_SHELL_CARD_SHADOW_APPLIED: u32 = 1 << 25;
 
     #[repr(C)]
     struct RawIUIElement {
@@ -3492,6 +4552,10 @@ mod win {
         hover_flyout_shapes: HashMap<u64, (ComRaw, f64, i32)>,
         tooltip_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
         tooltip_modified_targets: HashMap<u64, TooltipTrackedEntry>,
+        menu_flyout_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
+        menu_flyout_modified_targets: HashMap<u64, TooltipTrackedEntry>,
+        shell_card_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
+        shell_card_modified_targets: HashMap<u64, TooltipTrackedEntry>,
     }
 
     thread_local! {
@@ -3881,6 +4945,185 @@ mod win {
                             None,
                             DIAG_TOOLTIP_SHADOW_APPLIED,
                             is_cp,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            TargetKind::MenuFlyoutSurface => {
+                let (target_bg, target_border) = cb.runtime.menu_flyout_target_colors();
+                match cb.prop {
+                    BrushPropKind::ControlBackground | BrushPropKind::ControlBorderBrush => {
+                        let ctrl_com = qi_interface(sender, &IID_ICONTROL);
+                        if !ctrl_com.is_null() {
+                            let col = if matches!(cb.prop, BrushPropKind::ControlBackground) {
+                                target_bg
+                            } else {
+                                target_border
+                            };
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                ctrl_com.as_ptr(),
+                                cb.prop,
+                                col,
+                                true,
+                                None,
+                                DIAG_MENU_FLYOUT_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::BorderBackground | BrushPropKind::BorderBrush => {
+                        let border_com = qi_interface(sender, &IID_IBORDER);
+                        if !border_com.is_null() {
+                            let col = if matches!(cb.prop, BrushPropKind::BorderBackground) {
+                                target_bg
+                            } else {
+                                target_border
+                            };
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                border_com.as_ptr(),
+                                cb.prop,
+                                col,
+                                true,
+                                None,
+                                DIAG_MENU_FLYOUT_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::PanelBackground => {
+                        let panel_com = qi_interface(sender, &IID_IPANEL);
+                        if !panel_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                panel_com.as_ptr(),
+                                BrushPropKind::PanelBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_MENU_FLYOUT_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::GridBorderBrush => {
+                        let grid2_com = qi_interface(sender, &IID_IGRID2);
+                        if !grid2_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                grid2_com.as_ptr(),
+                                BrushPropKind::GridBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_MENU_FLYOUT_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::ElementShadow => {
+                        sync_element_shadow_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            true,
+                            None,
+                            DIAG_MENU_FLYOUT_SHADOW_APPLIED,
+                            false,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            TargetKind::ShellCardSurface | TargetKind::ShellCardSubSurface => {
+                let (target_bg, target_border) = if cb.kind == TargetKind::ShellCardSubSurface {
+                    (RawUiColor::TRANSPARENT, RawUiColor::TRANSPARENT)
+                } else {
+                    cb.runtime.menu_flyout_target_colors()
+                };
+                match cb.prop {
+                    BrushPropKind::BorderBackground => {
+                        let border_com = qi_interface(sender, &IID_IBORDER);
+                        if !border_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                border_com.as_ptr(),
+                                BrushPropKind::BorderBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_SHELL_CARD_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::BorderBrush => {
+                        let border_com = qi_interface(sender, &IID_IBORDER);
+                        if !border_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                border_com.as_ptr(),
+                                BrushPropKind::BorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_SHELL_CARD_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::PanelBackground => {
+                        let panel_com = qi_interface(sender, &IID_IPANEL);
+                        if !panel_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                panel_com.as_ptr(),
+                                BrushPropKind::PanelBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_SHELL_CARD_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::GridBorderBrush => {
+                        let grid2_com = qi_interface(sender, &IID_IGRID2);
+                        if !grid2_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                grid2_com.as_ptr(),
+                                BrushPropKind::GridBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_SHELL_CARD_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::ElementShadow => {
+                        sync_element_shadow_prop(
+                            &cb.runtime,
+                            cb.handle,
+                            sender,
+                            true,
+                            None,
+                            DIAG_SHELL_CARD_SHADOW_APPLIED,
+                            false,
                         );
                     }
                     _ => {}
@@ -4330,47 +5573,57 @@ mod win {
         }
     }
 
-    unsafe fn track_tooltip_modified_target(
-        presenter_key: u64,
-        presenter_insp: *mut c_void,
-        parent_tooltip: Option<(u64, *mut c_void)>,
+    unsafe fn resolve_weak_raw_inspectable(weak_raw: usize) -> Option<ComRaw> {
+        if weak_raw == 0 {
+            return None;
+        }
+        add_ref_raw_com_addr(weak_raw);
+        let weak_com = ComRaw(weak_raw as *mut c_void);
+        resolve_weak_inspectable(&weak_com)
+    }
+
+    unsafe fn track_paired_modified_target(
+        primary_key: u64,
+        primary_insp: *mut c_void,
+        parent_pair: Option<(u64, *mut c_void)>,
+        get_map: fn(&mut UiThreadBrushStore) -> &mut HashMap<u64, TooltipTrackedEntry>,
+        read_map: fn(&UiThreadBrushStore) -> &HashMap<u64, TooltipTrackedEntry>,
     ) {
-        if presenter_key == 0 || presenter_insp.is_null() {
+        if primary_key == 0 || primary_insp.is_null() {
             return;
         }
-        let (already_exists, need_tooltip_fill, need_prune) = UI_BRUSH_STORE.with(|cell| {
+        let (already_exists, need_parent_fill, need_prune) = UI_BRUSH_STORE.with(|cell| {
             cell.try_borrow()
                 .ok()
                 .map(|s| {
-                    let exists = s.tooltip_modified_targets.get(&presenter_key);
-                    let fill_tt = exists.is_some_and(|e| e.tooltip_weak.is_none())
-                        && parent_tooltip.is_some();
+                    let map = read_map(&s);
+                    let exists = map.get(&primary_key);
+                    let fill_parent = exists.is_some_and(|e| e.tooltip_weak.is_none())
+                        && parent_pair.is_some();
                     (
                         exists.is_some(),
-                        fill_tt,
-                        exists.is_none() && s.tooltip_modified_targets.len() >= 128,
+                        fill_parent,
+                        exists.is_none() && map.len() >= 128,
                     )
                 })
                 .unwrap_or((false, false, false))
         });
 
         if already_exists {
-            if need_tooltip_fill {
-                if let Some((tk, t_ptr)) = parent_tooltip {
-                    if let Some(t_weak) = make_weak_ref_com(t_ptr) {
+            if need_parent_fill {
+                if let Some((pk, p_ptr)) = parent_pair {
+                    if let Some(p_weak) = make_weak_ref_com(p_ptr) {
                         let rejected = UI_BRUSH_STORE.with(|cell| {
                             if let Ok(mut s) = cell.try_borrow_mut() {
-                                if let Some(entry) =
-                                    s.tooltip_modified_targets.get_mut(&presenter_key)
-                                {
+                                if let Some(entry) = get_map(&mut s).get_mut(&primary_key) {
                                     if entry.tooltip_weak.is_none() {
-                                        entry.tooltip_key = Some(tk);
-                                        entry.tooltip_weak = Some(t_weak);
+                                        entry.tooltip_key = Some(pk);
+                                        entry.tooltip_weak = Some(p_weak);
                                         return None;
                                     }
                                 }
                             }
-                            Some(t_weak)
+                            Some(p_weak)
                         });
                         drop(rejected);
                     }
@@ -4385,7 +5638,7 @@ mod win {
                     cell.try_borrow()
                         .ok()
                         .map(|s| {
-                            s.tooltip_modified_targets
+                            read_map(&s)
                                 .iter()
                                 .map(|(&k, e)| {
                                     (
@@ -4420,20 +5673,18 @@ mod win {
                     let Ok(mut s) = cell.try_borrow_mut() else {
                         return Vec::new();
                     };
-                    dead_entry_keys
-                        .iter()
-                        .filter_map(|k| s.tooltip_modified_targets.remove(k))
-                        .collect()
+                    let map = get_map(&mut s);
+                    dead_entry_keys.iter().filter_map(|k| map.remove(k)).collect()
                 });
                 drop(removed);
                 purge_saved_brushes_for_current_thread(&dead_purge_keys);
             }
         }
 
-        let Some(presenter_weak) = make_weak_ref_com(presenter_insp) else {
+        let Some(presenter_weak) = make_weak_ref_com(primary_insp) else {
             return;
         };
-        let (tooltip_key, tooltip_weak) = match parent_tooltip {
+        let (tooltip_key, tooltip_weak) = match parent_pair {
             Some((tk, t_ptr)) => match make_weak_ref_com(t_ptr) {
                 Some(tw) => (Some(tk), Some(tw)),
                 None => (Some(tk), None),
@@ -4442,9 +5693,10 @@ mod win {
         };
         let displaced = UI_BRUSH_STORE.with(|cell| {
             if let Ok(mut s) = cell.try_borrow_mut() {
-                if !s.tooltip_modified_targets.contains_key(&presenter_key) {
-                    s.tooltip_modified_targets.insert(
-                        presenter_key,
+                let map = get_map(&mut s);
+                if !map.contains_key(&primary_key) {
+                    map.insert(
+                        primary_key,
                         TooltipTrackedEntry {
                             presenter_weak,
                             tooltip_key,
@@ -4457,6 +5709,44 @@ mod win {
             Some((presenter_weak, tooltip_weak))
         });
         drop(displaced);
+    }
+
+    unsafe fn track_tooltip_modified_target(
+        presenter_key: u64,
+        presenter_insp: *mut c_void,
+        parent_tooltip: Option<(u64, *mut c_void)>,
+    ) {
+        track_paired_modified_target(
+            presenter_key,
+            presenter_insp,
+            parent_tooltip,
+            |s| &mut s.tooltip_modified_targets,
+            |s| &s.tooltip_modified_targets,
+        );
+    }
+
+    unsafe fn track_menu_flyout_modified_target(
+        surface_key: u64,
+        surface_insp: *mut c_void,
+        parent_ctrl: Option<(u64, *mut c_void)>,
+    ) {
+        track_paired_modified_target(
+            surface_key,
+            surface_insp,
+            parent_ctrl,
+            |s| &mut s.menu_flyout_modified_targets,
+            |s| &s.menu_flyout_modified_targets,
+        );
+    }
+
+    unsafe fn track_shell_card_modified_target(surface_key: u64, surface_insp: *mut c_void) {
+        track_paired_modified_target(
+            surface_key,
+            surface_insp,
+            None,
+            |s| &mut s.shell_card_modified_targets,
+            |s| &s.shell_card_modified_targets,
+        );
     }
 
     fn take_saved_target_brushes(handle: u64) -> SavedTargetBrushes {
@@ -4481,6 +5771,16 @@ mod win {
                 if !s.tooltip_orig_corner_radius.is_empty() {
                     for &h in handles {
                         s.tooltip_orig_corner_radius.remove(&h);
+                    }
+                }
+                if !s.menu_flyout_orig_corner_radius.is_empty() {
+                    for &h in handles {
+                        s.menu_flyout_orig_corner_radius.remove(&h);
+                    }
+                }
+                if !s.shell_card_orig_corner_radius.is_empty() {
+                    for &h in handles {
+                        s.shell_card_orig_corner_radius.remove(&h);
                     }
                 }
                 let brushes: Vec<SavedTargetBrushes> = if s.saved.is_empty() {
@@ -5208,6 +6508,54 @@ mod win {
             }
         }
         measure_element_bounds_dip(insp_ptr, 20.0, 16.0, 0.05)
+    }
+
+    unsafe fn measure_menu_flyout_bounds_dip(insp_ptr: *mut c_void) -> Option<[f32; 4]> {
+        let Some(vth) = cached_visual_tree_helper() else {
+            return None;
+        };
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        let mut cur_dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+        let mut ancestor_hops = 0usize;
+        for _ in 0..8 {
+            if cur_dep.is_null() {
+                break;
+            }
+            let mut parent_dep = ComRaw::null();
+            if ((*(*vth_iface).lp_vtbl).get_parent)(
+                vth.as_ptr(),
+                cur_dep.as_ptr(),
+                &mut parent_dep.0,
+            )
+            .is_err()
+                || parent_dep.is_null()
+            {
+                break;
+            }
+            let p_ui = qi_interface(parent_dep.as_ptr(), &IID_IUIELEMENT);
+            if !p_ui.is_null() {
+                let p_ui_iface = p_ui.as_ptr().cast::<RawIUIElement>();
+                let mut p_vis = VISIBILITY_COLLAPSED;
+                if ((*(*p_ui_iface).lp_vtbl).get_visibility)(p_ui.as_ptr(), &mut p_vis).is_err()
+                    || p_vis != VISIBILITY_VISIBLE
+                {
+                    return None;
+                }
+                let mut p_op = 0.0f64;
+                if ((*(*p_ui_iface).lp_vtbl).get_opacity)(p_ui.as_ptr(), &mut p_op).is_err()
+                    || !p_op.is_finite()
+                    || p_op < 0.05
+                {
+                    return None;
+                }
+            }
+            ancestor_hops += 1;
+            cur_dep = parent_dep;
+        }
+        if ancestor_hops < 2 {
+            return None;
+        }
+        measure_element_bounds_dip(insp_ptr, 64.0, 28.0, 0.05)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6319,15 +7667,56 @@ mod win {
         Some((parent_key, parent_insp))
     }
 
-    unsafe fn sync_tooltip_control_corner_radius(
-        tooltip_key: u64,
-        tt_ptr: *mut c_void,
+    unsafe fn find_parent_menu_flyout_control(insp_ptr: *mut c_void) -> Option<(u64, ComRaw)> {
+        let vth = cached_visual_tree_helper()?;
+        let mut cur_dep = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
+        if cur_dep.is_null() {
+            return None;
+        }
+        let vth_iface = vth.as_ptr().cast::<RawIVisualTreeHelperStatics>();
+        for _ in 0..4 {
+            let mut parent_dep = ComRaw::null();
+            if ((*(*vth_iface).lp_vtbl).get_parent)(
+                vth.as_ptr(),
+                cur_dep.as_ptr(),
+                &mut parent_dep.0,
+            )
+            .is_err()
+                || parent_dep.is_null()
+            {
+                break;
+            }
+            let ctrl_com = qi_interface(parent_dep.as_ptr(), &IID_ICONTROL);
+            if !ctrl_com.is_null() {
+                let parent_insp = qi_interface(parent_dep.as_ptr(), &IID_IINSPECTABLE);
+                if !parent_insp.is_null() {
+                    if let Some(cls) = element_runtime_class_name(parent_insp.as_ptr()) {
+                        if cls.contains("MenuFlyoutPresenter")
+                            || ((cls.contains("JumpList") || cls.contains("JumpView"))
+                                && !cls.contains("Item"))
+                        {
+                            let parent_key = com_identity_key(parent_insp.as_ptr());
+                            return Some((parent_key, parent_insp));
+                        }
+                    }
+                }
+            }
+            cur_dep = parent_dep;
+        }
+        None
+    }
+
+    unsafe fn sync_control_corner_radius_in_map(
+        ctrl_key: u64,
+        ctrl_ptr: *mut c_void,
         apply_round: bool,
+        get_map: fn(&mut UiThreadBrushStore) -> &mut HashMap<u64, SavedCornerRadius>,
+        read_map: fn(&UiThreadBrushStore) -> &HashMap<u64, SavedCornerRadius>,
     ) {
-        if tt_ptr.is_null() {
+        if ctrl_ptr.is_null() {
             return;
         }
-        let ctrl7_com = qi_interface(tt_ptr, &IID_ICONTROL7);
+        let ctrl7_com = qi_interface(ctrl_ptr, &IID_ICONTROL7);
         if ctrl7_com.is_null() {
             return;
         }
@@ -6336,7 +7725,7 @@ mod win {
             let already_saved = UI_BRUSH_STORE.with(|cell| {
                 cell.try_borrow()
                     .ok()
-                    .is_some_and(|s| s.tooltip_orig_corner_radius.contains_key(&tooltip_key))
+                    .is_some_and(|s| read_map(&s).contains_key(&ctrl_key))
             });
             if !already_saved {
                 let mut saved_cr: Option<SavedCornerRadius> = None;
@@ -6351,7 +7740,7 @@ mod win {
                     fetch_unset_value,
                 );
                 if let (Some(dp_com), Some(unset_com)) = (dp, unset) {
-                    let dep_com = qi_interface(tt_ptr, &IID_IDEPENDENCYOBJECT);
+                    let dep_com = qi_interface(ctrl_ptr, &IID_IDEPENDENCYOBJECT);
                     if !dep_com.is_null() {
                         let dep = dep_com.as_ptr().cast::<RawIDependencyObject>();
                         let mut local_val = ComRaw::null();
@@ -6379,9 +7768,7 @@ mod win {
                 if let Some(orig) = saved_cr {
                     let _ = UI_BRUSH_STORE.with(|cell| {
                         if let Ok(mut s) = cell.try_borrow_mut() {
-                            s.tooltip_orig_corner_radius
-                                .entry(tooltip_key)
-                                .or_insert(orig);
+                            get_map(&mut s).entry(ctrl_key).or_insert(orig);
                         }
                     });
                 }
@@ -6402,7 +7789,7 @@ mod win {
             let orig = UI_BRUSH_STORE.with(|cell| {
                 cell.try_borrow_mut()
                     .ok()
-                    .and_then(|mut s| s.tooltip_orig_corner_radius.remove(&tooltip_key))
+                    .and_then(|mut s| get_map(&mut s).remove(&ctrl_key))
             });
             match orig {
                 Some(SavedCornerRadius::Unset) => {
@@ -6411,7 +7798,7 @@ mod win {
                         |s, v| s.control_corner_radius_dp = Some(v),
                         fetch_control_corner_radius_dp,
                     );
-                    let _ = clear_dp_value(tt_ptr, dp.as_ref());
+                    let _ = clear_dp_value(ctrl_ptr, dp.as_ref());
                 }
                 Some(SavedCornerRadius::Local(orig_cr)) => {
                     let _ = ((*(*ctrl7).lp_vtbl).put_corner_radius)(ctrl7_com.as_ptr(), orig_cr);
@@ -6419,6 +7806,34 @@ mod win {
                 None => {}
             }
         }
+    }
+
+    unsafe fn sync_tooltip_control_corner_radius(
+        tooltip_key: u64,
+        tt_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        sync_control_corner_radius_in_map(
+            tooltip_key,
+            tt_ptr,
+            apply_round,
+            |s| &mut s.tooltip_orig_corner_radius,
+            |s| &s.tooltip_orig_corner_radius,
+        );
+    }
+
+    unsafe fn sync_menu_flyout_control_corner_radius(
+        ctrl_key: u64,
+        ctrl_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        sync_control_corner_radius_in_map(
+            ctrl_key,
+            ctrl_ptr,
+            apply_round,
+            |s| &mut s.menu_flyout_orig_corner_radius,
+            |s| &s.menu_flyout_orig_corner_radius,
+        );
     }
 
     unsafe fn sync_tooltip_presenter_corner_radius_fallback(
@@ -6806,6 +8221,766 @@ mod win {
         }
     }
 
+    unsafe fn sync_menu_flyout_border_corner_radius_fallback(
+        surface_key: u64,
+        border_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        if border_ptr.is_null() {
+            return;
+        }
+        let border = border_ptr.cast::<RawIBorder>();
+        if apply_round {
+            let target_cr = RawCornerRadius {
+                top_left: 8.0,
+                top_right: 8.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
+            };
+            let mut cur_cr = RawCornerRadius::default();
+            if ((*(*border).lp_vtbl).get_corner_radius)(border_ptr, &mut cur_cr).is_ok()
+                && approx_eq_corner_radius(cur_cr, target_cr)
+            {
+                return;
+            }
+            let already_saved = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.menu_flyout_orig_corner_radius.contains_key(&surface_key))
+            });
+            if !already_saved
+                && ((*(*border).lp_vtbl).get_corner_radius)(border_ptr, &mut cur_cr).is_ok()
+            {
+                let _ = UI_BRUSH_STORE.with(|cell| {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.menu_flyout_orig_corner_radius
+                            .entry(surface_key)
+                            .or_insert(SavedCornerRadius::Local(cur_cr));
+                    }
+                });
+            }
+            let _ = ((*(*border).lp_vtbl).put_corner_radius)(border_ptr, target_cr);
+        } else {
+            let orig = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.menu_flyout_orig_corner_radius.remove(&surface_key))
+            });
+            if let Some(SavedCornerRadius::Local(orig_cr)) = orig {
+                let _ = ((*(*border).lp_vtbl).put_corner_radius)(border_ptr, orig_cr);
+            }
+        }
+    }
+
+    unsafe fn restore_menu_flyout_pair(
+        rt: &Arc<TapRuntime>,
+        surface_key: u64,
+        surface_insp: Option<*mut c_void>,
+        ctrl_key_opt: Option<u64>,
+        ctrl_insp: Option<*mut c_void>,
+    ) {
+        let ck_eff = ctrl_insp.map(|p| com_identity_key(p)).or(ctrl_key_opt);
+
+        let mut keys_to_clean = Vec::with_capacity(2);
+        if surface_key != 0 {
+            keys_to_clean.push(surface_key);
+        }
+        if let Some(ck) = ck_eff.filter(|&k| k != 0 && !keys_to_clean.contains(&k)) {
+            keys_to_clean.push(ck);
+        }
+        unregister_watches_for_keys(&keys_to_clean);
+
+        let (target_bg, target_border) = rt.menu_flyout_target_colors();
+
+        if let (Some(ck), Some(ctrl_ptr)) = (ck_eff, ctrl_insp) {
+            let ctrl_saved = take_saved_target_brushes(ck);
+            let ctrl_com = qi_interface(ctrl_ptr, &IID_ICONTROL);
+            if !ctrl_com.is_null() {
+                sync_overflow_brush_prop(
+                    rt,
+                    ck,
+                    ctrl_ptr,
+                    ctrl_com.as_ptr(),
+                    BrushPropKind::ControlBackground,
+                    target_bg,
+                    false,
+                    ctrl_saved.background,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                );
+                sync_overflow_brush_prop(
+                    rt,
+                    ck,
+                    ctrl_ptr,
+                    ctrl_com.as_ptr(),
+                    BrushPropKind::ControlBorderBrush,
+                    target_border,
+                    false,
+                    ctrl_saved.border_brush,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                );
+            }
+            sync_menu_flyout_control_corner_radius(ck, ctrl_ptr, false);
+            if ctrl_saved.shadow.is_some() {
+                sync_element_shadow_prop(
+                    rt,
+                    ck,
+                    ctrl_ptr,
+                    false,
+                    ctrl_saved.shadow,
+                    DIAG_MENU_FLYOUT_SHADOW_APPLIED,
+                    false,
+                );
+            }
+        }
+
+        if let Some(surf_ptr) = surface_insp {
+            let surf_saved = take_saved_target_brushes(surface_key);
+            if surf_saved.shadow.is_some() {
+                sync_element_shadow_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    false,
+                    surf_saved.shadow,
+                    DIAG_MENU_FLYOUT_SHADOW_APPLIED,
+                    false,
+                );
+            }
+            let border_com = qi_interface(surf_ptr, &IID_IBORDER);
+            if !border_com.is_null() {
+                if let Some(sb_bg) = surf_saved.background {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        surface_key,
+                        surf_ptr,
+                        border_com.as_ptr(),
+                        BrushPropKind::BorderBackground,
+                        target_bg,
+                        false,
+                        Some(sb_bg),
+                        DIAG_MENU_FLYOUT_APPLIED,
+                        true,
+                    );
+                }
+                if let Some(sb_bb) = surf_saved.border_brush {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        surface_key,
+                        surf_ptr,
+                        border_com.as_ptr(),
+                        BrushPropKind::BorderBrush,
+                        target_border,
+                        false,
+                        Some(sb_bb),
+                        DIAG_MENU_FLYOUT_APPLIED,
+                        true,
+                    );
+                }
+                sync_menu_flyout_border_corner_radius_fallback(
+                    surface_key,
+                    border_com.as_ptr(),
+                    false,
+                );
+            } else {
+                let panel_com = qi_interface(surf_ptr, &IID_IPANEL);
+                if !panel_com.is_null() {
+                    if let Some(sb_bg) = surf_saved.background {
+                        sync_overflow_brush_prop(
+                            rt,
+                            surface_key,
+                            surf_ptr,
+                            panel_com.as_ptr(),
+                            BrushPropKind::PanelBackground,
+                            target_bg,
+                            false,
+                            Some(sb_bg),
+                            DIAG_MENU_FLYOUT_APPLIED,
+                        );
+                    }
+                }
+                let grid2_com = qi_interface(surf_ptr, &IID_IGRID2);
+                if !grid2_com.is_null() {
+                    if let Some(sb_bb) = surf_saved.border_brush {
+                        sync_overflow_brush_prop(
+                            rt,
+                            surface_key,
+                            surf_ptr,
+                            grid2_com.as_ptr(),
+                            BrushPropKind::GridBorderBrush,
+                            target_border,
+                            false,
+                            Some(sb_bb),
+                            DIAG_MENU_FLYOUT_APPLIED,
+                        );
+                    }
+                }
+            }
+        }
+
+        purge_saved_brushes_for_current_thread(&keys_to_clean);
+    }
+
+    unsafe fn restore_all_menu_flyout_targets_for_current_thread(rt: &Arc<TapRuntime>) {
+        let entries: Vec<(u64, TooltipTrackedEntry)> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            s.menu_flyout_modified_targets.drain().collect()
+        });
+        for (surface_key, entry) in entries {
+            let surf_insp = resolve_weak_inspectable(&entry.presenter_weak);
+            let ctrl_insp = entry
+                .tooltip_weak
+                .as_ref()
+                .and_then(|cw| resolve_weak_inspectable(cw));
+            restore_menu_flyout_pair(
+                rt,
+                surface_key,
+                surf_insp.as_ref().map(ComRaw::as_ptr),
+                entry.tooltip_key,
+                ctrl_insp.as_ref().map(ComRaw::as_ptr),
+            );
+        }
+    }
+
+    unsafe fn apply_menu_flyout_surface_appearance(
+        rt: &Arc<TapRuntime>,
+        _handle: u64,
+        insp_ptr: *mut c_void,
+        desired_hide: bool,
+    ) {
+        if insp_ptr.is_null() {
+            return;
+        }
+        let surface_key = com_identity_key(insp_ptr);
+        let parent_ctrl = find_parent_menu_flyout_control(insp_ptr);
+
+        if desired_hide {
+            let parent_pair = parent_ctrl
+                .as_ref()
+                .map(|(ck, insp)| (*ck, insp.as_ptr()));
+            track_menu_flyout_modified_target(surface_key, insp_ptr, parent_pair);
+
+            let (target_bg, target_border) = rt.menu_flyout_target_colors();
+            let apply_round = rt.is_menu_flyout_suppressed();
+
+            if let Some((ctrl_key, ref ctrl_insp)) = parent_ctrl {
+                let ctrl_ptr = ctrl_insp.as_ptr();
+                let ctrl_com = qi_interface(ctrl_ptr, &IID_ICONTROL);
+                if !ctrl_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        ctrl_key,
+                        ctrl_ptr,
+                        ctrl_com.as_ptr(),
+                        BrushPropKind::ControlBackground,
+                        target_bg,
+                        true,
+                        None,
+                        DIAG_MENU_FLYOUT_APPLIED,
+                    );
+                    sync_overflow_brush_prop(
+                        rt,
+                        ctrl_key,
+                        ctrl_ptr,
+                        ctrl_com.as_ptr(),
+                        BrushPropKind::ControlBorderBrush,
+                        target_border,
+                        true,
+                        None,
+                        DIAG_MENU_FLYOUT_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        ctrl_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::ControlBackground,
+                        ctrl_ptr,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        ctrl_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::ControlBorderBrush,
+                        ctrl_ptr,
+                    );
+                }
+                sync_menu_flyout_control_corner_radius(ctrl_key, ctrl_ptr, apply_round);
+                sync_element_shadow_prop(
+                    rt,
+                    ctrl_key,
+                    ctrl_ptr,
+                    true,
+                    None,
+                    DIAG_MENU_FLYOUT_SHADOW_APPLIED,
+                    false,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    ctrl_key,
+                    TargetKind::MenuFlyoutSurface,
+                    BrushPropKind::ElementShadow,
+                    ctrl_ptr,
+                );
+            }
+
+            sync_element_shadow_prop(
+                rt,
+                surface_key,
+                insp_ptr,
+                true,
+                None,
+                DIAG_MENU_FLYOUT_SHADOW_APPLIED,
+                false,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                surface_key,
+                TargetKind::MenuFlyoutSurface,
+                BrushPropKind::ElementShadow,
+                insp_ptr,
+            );
+
+            // Preserve {TemplateBinding Background/BorderBrush/CornerRadius} on child Border
+            // (e.g. MenuFlyoutPresenterRoot) when inherited from parent Control.
+            let border_com = qi_interface(insp_ptr, &IID_IBORDER);
+            if !border_com.is_null() {
+                let wrote_b_bg = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    surface_key,
+                    insp_ptr,
+                    border_com.as_ptr(),
+                    BrushPropKind::BorderBackground,
+                    target_bg,
+                    true,
+                    None,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                    true,
+                );
+                if wrote_b_bg
+                    || parent_ctrl.is_none()
+                    || has_saved_brush_slot(surface_key, BrushSlot::Background)
+                {
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::BorderBackground,
+                        insp_ptr,
+                    );
+                }
+                let wrote_b_bb = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    surface_key,
+                    insp_ptr,
+                    border_com.as_ptr(),
+                    BrushPropKind::BorderBrush,
+                    target_border,
+                    true,
+                    None,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                    true,
+                );
+                if wrote_b_bb
+                    || parent_ctrl.is_none()
+                    || has_saved_brush_slot(surface_key, BrushSlot::BorderBrush)
+                {
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::BorderBrush,
+                        insp_ptr,
+                    );
+                }
+                if apply_round
+                    || UI_BRUSH_STORE.with(|cell| {
+                        cell.try_borrow()
+                            .ok()
+                            .is_some_and(|s| s.menu_flyout_orig_corner_radius.contains_key(&surface_key))
+                    })
+                {
+                    sync_menu_flyout_border_corner_radius_fallback(
+                        surface_key,
+                        border_com.as_ptr(),
+                        apply_round,
+                    );
+                }
+            } else {
+                let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
+                if !panel_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        surface_key,
+                        insp_ptr,
+                        panel_com.as_ptr(),
+                        BrushPropKind::PanelBackground,
+                        target_bg,
+                        true,
+                        None,
+                        DIAG_MENU_FLYOUT_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::PanelBackground,
+                        insp_ptr,
+                    );
+                }
+                let grid2_com = qi_interface(insp_ptr, &IID_IGRID2);
+                if !grid2_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        surface_key,
+                        insp_ptr,
+                        grid2_com.as_ptr(),
+                        BrushPropKind::GridBorderBrush,
+                        target_border,
+                        true,
+                        None,
+                        DIAG_MENU_FLYOUT_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        TargetKind::MenuFlyoutSurface,
+                        BrushPropKind::GridBorderBrush,
+                        insp_ptr,
+                    );
+                }
+            }
+        } else {
+            let tracked = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.menu_flyout_modified_targets.remove(&surface_key))
+            });
+            let resolved_parent = if parent_ctrl.is_some() {
+                parent_ctrl
+            } else {
+                tracked.as_ref().and_then(|e| {
+                    e.tooltip_weak
+                        .as_ref()
+                        .and_then(|cw| resolve_weak_inspectable(cw))
+                        .map(|insp| (e.tooltip_key.unwrap_or_else(|| com_identity_key(insp.as_ptr())), insp))
+                })
+            };
+            let ck_opt = resolved_parent
+                .as_ref()
+                .map(|(ck, _)| *ck)
+                .or_else(|| tracked.as_ref().and_then(|e| e.tooltip_key));
+            restore_menu_flyout_pair(
+                rt,
+                surface_key,
+                Some(insp_ptr),
+                ck_opt,
+                resolved_parent.as_ref().map(|(_, insp)| insp.as_ptr()),
+            );
+        }
+    }
+
+    unsafe fn sync_shell_card_border_corner_radius(
+        surface_key: u64,
+        border_ptr: *mut c_void,
+        apply_round: bool,
+    ) {
+        if border_ptr.is_null() {
+            return;
+        }
+        let border = border_ptr.cast::<RawIBorder>();
+        if apply_round {
+            let target_cr = RawCornerRadius {
+                top_left: 8.0,
+                top_right: 8.0,
+                bottom_right: 8.0,
+                bottom_left: 8.0,
+            };
+            let mut cur_cr = RawCornerRadius::default();
+            if ((*(*border).lp_vtbl).get_corner_radius)(border_ptr, &mut cur_cr).is_ok()
+                && approx_eq_corner_radius(cur_cr, target_cr)
+            {
+                return;
+            }
+            let already_saved = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow()
+                    .ok()
+                    .is_some_and(|s| s.shell_card_orig_corner_radius.contains_key(&surface_key))
+            });
+            if !already_saved
+                && ((*(*border).lp_vtbl).get_corner_radius)(border_ptr, &mut cur_cr).is_ok()
+            {
+                let _ = UI_BRUSH_STORE.with(|cell| {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.shell_card_orig_corner_radius
+                            .entry(surface_key)
+                            .or_insert(SavedCornerRadius::Local(cur_cr));
+                    }
+                });
+            }
+            let _ = ((*(*border).lp_vtbl).put_corner_radius)(border_ptr, target_cr);
+        } else {
+            let orig = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.shell_card_orig_corner_radius.remove(&surface_key))
+            });
+            if let Some(SavedCornerRadius::Local(orig_cr)) = orig {
+                let _ = ((*(*border).lp_vtbl).put_corner_radius)(border_ptr, orig_cr);
+            }
+        }
+    }
+
+    unsafe fn restore_shell_card_target(
+        rt: &Arc<TapRuntime>,
+        surface_key: u64,
+        surface_insp: Option<*mut c_void>,
+    ) {
+        if surface_key != 0 {
+            unregister_watches_for_keys(&[surface_key]);
+        }
+        let surf_saved = take_saved_target_brushes(surface_key);
+        let (target_bg, target_border) = rt.menu_flyout_target_colors();
+
+        if let Some(surf_ptr) = surface_insp {
+            if surf_saved.shadow.is_some() {
+                sync_element_shadow_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    false,
+                    surf_saved.shadow,
+                    DIAG_SHELL_CARD_SHADOW_APPLIED,
+                    false,
+                );
+            }
+            let border_com = qi_interface(surf_ptr, &IID_IBORDER);
+            if !border_com.is_null() {
+                if let Some(sb_bg) = surf_saved.background {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        surface_key,
+                        surf_ptr,
+                        border_com.as_ptr(),
+                        BrushPropKind::BorderBackground,
+                        target_bg,
+                        false,
+                        Some(sb_bg),
+                        DIAG_SHELL_CARD_APPLIED,
+                        true,
+                    );
+                }
+                if let Some(sb_bb) = surf_saved.border_brush {
+                    let _ = sync_overflow_brush_prop_with_mode(
+                        rt,
+                        surface_key,
+                        surf_ptr,
+                        border_com.as_ptr(),
+                        BrushPropKind::BorderBrush,
+                        target_border,
+                        false,
+                        Some(sb_bb),
+                        DIAG_SHELL_CARD_APPLIED,
+                        true,
+                    );
+                }
+                sync_shell_card_border_corner_radius(surface_key, border_com.as_ptr(), false);
+            } else {
+                let panel_com = qi_interface(surf_ptr, &IID_IPANEL);
+                if !panel_com.is_null() {
+                    if let Some(sb_bg) = surf_saved.background {
+                        sync_overflow_brush_prop(
+                            rt,
+                            surface_key,
+                            surf_ptr,
+                            panel_com.as_ptr(),
+                            BrushPropKind::PanelBackground,
+                            target_bg,
+                            false,
+                            Some(sb_bg),
+                            DIAG_SHELL_CARD_APPLIED,
+                        );
+                    }
+                }
+                let grid2_com = qi_interface(surf_ptr, &IID_IGRID2);
+                if !grid2_com.is_null() {
+                    if let Some(sb_bb) = surf_saved.border_brush {
+                        sync_overflow_brush_prop(
+                            rt,
+                            surface_key,
+                            surf_ptr,
+                            grid2_com.as_ptr(),
+                            BrushPropKind::GridBorderBrush,
+                            target_border,
+                            false,
+                            Some(sb_bb),
+                            DIAG_SHELL_CARD_APPLIED,
+                        );
+                    }
+                }
+            }
+        }
+        if surface_key != 0 {
+            purge_saved_brushes_for_current_thread(&[surface_key]);
+        }
+    }
+
+    unsafe fn restore_all_shell_card_targets_for_current_thread(rt: &Arc<TapRuntime>) {
+        let entries: Vec<(u64, TooltipTrackedEntry)> = UI_BRUSH_STORE.with(|cell| {
+            let Ok(mut s) = cell.try_borrow_mut() else {
+                return Vec::new();
+            };
+            s.shell_card_modified_targets.drain().collect()
+        });
+        for (surface_key, entry) in entries {
+            let surf_insp = resolve_weak_inspectable(&entry.presenter_weak);
+            restore_shell_card_target(
+                rt,
+                surface_key,
+                surf_insp.as_ref().map(ComRaw::as_ptr),
+            );
+        }
+    }
+
+    unsafe fn apply_shell_card_surface_appearance(
+        rt: &Arc<TapRuntime>,
+        _handle: u64,
+        insp_ptr: *mut c_void,
+        kind: TargetKind,
+        desired_hide: bool,
+    ) {
+        if insp_ptr.is_null() {
+            return;
+        }
+        let surface_key = com_identity_key(insp_ptr);
+        if desired_hide {
+            track_shell_card_modified_target(surface_key, insp_ptr);
+            let is_subsurface = kind == TargetKind::ShellCardSubSurface;
+            let (target_bg, target_border) = if is_subsurface {
+                (RawUiColor::TRANSPARENT, RawUiColor::TRANSPARENT)
+            } else {
+                rt.menu_flyout_target_colors()
+            };
+            let apply_round = !is_subsurface && rt.is_menu_flyout_suppressed();
+
+            sync_element_shadow_prop(
+                rt,
+                surface_key,
+                insp_ptr,
+                true,
+                None,
+                DIAG_SHELL_CARD_SHADOW_APPLIED,
+                false,
+            );
+            ensure_prop_watch_registered(
+                rt,
+                surface_key,
+                kind,
+                BrushPropKind::ElementShadow,
+                insp_ptr,
+            );
+
+            let border_com = qi_interface(insp_ptr, &IID_IBORDER);
+            if !border_com.is_null() {
+                let _ = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    surface_key,
+                    insp_ptr,
+                    border_com.as_ptr(),
+                    BrushPropKind::BorderBackground,
+                    target_bg,
+                    true,
+                    None,
+                    DIAG_SHELL_CARD_APPLIED,
+                    true,
+                );
+                let _ = sync_overflow_brush_prop_with_mode(
+                    rt,
+                    surface_key,
+                    insp_ptr,
+                    border_com.as_ptr(),
+                    BrushPropKind::BorderBrush,
+                    target_border,
+                    true,
+                    None,
+                    DIAG_SHELL_CARD_APPLIED,
+                    true,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    surface_key,
+                    kind,
+                    BrushPropKind::BorderBackground,
+                    insp_ptr,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    surface_key,
+                    kind,
+                    BrushPropKind::BorderBrush,
+                    insp_ptr,
+                );
+                sync_shell_card_border_corner_radius(surface_key, border_com.as_ptr(), apply_round);
+            } else {
+                let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
+                if !panel_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        surface_key,
+                        insp_ptr,
+                        panel_com.as_ptr(),
+                        BrushPropKind::PanelBackground,
+                        target_bg,
+                        true,
+                        None,
+                        DIAG_SHELL_CARD_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        kind,
+                        BrushPropKind::PanelBackground,
+                        insp_ptr,
+                    );
+                }
+                let grid2_com = qi_interface(insp_ptr, &IID_IGRID2);
+                if !grid2_com.is_null() {
+                    sync_overflow_brush_prop(
+                        rt,
+                        surface_key,
+                        insp_ptr,
+                        grid2_com.as_ptr(),
+                        BrushPropKind::GridBorderBrush,
+                        target_border,
+                        true,
+                        None,
+                        DIAG_SHELL_CARD_APPLIED,
+                    );
+                    ensure_prop_watch_registered(
+                        rt,
+                        surface_key,
+                        kind,
+                        BrushPropKind::GridBorderBrush,
+                        insp_ptr,
+                    );
+                }
+            }
+        } else {
+            let removed = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow_mut()
+                    .ok()
+                    .and_then(|mut s| s.shell_card_modified_targets.remove(&surface_key))
+            });
+            if removed.is_some()
+                || has_saved_brush_slot(surface_key, BrushSlot::Background)
+                || has_saved_brush_slot(surface_key, BrushSlot::BorderBrush)
+                || has_saved_brush_slot(surface_key, BrushSlot::Shadow)
+            {
+                restore_shell_card_target(rt, surface_key, Some(insp_ptr));
+            }
+        }
+    }
+
     unsafe fn apply_target_appearance(
         rt: &Arc<TapRuntime>,
         handle: u64,
@@ -6879,6 +9054,12 @@ mod win {
             TargetKind::ToolTipPresenter => {
                 apply_tooltip_presenter_appearance(rt, handle, insp_ptr, desired_hide);
             }
+            TargetKind::MenuFlyoutSurface => {
+                apply_menu_flyout_surface_appearance(rt, handle, insp_ptr, desired_hide);
+            }
+            TargetKind::ShellCardSurface | TargetKind::ShellCardSubSurface => {
+                apply_shell_card_surface_appearance(rt, handle, insp_ptr, kind, desired_hide);
+            }
             TargetKind::OverflowPanel => {
                 let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
                 if panel_com.is_null() {
@@ -6941,11 +9122,38 @@ mod win {
         shutdown: bool,
         targets: HashMap<u64, TrackedTarget>,
         tooltip_dispatchers: Vec<(u32, OwnedDispatcher)>,
+        menu_flyout_dispatchers: Vec<(u32, OwnedDispatcher)>,
+    }
+
+    unsafe fn detect_host_scope_and_pipe(is_appcontainer: bool) -> (TapHostScope, Option<String>) {
+        let pid = GetCurrentProcessId();
+        if is_appcontainer {
+            return (
+                TapHostScope::ShellExperience,
+                Some(appcontainer_pipe_name_for_pid(pid)),
+            );
+        }
+        let mut buf = [0u16; 512];
+        let len = GetModuleFileNameW(None, &mut buf) as usize;
+        if len > 0 {
+            let path = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
+            let exe_name = path.rsplit(['\\', '/']).next().unwrap_or("");
+            if exe_name.eq_ignore_ascii_case("ShellHost.exe") {
+                return (
+                    TapHostScope::ShellHost,
+                    Some(shell_host_pipe_name_for_pid(pid)),
+                );
+            }
+        }
+        (TapHostScope::Explorer, None)
     }
 
     struct TapRuntime {
         tree: Mutex<VisualTreeIndex>,
         state: Mutex<RuntimeState>,
+        is_appcontainer: bool,
+        host_scope: TapHostScope,
+        reverse_pipe_name: Option<String>,
         alt_tab_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
         hover_flyout_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
         osd_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
@@ -6956,6 +9164,11 @@ mod win {
         tooltip_suppressed: AtomicBool,
         tooltip_fallback_bg_argb: AtomicU32,
         tooltip_fallback_border_argb: AtomicU32,
+        menu_flyout_bounds_by_tid: Mutex<HashMap<u32, Vec<[f32; 4]>>>,
+        shell_card_bounds_by_handle: Mutex<HashMap<u64, (u32, [f32; 4])>>,
+        menu_flyout_suppressed: AtomicBool,
+        menu_flyout_fallback_bg_argb: AtomicU32,
+        menu_flyout_fallback_border_argb: AtomicU32,
         alt_tab_item_bg_argb: AtomicU32,
         alt_tab_item_border_argb: AtomicU32,
         diag_cookie: AtomicU32,
@@ -6974,6 +9187,9 @@ mod win {
     impl TapRuntime {
         fn new(diag_cookie: u32) -> windows::core::Result<Arc<Self>> {
             let stop_event = unsafe { CreateEventW(None, true, false, None)? };
+            let is_appcontainer = unsafe { is_current_process_appcontainer() };
+            let (host_scope, reverse_pipe_name) =
+                unsafe { detect_host_scope_and_pipe(is_appcontainer) };
             Ok(Arc::new(Self {
                 tree: Mutex::new(VisualTreeIndex::new()),
                 state: Mutex::new(RuntimeState {
@@ -6981,7 +9197,11 @@ mod win {
                     shutdown: false,
                     targets: HashMap::new(),
                     tooltip_dispatchers: Vec::new(),
+                    menu_flyout_dispatchers: Vec::new(),
                 }),
+                is_appcontainer,
+                host_scope,
+                reverse_pipe_name,
                 alt_tab_bounds_dip: Mutex::new(None),
                 hover_flyout_bounds_dip: Mutex::new(None),
                 osd_bounds_dip: Mutex::new(None),
@@ -6992,6 +9212,11 @@ mod win {
                 tooltip_suppressed: AtomicBool::new(false),
                 tooltip_fallback_bg_argb: AtomicU32::new(0x44_141822),
                 tooltip_fallback_border_argb: AtomicU32::new(0x54_FFFFFF),
+                menu_flyout_bounds_by_tid: Mutex::new(HashMap::new()),
+                shell_card_bounds_by_handle: Mutex::new(HashMap::new()),
+                menu_flyout_suppressed: AtomicBool::new(false),
+                menu_flyout_fallback_bg_argb: AtomicU32::new(0x48_141822),
+                menu_flyout_fallback_border_argb: AtomicU32::new(0x56_FFFFFF),
                 alt_tab_item_bg_argb: AtomicU32::new(0x38_1A1D24),
                 alt_tab_item_border_argb: AtomicU32::new(0x42_FFFFFF),
                 diag_cookie: AtomicU32::new(diag_cookie),
@@ -7041,6 +9266,11 @@ mod win {
             self.tooltip_suppressed.load(Ordering::Acquire)
         }
 
+        #[inline]
+        fn is_menu_flyout_suppressed(&self) -> bool {
+            self.menu_flyout_suppressed.load(Ordering::Acquire)
+        }
+
         fn clear_host_handle(&self) {
             if let Ok(mut hh) = self.host_handle_raw.lock() {
                 if let Some((_, raw)) = hh.take() {
@@ -7063,6 +9293,13 @@ mod win {
             if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
                 *b = None;
             }
+            self.menu_flyout_suppressed.store(false, Ordering::Release);
+            if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                b.clear();
+            }
+            if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                b.clear();
+            }
             if let Ok(mut g) = self.state.lock() {
                 if !g.shutdown {
                     g.desired_hide = false;
@@ -7072,7 +9309,7 @@ mod win {
         }
 
         fn set_hide(self: &Arc<Self>, hide: bool, host_pid: u32) {
-            if hide && host_pid != 0 {
+            if hide && !self.is_appcontainer && host_pid != 0 {
                 if let Ok(mut hh) = self.host_handle_raw.lock() {
                     let need_open = match *hh {
                         Some((prev_pid, raw)) if prev_pid == host_pid && raw != 0 => unsafe {
@@ -7104,6 +9341,13 @@ mod win {
                 if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
                     *b = None;
                 }
+                self.menu_flyout_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                    b.clear();
+                }
             }
 
             if let Ok(mut g) = self.state.lock() {
@@ -7125,6 +9369,10 @@ mod win {
                 self.tooltip_suppressed.store(false, Ordering::Release);
                 if let Ok(mut b) = self.tooltip_bounds_dip.lock() {
                     *b = None;
+                }
+                self.menu_flyout_suppressed.store(false, Ordering::Release);
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
                 }
                 if let Ok(mut g) = self.state.lock() {
                     g.desired_hide = false;
@@ -7283,6 +9531,9 @@ mod win {
                 }
                 if only_kind.is_none() {
                     for &(tid, disp) in &g.tooltip_dispatchers {
+                        push_unique(&mut seen_keys, &mut dispatch_list, Some(tid), disp);
+                    }
+                    for &(tid, disp) in &g.menu_flyout_dispatchers {
                         push_unique(&mut seen_keys, &mut dispatch_list, Some(tid), disp);
                     }
                 }
@@ -7447,6 +9698,216 @@ mod win {
             }
         }
 
+        fn query_menu_flyout_bounds_dip(
+            self: &Arc<Self>,
+            wait_ms: u64,
+        ) -> Vec<(u32, [f32; 4])> {
+            if self.is_menu_flyout_suppressed() {
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                return Vec::new();
+            }
+            let dispatched =
+                self.dispatch_apply_filtered(wait_ms, Some(TargetKind::MenuFlyoutSurface));
+            if dispatched == 0 {
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                return Vec::new();
+            }
+            let (active_tids, has_core_menu) = if let Ok(g) = self.state.lock() {
+                let mut tids = Vec::new();
+                let mut has_core = false;
+                for t in g.targets.values() {
+                    if t.kind == TargetKind::MenuFlyoutSurface {
+                        if let Some(tid) = t.thread_id {
+                            if !tids.contains(&tid) {
+                                tids.push(tid);
+                            }
+                        } else {
+                            has_core = true;
+                        }
+                    }
+                }
+                (tids, has_core)
+            } else {
+                (Vec::new(), true)
+            };
+            let mut out = Vec::new();
+            if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                if !has_core_menu {
+                    b.retain(|tid, _| active_tids.contains(tid));
+                }
+                for (&tid, rects) in b.iter() {
+                    for &r in rects {
+                        out.push((tid, r));
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1[1].total_cmp(&b.1[1]))
+                    .then_with(|| a.1[0].total_cmp(&b.1[0]))
+            });
+            out.truncate(MAX_MENU_FLYOUT_RECTS);
+            out
+        }
+
+        fn query_shell_card_bounds_dip(
+            self: &Arc<Self>,
+            wait_ms: u64,
+        ) -> Vec<(u32, [f32; 4])> {
+            if self.is_menu_flyout_suppressed() {
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                    b.clear();
+                }
+                return Vec::new();
+            }
+
+            let (menu_tids, shell_handles, has_core_menu) =
+                if let Ok(g) = self.state.lock() {
+                    let mut m_tids = Vec::new();
+                    let mut s_handles = Vec::new();
+                    let mut core_menu = false;
+                    for (&h, t) in &g.targets {
+                        match t.kind {
+                            TargetKind::MenuFlyoutSurface => {
+                                if let Some(tid) = t.thread_id {
+                                    if !m_tids.contains(&tid) {
+                                        m_tids.push(tid);
+                                    }
+                                } else {
+                                    core_menu = true;
+                                }
+                            }
+                            TargetKind::ShellCardSurface => {
+                                s_handles.push(h);
+                            }
+                            _ => {}
+                        }
+                    }
+                    (m_tids, s_handles, core_menu)
+                } else {
+                    (Vec::new(), Vec::new(), false)
+                };
+
+            let need_menu_dispatch = has_core_menu || !menu_tids.is_empty();
+            let need_shell_dispatch = !shell_handles.is_empty();
+            if !need_menu_dispatch && !need_shell_dispatch {
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                    b.clear();
+                }
+                return Vec::new();
+            }
+
+            if need_menu_dispatch {
+                let _ = self.dispatch_apply_filtered(wait_ms, Some(TargetKind::MenuFlyoutSurface));
+            }
+            if need_shell_dispatch {
+                let _ = self.dispatch_apply_filtered(wait_ms, Some(TargetKind::ShellCardSurface));
+            }
+
+            let mut out: Vec<(u32, [f32; 4])> = Vec::new();
+            if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                if !need_menu_dispatch {
+                    b.clear();
+                } else {
+                    if !has_core_menu {
+                        b.retain(|tid, _| menu_tids.contains(tid));
+                    }
+                    for (&tid, rects) in b.iter() {
+                        for &r in rects {
+                            out.push((tid, r));
+                        }
+                    }
+                }
+            }
+            if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                if !need_shell_dispatch {
+                    b.clear();
+                } else {
+                    b.retain(|h, _| shell_handles.contains(h));
+                    for &(tid, r) in b.values() {
+                        let is_dup = out.iter().any(|&(pt, prev)| {
+                            pt == tid
+                                && (prev[0] - r[0]).abs() <= 4.0
+                                && (prev[1] - r[1]).abs() <= 4.0
+                                && (prev[2] - r[2]).abs() <= 4.0
+                                && (prev[3] - r[3]).abs() <= 4.0
+                        });
+                        if !is_dup {
+                            out.push((tid, r));
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1[1].total_cmp(&b.1[1]))
+                    .then_with(|| a.1[0].total_cmp(&b.1[0]))
+                    .then_with(|| a.1[3].total_cmp(&b.1[3]))
+                    .then_with(|| a.1[2].total_cmp(&b.1[2]))
+            });
+            out.truncate(MAX_SHELL_CARD_RECTS);
+            out
+        }
+
+        #[inline]
+        fn menu_flyout_target_colors(&self) -> (RawUiColor, RawUiColor) {
+            if self.is_menu_flyout_suppressed() {
+                (
+                    RawUiColor::from_argb(
+                        self.menu_flyout_fallback_bg_argb.load(Ordering::Acquire),
+                    ),
+                    RawUiColor::from_argb(
+                        self.menu_flyout_fallback_border_argb
+                            .load(Ordering::Acquire),
+                    ),
+                )
+            } else {
+                (RawUiColor::TRANSPARENT, RawUiColor::TRANSPARENT)
+            }
+        }
+
+        fn set_menu_flyout_suppressed(self: &Arc<Self>, suppressed: bool) {
+            let prev = self.menu_flyout_suppressed.swap(suppressed, Ordering::AcqRel);
+            if suppressed {
+                if let Ok(mut b) = self.menu_flyout_bounds_by_tid.lock() {
+                    b.clear();
+                }
+                if let Ok(mut b) = self.shell_card_bounds_by_handle.lock() {
+                    b.clear();
+                }
+            }
+            if prev != suppressed && self.desired_hide() {
+                self.dispatch_apply_filtered(0, Some(TargetKind::MenuFlyoutSurface));
+                self.dispatch_apply_filtered(0, Some(TargetKind::ShellCardSurface));
+            }
+        }
+
+        fn set_menu_flyout_fallback_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
+            let prev_bg = self
+                .menu_flyout_fallback_bg_argb
+                .swap(bg_argb, Ordering::AcqRel);
+            let prev_bd = self
+                .menu_flyout_fallback_border_argb
+                .swap(border_argb, Ordering::AcqRel);
+            if (prev_bg != bg_argb || prev_bd != border_argb)
+                && self.desired_hide()
+                && self.is_menu_flyout_suppressed()
+            {
+                self.dispatch_apply_filtered(0, Some(TargetKind::MenuFlyoutSurface));
+                self.dispatch_apply_filtered(0, Some(TargetKind::ShellCardSurface));
+            }
+        }
+
         fn set_alt_tab_item_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
             let prev_bg = self.alt_tab_item_bg_argb.swap(bg_argb, Ordering::AcqRel);
             let prev_bd = self
@@ -7533,6 +9994,9 @@ mod win {
         let mut saw_tooltip = false;
         let mut measured_tooltip: Option<([f32; 4], f32)> = None;
         let tooltip_suppressed = rt.is_tooltip_suppressed();
+        let mut saw_menu_flyout = false;
+        let mut measured_menu_flyouts: Vec<[f32; 4]> = Vec::new();
+        let menu_flyout_suppressed = rt.is_menu_flyout_suppressed();
         for item in items {
             let weak_com = ComRaw(item.weak_ref_raw as *mut c_void);
             if weak_com.is_null() {
@@ -7609,6 +10073,35 @@ mod win {
                             }
                         }
                     }
+                } else if item.kind == TargetKind::MenuFlyoutSurface {
+                    saw_menu_flyout = true;
+                    if desired_hide && !menu_flyout_suppressed {
+                        if let Some(bounds) = measure_menu_flyout_bounds_dip(insp.as_ptr()) {
+                            let is_dup = measured_menu_flyouts.iter().any(|prev| {
+                                (prev[0] - bounds[0]).abs() <= 4.0
+                                    && (prev[1] - bounds[1]).abs() <= 4.0
+                                    && (prev[2] - bounds[2]).abs() <= 4.0
+                                    && (prev[3] - bounds[3]).abs() <= 4.0
+                            });
+                            if !is_dup && measured_menu_flyouts.len() < MAX_MENU_FLYOUT_RECTS {
+                                measured_menu_flyouts.push(bounds);
+                            }
+                        }
+                    }
+                } else if item.kind == TargetKind::ShellCardSurface {
+                    let cur_tid = GetCurrentThreadId();
+                    let bounds_opt = if desired_hide && !menu_flyout_suppressed {
+                        measure_element_bounds_dip(insp.as_ptr(), 64.0, 28.0, 0.05)
+                    } else {
+                        None
+                    };
+                    if let Ok(mut b) = rt.shell_card_bounds_by_handle.lock() {
+                        if let Some(bounds) = bounds_opt {
+                            b.insert(item.handle, (cur_tid, bounds));
+                        } else {
+                            b.remove(&item.handle);
+                        }
+                    }
                 }
             }
         }
@@ -7653,9 +10146,24 @@ mod win {
                 };
             }
         }
+        if saw_menu_flyout {
+            let cur_tid = unsafe { GetCurrentThreadId() };
+            if let Ok(mut b) = rt.menu_flyout_bounds_by_tid.lock() {
+                if desired_hide && !menu_flyout_suppressed && !measured_menu_flyouts.is_empty() {
+                    b.insert(cur_tid, measured_menu_flyouts);
+                } else {
+                    b.remove(&cur_tid);
+                }
+            }
+        }
 
         if !stale_handles.is_empty() {
             purge_saved_brushes_for_current_thread(&stale_handles);
+            if let Ok(mut b) = rt.shell_card_bounds_by_handle.lock() {
+                for &h in &stale_handles {
+                    b.remove(&h);
+                }
+            }
             let mut evicted = Vec::new();
             if let Ok(mut g) = rt.state.lock() {
                 for h in stale_handles {
@@ -7677,6 +10185,8 @@ mod win {
                 restore_all_alttab_subtargets_for_current_thread(rt);
                 restore_all_hover_flyout_shapes_for_current_thread(rt);
                 restore_all_tooltip_targets_for_current_thread(rt);
+                restore_all_menu_flyout_targets_for_current_thread(rt);
+                restore_all_shell_card_targets_for_current_thread(rt);
             }
         }
 
@@ -7776,11 +10286,15 @@ mod win {
 
         let cur_tid = GetCurrentThreadId();
         let mut tooltip_extra_disp: Option<OwnedDispatcher> = None;
+        let mut menu_flyout_extra_disp: Option<OwnedDispatcher> = None;
         let (thread_id, dispatcher, async_dispatch) =
             if let Ok(dq) = DispatcherQueue::GetForCurrentThread() {
                 let dq_for_enqueue = dq.clone();
                 if kind == TargetKind::ToolTipPresenter {
                     tooltip_extra_disp =
+                        Some(OwnedDispatcher::Queue(dq.clone().into_raw() as usize));
+                } else if kind == TargetKind::MenuFlyoutSurface {
+                    menu_flyout_extra_disp =
                         Some(OwnedDispatcher::Queue(dq.clone().into_raw() as usize));
                 }
                 (
@@ -7814,6 +10328,17 @@ mod win {
                         git.RegisterInterfaceInGlobal(cd_unk, &IID_ICOREDISPATCHER)
                     {
                         tooltip_extra_disp = Some(OwnedDispatcher::Core(extra_cookie));
+                    }
+                } else if matches!(
+                    kind,
+                    TargetKind::MenuFlyoutSurface
+                        | TargetKind::ShellCardSurface
+                        | TargetKind::ShellCardSubSurface
+                ) {
+                    if let Ok(extra_cookie) =
+                        git.RegisterInterfaceInGlobal(cd_unk, &IID_ICOREDISPATCHER)
+                    {
+                        menu_flyout_extra_disp = Some(OwnedDispatcher::Core(extra_cookie));
                     }
                 }
                 (
@@ -7850,6 +10375,13 @@ mod win {
                         tooltip_extra_disp = Some(extra);
                     }
                 }
+                if let Some(extra) = menu_flyout_extra_disp.take() {
+                    if !g.menu_flyout_dispatchers.iter().any(|(tid, _)| *tid == cur_tid) {
+                        g.menu_flyout_dispatchers.push((cur_tid, extra));
+                    } else {
+                        menu_flyout_extra_disp = Some(extra);
+                    }
+                }
                 want_hide_after = g.desired_hide;
                 rt.diag_flags
                     .fetch_or(DIAG_INSERTED_TARGET, Ordering::Relaxed);
@@ -7875,6 +10407,9 @@ mod win {
         }
 
         if let Some(unused_extra) = tooltip_extra_disp {
+            release_owned_dispatcher(unused_extra, Some(&git));
+        }
+        if let Some(unused_extra) = menu_flyout_extra_disp {
             release_owned_dispatcher(unused_extra, Some(&git));
         }
         if let Some(old) = evicted {
@@ -8066,7 +10601,42 @@ mod win {
                 || type_name.contains("HWConfirmatorUI")
                 || type_name.contains("ConfirmatorHostControl")
                 || type_name.ends_with(".ToolTip")
-                || type_name == "ToolTip";
+                || type_name == "ToolTip"
+                || type_name.contains("MenuFlyoutPresenter")
+                || type_name.contains("JumpList")
+                || type_name.contains("JumpView")
+                || name == "JumpListRestyledAcrylic"
+                || name == "JumpListGrid"
+                || type_name.contains("TaskbarJumpListFrame")
+                || type_name.contains("ControlCenter")
+                || type_name.contains("NotificationCenter")
+                || type_name.contains("CalendarCenter")
+                || type_name.contains("ActionCenter")
+                || type_name.contains("ToastNotificationView")
+                || type_name.contains("FlexibleToastView")
+                || type_name.contains("FlexibleNormalToastView")
+                || type_name.contains("FlexiblePriorityToastView")
+                || matches!(
+                    name.as_str(),
+                    "NotificationCenterGrid"
+                        | "NotificationCenterView"
+                        | "NotificationCenterPage"
+                        | "CalendarCenterGrid"
+                        | "CalendarHeaderMinimizedOverlay"
+                        | "ControlCenterRegion"
+                        | "RootGridBorder"
+                        | "L1Grid"
+                        | "L2Frame"
+                        | "MainGrid"
+                        | "MediaTransportControlsRegion"
+                        | "MediaTransportControlsGrid"
+                        | "BackgroundBlur"
+                        | "FooterGrid"
+                        | "PaneFooter"
+                        | "Footer"
+                        | "ToastBackgroundBorder2"
+                        | "ToastBackgroundBorder"
+                );
             let may_be_alttab_item_container = type_name.contains("ListViewItem");
             let mut is_container_root = hint_container_root;
             if hint_container_root {
@@ -8078,21 +10648,125 @@ mod win {
             ) {
                 rt.diag_flags.fetch_or(DIAG_SAW_TARGET_NAME, Ordering::Relaxed);
             }
-            let (matched_kind, extra_candidates) = if let Ok(mut idx) = rt.tree.lock() {
+            let existing_flyout_on_tid: Vec<(u64, TargetKind)> = if is_container_root {
+                rt.state
+                    .lock()
+                    .map(|g| {
+                        g.targets
+                            .iter()
+                            .filter_map(|(&h, t)| {
+                                (t.thread_id == Some(cur_tid)
+                                    && matches!(
+                                        t.kind,
+                                        TargetKind::MenuFlyoutSurface
+                                            | TargetKind::ShellCardSurface
+                                            | TargetKind::ShellCardSubSurface
+                                    ))
+                                .then_some((h, t.kind))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let (matched_kind, extra_candidates, reclass_actions) = if let Ok(mut idx) =
+                rt.tree.lock()
+            {
                 idx.on_add_on_thread(relation.parent, handle, type_name, name, cur_tid);
                 if !is_container_root && may_be_alttab_item_container {
                     is_container_root = idx.thread_has_alttab_container(cur_tid);
                 }
-                let matched_kind = idx.classify_target(handle);
+                let matched_kind = idx.classify_target_in_scope(handle, rt.host_scope);
                 let extra = if is_container_root {
-                    idx.collect_classified_targets_for_thread(cur_tid)
+                    idx.collect_classified_targets_for_thread_in_scope(cur_tid, rt.host_scope)
                 } else {
                     Vec::new()
                 };
-                (matched_kind, extra)
+                let mut reclass = Vec::new();
+                for (eh, old_kind) in existing_flyout_on_tid {
+                    let new_kind = idx.classify_target_in_scope(eh, rt.host_scope);
+                    if new_kind != Some(old_kind) {
+                        reclass.push((eh, old_kind, new_kind));
+                    }
+                }
+                (matched_kind, extra, reclass)
             } else {
-                (None, Vec::new())
+                (None, Vec::new(), Vec::new())
             };
+            if !reclass_actions.is_empty() {
+                let mut dropped_targets = Vec::new();
+                let mut downgraded_handles = Vec::new();
+                let mut clear_bounds_handles = Vec::new();
+                if let Ok(mut g) = rt.state.lock() {
+                    for (eh, old_kind, new_kind) in reclass_actions {
+                        if old_kind == TargetKind::ShellCardSurface
+                            && new_kind != Some(TargetKind::ShellCardSurface)
+                        {
+                            clear_bounds_handles.push(eh);
+                        }
+                        match new_kind {
+                            Some(nk) => {
+                                if let Some(t) = g.targets.get_mut(&eh) {
+                                    t.kind = nk;
+                                    downgraded_handles.push((eh, nk));
+                                }
+                            }
+                            None => {
+                                if let Some(old) = g.targets.remove(&eh) {
+                                    dropped_targets.push((eh, old));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !clear_bounds_handles.is_empty() {
+                    if let Ok(mut b) = rt.shell_card_bounds_by_handle.lock() {
+                        for h in clear_bounds_handles {
+                            b.remove(&h);
+                        }
+                    }
+                }
+                for (eh, nk) in downgraded_handles {
+                    if let Ok(g) = rt.state.lock() {
+                        if let Some(t) = g.targets.get(&eh) {
+                            let hide_now = g.desired_hide && !g.shutdown;
+                            let weak_raw = t.weak_ref_raw;
+                            let op = t.orig_opacity;
+                            let vis = t.orig_visibility;
+                            drop(g);
+                            if let Some(insp) = resolve_weak_raw_inspectable(weak_raw) {
+                                apply_target_appearance(
+                                    rt,
+                                    eh,
+                                    insp.as_ptr(),
+                                    nk,
+                                    hide_now,
+                                    op,
+                                    vis,
+                                );
+                            }
+                        }
+                    }
+                }
+                if !dropped_targets.is_empty() {
+                    let git = create_git().ok();
+                    for (eh, old) in dropped_targets {
+                        if let Some(insp) = resolve_weak_raw_inspectable(old.weak_ref_raw) {
+                            apply_target_appearance(
+                                rt,
+                                eh,
+                                insp.as_ptr(),
+                                old.kind,
+                                false,
+                                old.orig_opacity,
+                                old.orig_visibility,
+                            );
+                        }
+                        release_target_resources(old, git.as_ref());
+                    }
+                }
+            }
             if let Some(kind) = matched_kind {
                 rt.diag_flags.fetch_or(DIAG_TARGET_MATCHED, Ordering::Relaxed);
                 on_target_added(rt, handle, kind);
@@ -8124,6 +10798,10 @@ mod win {
                 let mut removed_hover_flyout = false;
                 let mut removed_osd = false;
                 let mut removed_tooltip = false;
+                let mut removed_menu_flyout = false;
+                let mut remaining_menu_on_tid = false;
+                let mut removed_shell_handles: Vec<u64> = Vec::new();
+                let rem_tid = GetCurrentThreadId();
                 if let Ok(mut g) = rt.state.lock() {
                     for rh in removed {
                         if let Some(old) = g.targets.remove(&rh) {
@@ -8135,9 +10813,19 @@ mod win {
                                 removed_osd = true;
                             } else if old.kind == TargetKind::ToolTipPresenter {
                                 removed_tooltip = true;
+                            } else if old.kind == TargetKind::MenuFlyoutSurface {
+                                removed_menu_flyout = true;
+                            } else if old.kind == TargetKind::ShellCardSurface {
+                                removed_shell_handles.push(rh);
                             }
                             evicted.push(old);
                         }
+                    }
+                    if removed_menu_flyout {
+                        remaining_menu_on_tid = g.targets.values().any(|t| {
+                            t.kind == TargetKind::MenuFlyoutSurface
+                                && t.thread_id.is_none_or(|tid| tid == rem_tid)
+                        });
                     }
                 }
                 if removed_alt_tab {
@@ -8158,6 +10846,18 @@ mod win {
                 if removed_tooltip {
                     if let Ok(mut b) = rt.tooltip_bounds_dip.lock() {
                         *b = None;
+                    }
+                }
+                if removed_menu_flyout && !remaining_menu_on_tid {
+                    if let Ok(mut b) = rt.menu_flyout_bounds_by_tid.lock() {
+                        b.remove(&rem_tid);
+                    }
+                }
+                if !removed_shell_handles.is_empty() {
+                    if let Ok(mut b) = rt.shell_card_bounds_by_handle.lock() {
+                        for rh in removed_shell_handles {
+                            b.remove(&rh);
+                        }
                     }
                 }
                 if !evicted.is_empty() {
@@ -8403,7 +11103,11 @@ mod win {
             ACTIVE_OBJECTS.fetch_sub(1, Ordering::SeqCst);
         });
         std::thread::spawn(move || {
-            run_pipe_server_loop(rt_pipe);
+            if let Some(reverse_pipe) = rt_pipe.reverse_pipe_name.clone() {
+                run_reverse_pipe_client_loop(rt_pipe, reverse_pipe);
+            } else {
+                run_pipe_server_loop(rt_pipe);
+            }
             ACTIVE_OBJECTS.fetch_sub(1, Ordering::SeqCst);
         });
 
@@ -8611,8 +11315,9 @@ mod win {
 
             drop(vts_com);
 
-            let (leftover, leftover_tooltip_dispatchers): (
+            let (leftover, leftover_tooltip_dispatchers, leftover_menu_dispatchers): (
                 Vec<TrackedTarget>,
+                Vec<OwnedDispatcher>,
                 Vec<OwnedDispatcher>,
             ) = if let Ok(mut g) = rt.state.lock() {
                 g.shutdown = true;
@@ -8622,14 +11327,21 @@ mod win {
                         .drain(..)
                         .map(|(_, disp)| disp)
                         .collect(),
+                    g.menu_flyout_dispatchers
+                        .drain(..)
+                        .map(|(_, disp)| disp)
+                        .collect(),
                 )
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
             for t in leftover {
                 release_target_resources(t, git.as_ref());
             }
             for disp in leftover_tooltip_dispatchers {
+                release_owned_dispatcher(disp, git.as_ref());
+            }
+            for disp in leftover_menu_dispatchers {
                 release_owned_dispatcher(disp, git.as_ref());
             }
 
@@ -8657,7 +11369,13 @@ mod win {
 
     // ---------- Named Pipe IPC + Host Crash Watchdog Thread ----------
 
-    unsafe fn read_pipe_exact(pipe: HANDLE, event: HANDLE, buf: &mut [u8]) -> bool {
+    unsafe fn read_pipe_exact_with_stop(
+        pipe: HANDLE,
+        event: HANDLE,
+        stop_event: Option<HANDLE>,
+        buf: &mut [u8],
+        timeout_ms: u32,
+    ) -> bool {
         let mut off = 0usize;
         while off < buf.len() {
             let _ = ResetEvent(event);
@@ -8675,8 +11393,16 @@ mod win {
             let got = if res.is_ok() {
                 read as usize
             } else if GetLastError() == ERROR_IO_PENDING {
-                if WaitForSingleObject(event, 1000) != WAIT_OBJECT_0 {
+                let signaled_ok = match stop_event {
+                    Some(se) if !se.is_invalid() => {
+                        WaitForMultipleObjects(&[event, se], false, timeout_ms) == WAIT_OBJECT_0
+                    }
+                    _ => WaitForSingleObject(event, timeout_ms) == WAIT_OBJECT_0,
+                };
+                if !signaled_ok {
                     let _ = CancelIo(pipe);
+                    let mut tr = 0u32;
+                    let _ = GetOverlappedResult(pipe, &ov, &mut tr, true);
                     return false;
                 }
                 let mut tr = 0u32;
@@ -8693,6 +11419,10 @@ mod win {
             off += got;
         }
         true
+    }
+
+    unsafe fn read_pipe_exact(pipe: HANDLE, event: HANDLE, buf: &mut [u8]) -> bool {
+        read_pipe_exact_with_stop(pipe, event, None, buf, 1000)
     }
 
     unsafe fn write_pipe_exact(pipe: HANDLE, event: HANDLE, buf: &[u8]) -> bool {
@@ -8715,6 +11445,8 @@ mod win {
             } else if GetLastError() == ERROR_IO_PENDING {
                 if WaitForSingleObject(event, 1000) != WAIT_OBJECT_0 {
                     let _ = CancelIo(pipe);
+                    let mut tr = 0u32;
+                    let _ = GetOverlappedResult(pipe, &ov, &mut tr, true);
                     return false;
                 }
                 let mut tr = 0u32;
@@ -8732,6 +11464,283 @@ mod win {
         }
         let _ = FlushFileBuffers(pipe);
         true
+    }
+
+    /// Processes a single incoming IPC command and returns `true` if `CMD_SHUTDOWN` was handled.
+    unsafe fn handle_pipe_command(
+        rt: &Arc<TapRuntime>,
+        pipe: HANDLE,
+        io_event: HANDLE,
+        cmd: u8,
+        host_pid: u32,
+    ) -> bool {
+        match cmd {
+            CMD_HIDE => {
+                rt.set_hide(true, host_pid);
+                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+            }
+            CMD_RESTORE => {
+                rt.set_hide(false, host_pid);
+                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+            }
+            CMD_PING => {
+                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+            }
+            CMD_VERSION => {
+                let _ = write_pipe_exact(pipe, io_event, &[CMD_VERSION, TAP_PROTOCOL_VERSION]);
+            }
+            CMD_ALTTAB_RECT => {
+                let bounds = if rt.desired_hide() {
+                    rt.query_alt_tab_bounds_dip(40)
+                } else {
+                    None
+                };
+                let mut resp = [0u8; 22];
+                resp[0] = CMD_ALTTAB_RECT;
+                if let Some((tid, r)) = bounds {
+                    resp[1] = 1;
+                    resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                    resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                    resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                    resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                    resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                }
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            CMD_HOVER_FLYOUT_RECT => {
+                let bounds = if rt.desired_hide() {
+                    rt.query_hover_flyout_bounds_dip(40)
+                } else {
+                    None
+                };
+                let mut resp = [0u8; 22];
+                resp[0] = CMD_HOVER_FLYOUT_RECT;
+                if let Some((tid, r)) = bounds {
+                    resp[1] = 1;
+                    resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                    resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                    resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                    resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                    resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                }
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            CMD_OSD_RECT | CMD_TOOLTIP_RECT => {
+                let bounds = if cmd == CMD_OSD_RECT {
+                    if rt.desired_hide() && !rt.is_osd_suppressed() {
+                        rt.query_osd_bounds_dip(40)
+                    } else {
+                        None
+                    }
+                } else if rt.desired_hide() && !rt.is_tooltip_suppressed() {
+                    rt.query_tooltip_bounds_dip(40)
+                } else {
+                    None
+                };
+                let mut resp = [0u8; 22];
+                resp[0] = cmd;
+                if let Some((tid, r)) = bounds {
+                    resp[1] = 1;
+                    resp[2..6].copy_from_slice(&tid.to_le_bytes());
+                    resp[6..10].copy_from_slice(&r[0].to_le_bytes());
+                    resp[10..14].copy_from_slice(&r[1].to_le_bytes());
+                    resp[14..18].copy_from_slice(&r[2].to_le_bytes());
+                    resp[18..22].copy_from_slice(&r[3].to_le_bytes());
+                }
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            CMD_MENU_FLYOUT_RECTS => {
+                let rects = if rt.desired_hide() && !rt.is_menu_flyout_suppressed() {
+                    rt.query_menu_flyout_bounds_dip(40)
+                } else {
+                    Vec::new()
+                };
+                let mut resp = [0u8; 2 + MAX_MENU_FLYOUT_RECTS * 20];
+                resp[0] = CMD_MENU_FLYOUT_RECTS;
+                let count = rects.len().min(MAX_MENU_FLYOUT_RECTS);
+                resp[1] = count as u8;
+                for (slot, &(tid, r)) in rects.iter().take(count).enumerate() {
+                    let base = 2 + slot * 20;
+                    resp[base..base + 4].copy_from_slice(&tid.to_le_bytes());
+                    resp[base + 4..base + 8].copy_from_slice(&r[0].to_le_bytes());
+                    resp[base + 8..base + 12].copy_from_slice(&r[1].to_le_bytes());
+                    resp[base + 12..base + 16].copy_from_slice(&r[2].to_le_bytes());
+                    resp[base + 16..base + 20].copy_from_slice(&r[3].to_le_bytes());
+                }
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            CMD_SHELL_CARD_RECTS => {
+                let rects = if rt.desired_hide() && !rt.is_menu_flyout_suppressed() {
+                    rt.query_shell_card_bounds_dip(40)
+                } else {
+                    Vec::new()
+                };
+                let mut resp = [0u8; 2 + MAX_SHELL_CARD_RECTS * 20];
+                resp[0] = CMD_SHELL_CARD_RECTS;
+                let count = rects.len().min(MAX_SHELL_CARD_RECTS);
+                resp[1] = count as u8;
+                for (slot, &(tid, r)) in rects.iter().take(count).enumerate() {
+                    let base = 2 + slot * 20;
+                    resp[base..base + 4].copy_from_slice(&tid.to_le_bytes());
+                    resp[base + 4..base + 8].copy_from_slice(&r[0].to_le_bytes());
+                    resp[base + 8..base + 12].copy_from_slice(&r[1].to_le_bytes());
+                    resp[base + 12..base + 16].copy_from_slice(&r[2].to_le_bytes());
+                    resp[base + 16..base + 20].copy_from_slice(&r[3].to_le_bytes());
+                }
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            CMD_SET_OSD_SUPPRESS | CMD_SET_TOOLTIP_SUPPRESS | CMD_SET_MENU_FLYOUT_SUPPRESS => {
+                let mut extra = [0u8; 1];
+                if read_pipe_exact(pipe, io_event, &mut extra) {
+                    match cmd {
+                        CMD_SET_OSD_SUPPRESS => {
+                            rt.set_osd_suppressed(extra[0] != 0);
+                        }
+                        CMD_SET_TOOLTIP_SUPPRESS => {
+                            rt.set_tooltip_suppressed(extra[0] != 0);
+                        }
+                        _ => {
+                            rt.set_menu_flyout_suppressed(extra[0] != 0);
+                        }
+                    }
+                    let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+                }
+            }
+            CMD_SET_ALTTAB_ITEM_STYLE
+            | CMD_SET_OSD_FALLBACK_STYLE
+            | CMD_SET_TOOLTIP_FALLBACK_STYLE
+            | CMD_SET_MENU_FLYOUT_FALLBACK_STYLE => {
+                let mut extra = [0u8; 8];
+                if read_pipe_exact(pipe, io_event, &mut extra) {
+                    let bg_argb = u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
+                    let border_argb = u32::from_le_bytes([extra[4], extra[5], extra[6], extra[7]]);
+                    match cmd {
+                        CMD_SET_ALTTAB_ITEM_STYLE => {
+                            rt.set_alt_tab_item_colors(bg_argb, border_argb);
+                        }
+                        CMD_SET_OSD_FALLBACK_STYLE => {
+                            rt.set_osd_fallback_colors(bg_argb, border_argb);
+                        }
+                        CMD_SET_TOOLTIP_FALLBACK_STYLE => {
+                            rt.set_tooltip_fallback_colors(bg_argb, border_argb);
+                        }
+                        _ => {
+                            rt.set_menu_flyout_fallback_colors(bg_argb, border_argb);
+                        }
+                    }
+                    let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+                }
+            }
+            CMD_SHUTDOWN => {
+                rt.trigger_shutdown(600);
+                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
+                return true;
+            }
+            CMD_STATUS => {
+                let desired = u8::from(rt.desired_hide());
+                let advise_hr = rt.advise_hr.load(Ordering::Acquire).to_le_bytes();
+                let node_cnt = rt
+                    .tree
+                    .lock()
+                    .map(|t| t.node_count().min(u32::MAX as usize) as u32)
+                    .unwrap_or(0)
+                    .to_le_bytes();
+                let target_cnt = rt
+                    .state
+                    .lock()
+                    .map(|g| g.targets.len().min(u32::MAX as usize) as u32)
+                    .unwrap_or(0)
+                    .to_le_bytes();
+                let op_hr = rt.last_put_opacity_hr.load(Ordering::Acquire).to_le_bytes();
+                let vis_hr = rt
+                    .last_put_visibility_hr
+                    .load(Ordering::Acquire)
+                    .to_le_bytes();
+                let flags = rt.diag_flags.load(Ordering::Acquire).to_le_bytes();
+                let mut resp = [0u8; 26];
+                resp[0] = CMD_STATUS;
+                resp[1] = desired;
+                resp[2..6].copy_from_slice(&advise_hr);
+                resp[6..10].copy_from_slice(&node_cnt);
+                resp[10..14].copy_from_slice(&target_cnt);
+                resp[14..18].copy_from_slice(&op_hr);
+                resp[18..22].copy_from_slice(&vis_hr);
+                resp[22..26].copy_from_slice(&flags);
+                let _ = write_pipe_exact(pipe, io_event, &resp);
+            }
+            _ => {
+                let _ = write_pipe_exact(pipe, io_event, &[0xFF]);
+            }
+        }
+        false
+    }
+
+    fn run_reverse_pipe_client_loop(rt: Arc<TapRuntime>, pipe_name: String) {
+        unsafe {
+            let com_ok = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            let wide_name: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let Ok(io_event) = CreateEventW(None, true, false, None) else {
+                if com_ok {
+                    CoUninitialize();
+                }
+                return;
+            };
+
+            'outer: while !rt.stop_requested.load(Ordering::SeqCst) {
+                let pipe = match CreateFileW(
+                    PCWSTR(wide_name.as_ptr()),
+                    GENERIC_READ.0 | GENERIC_WRITE.0,
+                    FILE_SHARE_NONE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    None,
+                ) {
+                    Ok(h) if !h.is_invalid() && h != INVALID_HANDLE_VALUE => h,
+                    _ => {
+                        if GetLastError() == ERROR_PIPE_BUSY {
+                            let _ = WaitNamedPipeW(PCWSTR(wide_name.as_ptr()), 150);
+                        } else {
+                            let _ = WaitForSingleObject(rt.stop_event_handle(), 100);
+                        }
+                        continue;
+                    }
+                };
+
+                loop {
+                    if rt.stop_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let mut req = [0u8; 5];
+                    if !read_pipe_exact_with_stop(
+                        pipe,
+                        io_event,
+                        Some(rt.stop_event_handle()),
+                        &mut req,
+                        INFINITE,
+                    ) {
+                        break;
+                    }
+                    let cmd = req[0];
+                    let host_pid = u32::from_le_bytes([req[1], req[2], req[3], req[4]]);
+                    if handle_pipe_command(&rt, pipe, io_event, cmd, host_pid) {
+                        let _ = CloseHandle(pipe);
+                        break 'outer;
+                    }
+                }
+
+                let _ = CloseHandle(pipe);
+                if !rt.stop_requested.load(Ordering::SeqCst) {
+                    rt.on_host_exited();
+                }
+            }
+
+            let _ = CloseHandle(io_event);
+            if com_ok {
+                CoUninitialize();
+            }
+        }
     }
 
     fn run_pipe_server_loop(rt: Arc<TapRuntime>) {
@@ -8807,6 +11816,8 @@ mod win {
                         loop {
                             if rt.stop_requested.load(Ordering::SeqCst) {
                                 let _ = CancelIo(pipe);
+                                let mut tr = 0u32;
+                                let _ = GetOverlappedResult(pipe, &ov, &mut tr, true);
                                 break false;
                             }
                             let w = WaitForMultipleObjects(&wait_handles[..count], false, INFINITE);
@@ -8816,6 +11827,8 @@ mod win {
                                 break GetOverlappedResult(pipe, &ov, &mut tr, false).is_ok();
                             } else if w == WAIT_EVENT_INDEX(1) || rt.stop_requested.load(Ordering::SeqCst) {
                                 let _ = CancelIo(pipe);
+                                let mut tr = 0u32;
+                                let _ = GetOverlappedResult(pipe, &ov, &mut tr, true);
                                 break false;
                             } else if (count == 3 && w == WAIT_EVENT_INDEX(2))
                                 || (!host_h_copy.is_invalid()
@@ -8827,6 +11840,8 @@ mod win {
                                 wait_handles[2] = HANDLE::default();
                             } else {
                                 let _ = CancelIo(pipe);
+                                let mut tr = 0u32;
+                                let _ = GetOverlappedResult(pipe, &ov, &mut tr, true);
                                 break false;
                             }
                         }
@@ -8846,159 +11861,9 @@ mod win {
                 if read_pipe_exact(pipe, io_event, &mut req) {
                     let cmd = req[0];
                     let host_pid = u32::from_le_bytes([req[1], req[2], req[3], req[4]]);
-                    match cmd {
-                        CMD_HIDE => {
-                            rt.set_hide(true, host_pid);
-                            let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                        }
-                        CMD_RESTORE => {
-                            rt.set_hide(false, host_pid);
-                            let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                        }
-                        CMD_PING => {
-                            let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                        }
-                        CMD_VERSION => {
-                            let _ = write_pipe_exact(
-                                pipe,
-                                io_event,
-                                &[CMD_VERSION, TAP_PROTOCOL_VERSION],
-                            );
-                        }
-                        CMD_ALTTAB_RECT => {
-                            let bounds = if rt.desired_hide() {
-                                rt.query_alt_tab_bounds_dip(40)
-                            } else {
-                                None
-                            };
-                            let mut resp = [0u8; 22];
-                            resp[0] = CMD_ALTTAB_RECT;
-                            if let Some((tid, r)) = bounds {
-                                resp[1] = 1;
-                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
-                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
-                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
-                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
-                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
-                            }
-                            let _ = write_pipe_exact(pipe, io_event, &resp);
-                        }
-                        CMD_HOVER_FLYOUT_RECT => {
-                            let bounds = if rt.desired_hide() {
-                                rt.query_hover_flyout_bounds_dip(40)
-                            } else {
-                                None
-                            };
-                            let mut resp = [0u8; 22];
-                            resp[0] = CMD_HOVER_FLYOUT_RECT;
-                            if let Some((tid, r)) = bounds {
-                                resp[1] = 1;
-                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
-                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
-                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
-                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
-                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
-                            }
-                            let _ = write_pipe_exact(pipe, io_event, &resp);
-                        }
-                        CMD_OSD_RECT | CMD_TOOLTIP_RECT => {
-                            let bounds = if cmd == CMD_OSD_RECT {
-                                if rt.desired_hide() && !rt.is_osd_suppressed() {
-                                    rt.query_osd_bounds_dip(40)
-                                } else {
-                                    None
-                                }
-                            } else if rt.desired_hide() && !rt.is_tooltip_suppressed() {
-                                rt.query_tooltip_bounds_dip(40)
-                            } else {
-                                None
-                            };
-                            let mut resp = [0u8; 22];
-                            resp[0] = cmd;
-                            if let Some((tid, r)) = bounds {
-                                resp[1] = 1;
-                                resp[2..6].copy_from_slice(&tid.to_le_bytes());
-                                resp[6..10].copy_from_slice(&r[0].to_le_bytes());
-                                resp[10..14].copy_from_slice(&r[1].to_le_bytes());
-                                resp[14..18].copy_from_slice(&r[2].to_le_bytes());
-                                resp[18..22].copy_from_slice(&r[3].to_le_bytes());
-                            }
-                            let _ = write_pipe_exact(pipe, io_event, &resp);
-                        }
-                        CMD_SET_OSD_SUPPRESS | CMD_SET_TOOLTIP_SUPPRESS => {
-                            let mut extra = [0u8; 1];
-                            if read_pipe_exact(pipe, io_event, &mut extra) {
-                                if cmd == CMD_SET_OSD_SUPPRESS {
-                                    rt.set_osd_suppressed(extra[0] != 0);
-                                } else {
-                                    rt.set_tooltip_suppressed(extra[0] != 0);
-                                }
-                                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                            }
-                        }
-                        CMD_SET_ALTTAB_ITEM_STYLE
-                        | CMD_SET_OSD_FALLBACK_STYLE
-                        | CMD_SET_TOOLTIP_FALLBACK_STYLE => {
-                            let mut extra = [0u8; 8];
-                            if read_pipe_exact(pipe, io_event, &mut extra) {
-                                let bg_argb =
-                                    u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
-                                let border_argb =
-                                    u32::from_le_bytes([extra[4], extra[5], extra[6], extra[7]]);
-                                match cmd {
-                                    CMD_SET_ALTTAB_ITEM_STYLE => {
-                                        rt.set_alt_tab_item_colors(bg_argb, border_argb);
-                                    }
-                                    CMD_SET_OSD_FALLBACK_STYLE => {
-                                        rt.set_osd_fallback_colors(bg_argb, border_argb);
-                                    }
-                                    _ => {
-                                        rt.set_tooltip_fallback_colors(bg_argb, border_argb);
-                                    }
-                                }
-                                let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                            }
-                        }
-                        CMD_SHUTDOWN => {
-                            rt.trigger_shutdown(600);
-                            let _ = write_pipe_exact(pipe, io_event, &[cmd]);
-                            let _ = DisconnectNamedPipe(pipe);
-                            break;
-                        }
-                        CMD_STATUS => {
-                            let desired = u8::from(rt.desired_hide());
-                            let advise_hr = rt.advise_hr.load(Ordering::Acquire).to_le_bytes();
-                            let node_cnt = rt
-                                .tree
-                                .lock()
-                                .map(|t| t.node_count().min(u32::MAX as usize) as u32)
-                                .unwrap_or(0)
-                                .to_le_bytes();
-                            let target_cnt = rt
-                                .state
-                                .lock()
-                                .map(|g| g.targets.len().min(u32::MAX as usize) as u32)
-                                .unwrap_or(0)
-                                .to_le_bytes();
-                            let op_hr =
-                                rt.last_put_opacity_hr.load(Ordering::Acquire).to_le_bytes();
-                            let vis_hr =
-                                rt.last_put_visibility_hr.load(Ordering::Acquire).to_le_bytes();
-                            let flags = rt.diag_flags.load(Ordering::Acquire).to_le_bytes();
-                            let mut resp = [0u8; 26];
-                            resp[0] = CMD_STATUS;
-                            resp[1] = desired;
-                            resp[2..6].copy_from_slice(&advise_hr);
-                            resp[6..10].copy_from_slice(&node_cnt);
-                            resp[10..14].copy_from_slice(&target_cnt);
-                            resp[14..18].copy_from_slice(&op_hr);
-                            resp[18..22].copy_from_slice(&vis_hr);
-                            resp[22..26].copy_from_slice(&flags);
-                            let _ = write_pipe_exact(pipe, io_event, &resp);
-                        }
-                        _ => {
-                            let _ = write_pipe_exact(pipe, io_event, &[0xFF]);
-                        }
+                    if handle_pipe_command(&rt, pipe, io_event, cmd, host_pid) {
+                        let _ = DisconnectNamedPipe(pipe);
+                        break;
                     }
                 }
 
