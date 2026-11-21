@@ -3,6 +3,7 @@ pub mod config;
 pub mod dsp;
 pub mod layout;
 pub mod marquee;
+pub mod timeline;
 pub mod volume;
 
 #[cfg(windows)]
@@ -11,6 +12,8 @@ pub mod app;
 pub mod audio;
 #[cfg(windows)]
 pub mod audio_devices;
+#[cfg(windows)]
+pub mod mini_player;
 #[cfg(windows)]
 pub mod popup;
 #[cfg(windows)]

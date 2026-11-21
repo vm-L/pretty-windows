@@ -671,6 +671,52 @@ pub const fn menu_flyout_fallback_card_colors(
     }
 }
 
+/// Win11 任务视图（`Win + Tab`）底部虚拟桌面条在 XAML 视觉树内渲染的背景与边框色彩（AARRGGBB）。
+pub type VirtualDesktopBarColors = AltTabItemCardColors;
+
+/// 根据当前主题风格与深浅色返回 `Win + Tab` 任务视图底部虚拟桌面条玻璃配色（`Default` 返回 `None` 还原原生）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const fn virtual_desktop_bar_colors(
+    style: TaskbarStyle,
+    light_glass: bool,
+) -> Option<VirtualDesktopBarColors> {
+    match (style, light_glass) {
+        (TaskbarStyle::Default, _) => None,
+        (TaskbarStyle::Transparent, false) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x38_10141C,
+            border_argb: 0x36_FFFFFF,
+        }),
+        (TaskbarStyle::LiquidGlass, false) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x4E_141A26,
+            border_argb: 0x58_E6F0FF,
+        }),
+        (TaskbarStyle::Blur, false) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x62_181C26,
+            border_argb: 0x44_FFFFFF,
+        }),
+        (TaskbarStyle::Acrylic, false) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x7A_1B1F28,
+            border_argb: 0x3A_FFFFFF,
+        }),
+        (TaskbarStyle::Transparent, true) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x44_F2F6FC,
+            border_argb: 0x58_FFFFFF,
+        }),
+        (TaskbarStyle::LiquidGlass, true) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x5C_F4F8FF,
+            border_argb: 0x78_FFFFFF,
+        }),
+        (TaskbarStyle::Blur, true) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x72_F2F5FA,
+            border_argb: 0x60_FFFFFF,
+        }),
+        (TaskbarStyle::Acrylic, true) => Some(VirtualDesktopBarColors {
+            bg_argb: 0x8A_F0F3F8,
+            border_argb: 0x52_FFFFFF,
+        }),
+    }
+}
+
 /// Maps `TaskbarStyle` + system light/dark theme to the live `Windows.UI.Composition` effect recipe.
 /// `Default` and `Transparent` need no behind-taskbar GPU backdrop (`None`).
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -1325,5 +1371,23 @@ mod tests {
                 (2002isize, [1608, 728, 1812, 902]),
             ]
         );
+    }
+
+    #[test]
+    fn virtual_desktop_bar_colors_order_by_style_and_theme() {
+        assert_eq!(virtual_desktop_bar_colors(TaskbarStyle::Default, false), None);
+        assert_eq!(virtual_desktop_bar_colors(TaskbarStyle::Default, true), None);
+
+        for light in [false, true] {
+            let t = virtual_desktop_bar_colors(TaskbarStyle::Transparent, light).unwrap();
+            let lg = virtual_desktop_bar_colors(TaskbarStyle::LiquidGlass, light).unwrap();
+            let b = virtual_desktop_bar_colors(TaskbarStyle::Blur, light).unwrap();
+            let a = virtual_desktop_bar_colors(TaskbarStyle::Acrylic, light).unwrap();
+
+            assert!(t.bg_argb >> 24 < lg.bg_argb >> 24);
+            assert!(lg.bg_argb >> 24 < b.bg_argb >> 24);
+            assert!(b.bg_argb >> 24 < a.bg_argb >> 24);
+            assert!(lg.border_argb >> 24 > t.border_argb >> 24);
+        }
     }
 }

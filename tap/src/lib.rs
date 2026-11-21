@@ -29,9 +29,10 @@ pub mod tree_match {
     pub const CMD_SET_MENU_FLYOUT_SUPPRESS: u8 = 0x10;
     pub const CMD_SET_MENU_FLYOUT_FALLBACK_STYLE: u8 = 0x11;
     pub const CMD_SHELL_CARD_RECTS: u8 = 0x12;
+    pub const CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE: u8 = 0x13;
     pub const MAX_MENU_FLYOUT_RECTS: usize = 3;
     pub const MAX_SHELL_CARD_RECTS: usize = 8;
-    pub const TAP_PROTOCOL_VERSION: u8 = 11;
+    pub const TAP_PROTOCOL_VERSION: u8 = 12;
     pub const ALTTAB_ITEM_OVERLAY_NAME: &str = "PrettyWindowsAltTabItemBg";
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +40,7 @@ pub mod tree_match {
         Explorer,
         ShellExperience,
         ShellHost,
+        StartMenu,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -56,6 +58,7 @@ pub mod tree_match {
         MenuFlyoutSurface,
         ShellCardSurface,
         ShellCardSubSurface,
+        VirtualDesktopBarSurface,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -308,6 +311,41 @@ pub mod tree_match {
                 handle,
                 Self::is_forbidden_alttab_node,
                 Self::is_alttab_container_node,
+                true,
+            )
+        }
+
+        fn is_forbidden_virtual_desktop_bar_node(meta: &NodeMeta) -> bool {
+            let t = meta.type_name.as_str();
+            let n = meta.name.as_str();
+            t.contains("VirtualDesktopListViewItem")
+                || t.contains("VirtualDesktopElementThemed")
+                || t.contains("NewVirtualDesktopElementThemed")
+                || t.contains("RemoteVirtualDesktopElementThemed")
+                || t.contains("SwitchItem")
+                || n.contains("SwitchItem")
+                || t.contains("Button")
+                || t.contains("MenuFlyout")
+                || t.contains("ToolTip")
+                || t.contains("Tooltip")
+                || t.contains("AltTab")
+                || n.contains("AltTab")
+                || t.contains("StartMenu")
+                || t.contains("TaskbarFrame")
+        }
+
+        fn is_virtual_desktop_bar_container_node(meta: &NodeMeta) -> bool {
+            meta.type_name.contains("VirtualDesktopBarElement")
+                || meta.name == "VirtualDesktopBar"
+                || meta.type_name.contains("Switcher.TaskView")
+                || matches!(meta.name.as_str(), "TaskViewTimelineRoot" | "TaskViewRoot")
+        }
+
+        pub fn has_valid_virtual_desktop_bar_ancestor(&self, handle: u64) -> bool {
+            self.has_ancestor_matching(
+                handle,
+                Self::is_forbidden_virtual_desktop_bar_node,
+                Self::is_virtual_desktop_bar_container_node,
                 true,
             )
         }
@@ -592,6 +630,7 @@ pub mod tree_match {
                 TapHostScope::Explorer => self.classify_explorer_target(handle),
                 TapHostScope::ShellExperience => self.classify_shell_experience_target(handle),
                 TapHostScope::ShellHost => self.classify_shell_host_target(handle),
+                TapHostScope::StartMenu => self.classify_start_menu_target(handle),
             }
         }
 
@@ -676,6 +715,17 @@ pub mod tree_match {
             if node.type_name.contains("ListViewItem") && self.has_valid_alttab_item_ancestor(handle)
             {
                 return Some(TargetKind::AltTabItemFocus);
+            }
+            if matches!(
+                node.name.as_str(),
+                "VirtualDesktopSwitcherBackground" | "VirtualDesktopBarBackground"
+            ) && (node.type_name.ends_with(".Border")
+                || node.type_name == "Border"
+                || node.type_name.ends_with(".Grid")
+                || node.type_name == "Grid")
+                && self.has_valid_virtual_desktop_bar_ancestor(handle)
+            {
+                return Some(TargetKind::VirtualDesktopBarSurface);
             }
             if !self.has_forbidden_menu_flyout_ancestor(handle) {
                 let is_border =
@@ -997,6 +1047,39 @@ pub mod tree_match {
             self.classify_control_center_card_node(handle, node)
         }
 
+        fn classify_start_menu_target(&self, handle: u64) -> Option<TargetKind> {
+            let node = self.nodes.get(&handle)?;
+            if self.has_forbidden_shell_card_item_ancestor(handle) {
+                return None;
+            }
+            let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
+            let is_grid = node.type_name.ends_with(".Grid") || node.type_name == "Grid";
+            if !is_border && !is_grid {
+                return None;
+            }
+            if is_border
+                && self
+                    .nodes
+                    .get(&node.parent)
+                    .is_some_and(|p| p.type_name.contains("MenuFlyoutPresenter"))
+            {
+                return Some(TargetKind::MenuFlyoutSurface);
+            }
+            if node.name == "AcrylicBorder" {
+                return Some(TargetKind::ShellCardSurface);
+            }
+            if matches!(
+                node.name.as_str(),
+                "AcrylicOverlay"
+                    | "StartDropShadow"
+                    | "LeftCompanionDropShadow"
+                    | "RightCompanionDropShadow"
+            ) {
+                return Some(TargetKind::ShellCardSubSurface);
+            }
+            None
+        }
+
         /// Returns `true` only for `BackgroundFill`/`BackgroundStroke`/`ScreenEdgeStroke` rectangles inside a non-flyout taskbar container.
         pub fn is_taskbar_bg_target(&self, handle: u64) -> bool {
             self.classify_target(handle) == Some(TargetKind::ShapeElement)
@@ -1048,6 +1131,10 @@ pub mod tree_match {
 
     pub fn shell_host_pipe_name_for_pid(pid: u32) -> String {
         format!(r"\\.\pipe\PrettyWindows_ShellHostTap_{pid}")
+    }
+
+    pub fn start_menu_pipe_name_for_pid(pid: u32) -> String {
+        format!(r"\\.\pipe\PrettyWindows_StartMenuTap_{pid}")
     }
 }
 
@@ -2640,19 +2727,247 @@ mod tests {
             Some(TargetKind::MenuFlyoutSurface)
         );
     }
+
+    #[test]
+    fn classifies_virtual_desktop_bar_surfaces_and_ignores_inner_desktop_items() {
+        let mut idx = VisualTreeIndex::new();
+
+        // Standard Win11 TaskViewTimeline > VirtualDesktopBarElement > GridElement
+        // with mutually exclusive lazy sibling Borders:
+        // VirtualDesktopSwitcherBackground (Acrylic pill) and VirtualDesktopBarBackground (bottom bar).
+        idx.on_add_on_thread(
+            0,
+            7000,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.TaskViewTimeline".into(),
+            "TaskViewTimelineRoot".into(),
+            501,
+        );
+        idx.on_add_on_thread(
+            7000,
+            7001,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.VirtualDesktopBarElement".into(),
+            "VirtualDesktopBar".into(),
+            501,
+        );
+        idx.on_add_on_thread(
+            7001,
+            7002,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "GridElement".into(),
+            501,
+        );
+        idx.on_add_on_thread(
+            7002,
+            7003,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "VirtualDesktopSwitcherBackground".into(),
+            501,
+        );
+        idx.on_add_on_thread(
+            7002,
+            7004,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "VirtualDesktopBarBackground".into(),
+            501,
+        );
+        // Inner desktop thumbnail tile & New Desktop button must NEVER match
+        idx.on_add_on_thread(
+            7002,
+            7005,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.VirtualDesktopListViewItem".into(),
+            "".into(),
+            501,
+        );
+        idx.on_add_on_thread(
+            7005,
+            7006,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "VirtualDesktopBarBackground".into(),
+            501,
+        );
+
+        assert_eq!(
+            idx.classify_target(7003),
+            Some(TargetKind::VirtualDesktopBarSurface)
+        );
+        assert_eq!(
+            idx.classify_target(7004),
+            Some(TargetKind::VirtualDesktopBarSurface)
+        );
+        assert_eq!(idx.classify_target(7006), None);
+
+        // Older Win11 build with only VirtualDesktopBarBackground (no outer VirtualDesktopSwitcherBackground)
+        // automatically promotes VirtualDesktopBarBackground to primary VirtualDesktopBarSurface.
+        idx.on_add_on_thread(
+            0,
+            7100,
+            "WindowsInternal.ComposableShell.Experiences.Switcher.VirtualDesktopBarElement".into(),
+            "VirtualDesktopBar".into(),
+            502,
+        );
+        idx.on_add_on_thread(
+            7100,
+            7101,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "VirtualDesktopBarBackground".into(),
+            502,
+        );
+        assert_eq!(
+            idx.classify_target(7101),
+            Some(TargetKind::VirtualDesktopBarSurface)
+        );
+    }
+
+    #[test]
+    fn start_menu_targets_acrylic_border_overlay_shadows_and_context_menus() {
+        let mut idx = VisualTreeIndex::new();
+
+        // 1. Win11 DockedStart: FrameRoot > MaxHeightEnforcer > StartDropShadow + MainMenu > AcrylicBorder + MainContent > AcrylicOverlay
+        idx.on_add_on_thread(
+            0,
+            9000,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "FrameRoot".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9000,
+            9001,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "MaxHeightEnforcer".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9001,
+            9002,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "StartDropShadow".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9001,
+            9003,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "MainMenu".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9003,
+            9004,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "AcrylicBorder".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9003,
+            9005,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "MainContent".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9005,
+            9006,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "AcrylicOverlay".into(),
+            701,
+        );
+        // Companion side panel
+        idx.on_add_on_thread(
+            9001,
+            9010,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "RightCompanionDropShadow".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9001,
+            9011,
+            "Windows.UI.Xaml.Controls.Grid".into(),
+            "CompanionRoot".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9011,
+            9012,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "AcrylicBorder".into(),
+            701,
+        );
+        // Inner button/item borders must NEVER match
+        idx.on_add_on_thread(
+            9005,
+            9020,
+            "Windows.UI.Xaml.Controls.Button".into(),
+            "SearchBoxToggleButton".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9020,
+            9021,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "AcrylicBorder".into(),
+            701,
+        );
+        // Power / Pinned item context menu inside StartMenu
+        idx.on_add_on_thread(
+            0,
+            9030,
+            "Windows.UI.Xaml.Controls.MenuFlyoutPresenter".into(),
+            "".into(),
+            701,
+        );
+        idx.on_add_on_thread(
+            9030,
+            9031,
+            "Windows.UI.Xaml.Controls.Border".into(),
+            "MenuFlyoutPresenterBorder".into(),
+            701,
+        );
+
+        assert_eq!(
+            idx.classify_target_in_scope(9002, TapHostScope::StartMenu),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9004, TapHostScope::StartMenu),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9006, TapHostScope::StartMenu),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9010, TapHostScope::StartMenu),
+            Some(TargetKind::ShellCardSubSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9012, TapHostScope::StartMenu),
+            Some(TargetKind::ShellCardSurface)
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9021, TapHostScope::StartMenu),
+            None
+        );
+        assert_eq!(
+            idx.classify_target_in_scope(9031, TapHostScope::StartMenu),
+            Some(TargetKind::MenuFlyoutSurface)
+        );
+    }
 }
 
 #[cfg(windows)]
 mod win {
     use super::tree_match::{
         appcontainer_pipe_name_for_pid, pipe_name_for_pid, shell_host_pipe_name_for_pid,
-        TapHostScope, TargetKind, VisualTreeIndex, ALTTAB_ITEM_OVERLAY_NAME,
+        start_menu_pipe_name_for_pid, TapHostScope, TargetKind, VisualTreeIndex, ALTTAB_ITEM_OVERLAY_NAME,
         CLSID_PRETTY_WINDOWS_TAP_U128, CMD_ALTTAB_RECT, CMD_HIDE, CMD_HOVER_FLYOUT_RECT,
         CMD_MENU_FLYOUT_RECTS, CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE,
         CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS,
         CMD_SET_OSD_FALLBACK_STYLE, CMD_SET_OSD_SUPPRESS, CMD_SET_TOOLTIP_FALLBACK_STYLE,
-        CMD_SET_TOOLTIP_SUPPRESS, CMD_SHELL_CARD_RECTS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT,
-        CMD_VERSION, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS, TAP_PROTOCOL_VERSION,
+        CMD_SET_TOOLTIP_SUPPRESS, CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE, CMD_SHELL_CARD_RECTS,
+        CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT, CMD_VERSION, MAX_MENU_FLYOUT_RECTS,
+        MAX_SHELL_CARD_RECTS, TAP_PROTOCOL_VERSION,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, VecDeque};
@@ -3293,6 +3608,7 @@ mod win {
     const DIAG_MENU_FLYOUT_SHADOW_APPLIED: u32 = 1 << 23;
     const DIAG_SHELL_CARD_APPLIED: u32 = 1 << 24;
     const DIAG_SHELL_CARD_SHADOW_APPLIED: u32 = 1 << 25;
+    const DIAG_VIRTUAL_DESKTOP_BAR_APPLIED: u32 = 1 << 26;
 
     #[repr(C)]
     struct RawIUIElement {
@@ -5125,6 +5441,78 @@ mod win {
                             DIAG_SHELL_CARD_SHADOW_APPLIED,
                             false,
                         );
+                    }
+                    _ => {}
+                }
+            }
+            TargetKind::VirtualDesktopBarSurface => {
+                let (target_bg, target_border) = cb.runtime.virtual_desktop_bar_target_colors();
+                match cb.prop {
+                    BrushPropKind::BorderBackground => {
+                        let border_com = qi_interface(sender, &IID_IBORDER);
+                        if !border_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                border_com.as_ptr(),
+                                BrushPropKind::BorderBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::BorderBrush => {
+                        let border_com = qi_interface(sender, &IID_IBORDER);
+                        if !border_com.is_null() {
+                            let _ = sync_overflow_brush_prop_with_mode(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                border_com.as_ptr(),
+                                BrushPropKind::BorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                                true,
+                            );
+                        }
+                    }
+                    BrushPropKind::PanelBackground => {
+                        let panel_com = qi_interface(sender, &IID_IPANEL);
+                        if !panel_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                panel_com.as_ptr(),
+                                BrushPropKind::PanelBackground,
+                                target_bg,
+                                true,
+                                None,
+                                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                            );
+                        }
+                    }
+                    BrushPropKind::GridBorderBrush => {
+                        let grid2_com = qi_interface(sender, &IID_IGRID2);
+                        if !grid2_com.is_null() {
+                            sync_overflow_brush_prop(
+                                &cb.runtime,
+                                cb.handle,
+                                sender,
+                                grid2_com.as_ptr(),
+                                BrushPropKind::GridBorderBrush,
+                                target_border,
+                                true,
+                                None,
+                                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -8981,6 +9369,116 @@ mod win {
         }
     }
 
+    unsafe fn apply_virtual_desktop_bar_appearance(
+        rt: &Arc<TapRuntime>,
+        handle: u64,
+        insp_ptr: *mut c_void,
+        kind: TargetKind,
+        desired_hide: bool,
+    ) {
+        if insp_ptr.is_null() {
+            return;
+        }
+        let (target_bg, target_border) = rt.virtual_desktop_bar_target_colors();
+        let saved = if desired_hide {
+            SavedTargetBrushes::default()
+        } else {
+            take_saved_target_brushes(handle)
+        };
+
+        let border_com = qi_interface(insp_ptr, &IID_IBORDER);
+        if !border_com.is_null() {
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                handle,
+                insp_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBackground,
+                target_bg,
+                desired_hide,
+                saved.background,
+                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                true,
+            );
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                handle,
+                insp_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBrush,
+                target_border,
+                desired_hide,
+                saved.border_brush,
+                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+                true,
+            );
+            if desired_hide {
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    kind,
+                    BrushPropKind::BorderBackground,
+                    insp_ptr,
+                );
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    kind,
+                    BrushPropKind::BorderBrush,
+                    insp_ptr,
+                );
+            }
+            return;
+        }
+
+        let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
+        if !panel_com.is_null() {
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                panel_com.as_ptr(),
+                BrushPropKind::PanelBackground,
+                target_bg,
+                desired_hide,
+                saved.background,
+                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+            );
+            if desired_hide {
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    kind,
+                    BrushPropKind::PanelBackground,
+                    insp_ptr,
+                );
+            }
+        }
+        let grid2_com = qi_interface(insp_ptr, &IID_IGRID2);
+        if !grid2_com.is_null() {
+            sync_overflow_brush_prop(
+                rt,
+                handle,
+                insp_ptr,
+                grid2_com.as_ptr(),
+                BrushPropKind::GridBorderBrush,
+                target_border,
+                desired_hide,
+                saved.border_brush,
+                DIAG_VIRTUAL_DESKTOP_BAR_APPLIED,
+            );
+            if desired_hide {
+                ensure_prop_watch_registered(
+                    rt,
+                    handle,
+                    kind,
+                    BrushPropKind::GridBorderBrush,
+                    insp_ptr,
+                );
+            }
+        }
+    }
+
     unsafe fn apply_target_appearance(
         rt: &Arc<TapRuntime>,
         handle: u64,
@@ -9060,6 +9558,9 @@ mod win {
             TargetKind::ShellCardSurface | TargetKind::ShellCardSubSurface => {
                 apply_shell_card_surface_appearance(rt, handle, insp_ptr, kind, desired_hide);
             }
+            TargetKind::VirtualDesktopBarSurface => {
+                apply_virtual_desktop_bar_appearance(rt, handle, insp_ptr, kind, desired_hide);
+            }
             TargetKind::OverflowPanel => {
                 let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
                 if panel_com.is_null() {
@@ -9127,23 +9628,29 @@ mod win {
 
     unsafe fn detect_host_scope_and_pipe(is_appcontainer: bool) -> (TapHostScope, Option<String>) {
         let pid = GetCurrentProcessId();
-        if is_appcontainer {
-            return (
-                TapHostScope::ShellExperience,
-                Some(appcontainer_pipe_name_for_pid(pid)),
-            );
-        }
         let mut buf = [0u16; 512];
         let len = GetModuleFileNameW(None, &mut buf) as usize;
         if len > 0 {
             let path = String::from_utf16_lossy(&buf[..len.min(buf.len())]);
             let exe_name = path.rsplit(['\\', '/']).next().unwrap_or("");
+            if exe_name.eq_ignore_ascii_case("StartMenuExperienceHost.exe") {
+                return (
+                    TapHostScope::StartMenu,
+                    Some(start_menu_pipe_name_for_pid(pid)),
+                );
+            }
             if exe_name.eq_ignore_ascii_case("ShellHost.exe") {
                 return (
                     TapHostScope::ShellHost,
                     Some(shell_host_pipe_name_for_pid(pid)),
                 );
             }
+        }
+        if is_appcontainer {
+            return (
+                TapHostScope::ShellExperience,
+                Some(appcontainer_pipe_name_for_pid(pid)),
+            );
         }
         (TapHostScope::Explorer, None)
     }
@@ -9171,6 +9678,8 @@ mod win {
         menu_flyout_fallback_border_argb: AtomicU32,
         alt_tab_item_bg_argb: AtomicU32,
         alt_tab_item_border_argb: AtomicU32,
+        virtual_desktop_bar_bg_argb: AtomicU32,
+        virtual_desktop_bar_border_argb: AtomicU32,
         diag_cookie: AtomicU32,
         shutdown_started: AtomicBool,
         stop_requested: AtomicBool,
@@ -9219,6 +9728,8 @@ mod win {
                 menu_flyout_fallback_border_argb: AtomicU32::new(0x56_FFFFFF),
                 alt_tab_item_bg_argb: AtomicU32::new(0x49_1A1D24),
                 alt_tab_item_border_argb: AtomicU32::new(0x42_FFFFFF),
+                virtual_desktop_bar_bg_argb: AtomicU32::new(0x4E_141A26),
+                virtual_desktop_bar_border_argb: AtomicU32::new(0x58_E6F0FF),
                 diag_cookie: AtomicU32::new(diag_cookie),
                 shutdown_started: AtomicBool::new(false),
                 stop_requested: AtomicBool::new(false),
@@ -9918,6 +10429,27 @@ mod win {
                 self.dispatch_apply_filtered(0, Some(TargetKind::AltTabBorder));
             }
         }
+
+        fn virtual_desktop_bar_target_colors(&self) -> (RawUiColor, RawUiColor) {
+            (
+                RawUiColor::from_argb(self.virtual_desktop_bar_bg_argb.load(Ordering::Acquire)),
+                RawUiColor::from_argb(
+                    self.virtual_desktop_bar_border_argb.load(Ordering::Acquire),
+                ),
+            )
+        }
+
+        fn set_virtual_desktop_bar_colors(self: &Arc<Self>, bg_argb: u32, border_argb: u32) {
+            let prev_bg = self
+                .virtual_desktop_bar_bg_argb
+                .swap(bg_argb, Ordering::AcqRel);
+            let prev_bd = self
+                .virtual_desktop_bar_border_argb
+                .swap(border_argb, Ordering::AcqRel);
+            if (prev_bg != bg_argb || prev_bd != border_argb) && self.desired_hide() {
+                self.dispatch_apply_filtered(0, Some(TargetKind::VirtualDesktopBarSurface));
+            }
+        }
     }
 
     impl Drop for TapRuntime {
@@ -10590,6 +11122,16 @@ mod win {
                 || name == "ModalRootGrid"
                 || name == "AltTabRoot"
                 || type_name.contains("Switcher.AltTab")
+                || type_name.contains("Switcher.TaskView")
+                || type_name.contains("VirtualDesktopBarElement")
+                || matches!(
+                    name.as_str(),
+                    "TaskViewTimelineRoot"
+                        | "TaskViewRoot"
+                        | "VirtualDesktopBar"
+                        | "VirtualDesktopSwitcherBackground"
+                        | "VirtualDesktopBarBackground"
+                )
                 || name == "BackgroundElement"
                 || type_name.contains("SwitchItemList")
                 || name == "CustomFocusItemPanel"
@@ -10636,6 +11178,14 @@ mod win {
                         | "Footer"
                         | "ToastBackgroundBorder2"
                         | "ToastBackgroundBorder"
+                        | "FrameRoot"
+                        | "CompanionRoot"
+                        | "MainMenu"
+                        | "AcrylicBorder"
+                        | "AcrylicOverlay"
+                        | "StartDropShadow"
+                        | "LeftCompanionDropShadow"
+                        | "RightCompanionDropShadow"
                 );
             let may_be_alttab_item_container = type_name.contains("ListViewItem");
             let mut is_container_root = hint_container_root;
@@ -11609,7 +12159,8 @@ mod win {
             CMD_SET_ALTTAB_ITEM_STYLE
             | CMD_SET_OSD_FALLBACK_STYLE
             | CMD_SET_TOOLTIP_FALLBACK_STYLE
-            | CMD_SET_MENU_FLYOUT_FALLBACK_STYLE => {
+            | CMD_SET_MENU_FLYOUT_FALLBACK_STYLE
+            | CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE => {
                 let mut extra = [0u8; 8];
                 if read_pipe_exact(pipe, io_event, &mut extra) {
                     let bg_argb = u32::from_le_bytes([extra[0], extra[1], extra[2], extra[3]]);
@@ -11623,6 +12174,9 @@ mod win {
                         }
                         CMD_SET_TOOLTIP_FALLBACK_STYLE => {
                             rt.set_tooltip_fallback_colors(bg_argb, border_argb);
+                        }
+                        CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE => {
+                            rt.set_virtual_desktop_bar_colors(bg_argb, border_argb);
                         }
                         _ => {
                             rt.set_menu_flyout_fallback_colors(bg_argb, border_argb);

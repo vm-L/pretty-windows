@@ -4072,6 +4072,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(72, 195, 220),
             accent_light: Rgb::new(40, 128, 172),
         };
@@ -4080,6 +4083,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(235, 192, 86),
             accent_light: Rgb::new(155, 118, 30),
         };
@@ -4088,6 +4094,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(128, 128, 128),
             accent_light: Rgb::new(128, 128, 128),
         };
@@ -4185,6 +4194,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(228, 186, 78),
             accent_light: Rgb::new(152, 114, 24),
         });
@@ -4193,6 +4205,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(82, 205, 198),
             accent_light: Rgb::new(28, 138, 132),
         });
@@ -4204,6 +4219,7 @@ mod tests {
             status: PlaybackState::Playing,
             pid: None,
             cover,
+            timeline: None,
         };
 
         let sources = vec![
@@ -4250,6 +4266,9 @@ mod tests {
             thumb_w: 2,
             thumb_h: 2,
             thumb_pbgra: vec![255; 16],
+            art_w: 2,
+            art_h: 2,
+            art_pbgra: vec![255; 16],
             accent_dark: Rgb::new(125, 167, 171),
             accent_light: Rgb::new(97, 145, 149),
         });
@@ -4261,6 +4280,7 @@ mod tests {
             status: PlaybackState::Playing,
             pid: None,
             cover: Some(muted_cover.clone()),
+            timeline: None,
         }];
         let fallback = Rgb::new(0, 120, 212);
         let rgb_chroma =

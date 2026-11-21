@@ -239,6 +239,7 @@ pub struct RenderFrame<'a> {
     pub master_volume: f32,
     pub master_muted: bool,
     pub popup_open: bool,
+    pub progress: Option<f32>,
     pub bar_levels: &'a [f32; NUM_BARS],
     pub title_marquee: &'a mut MarqueeState,
     pub artist_marquee: &'a mut MarqueeState,
@@ -727,6 +728,19 @@ impl BarRenderer {
                         frame.hover_zone,
                         frame.pressed_zone,
                     );
+                }
+
+                // 6. Ultra-slim bottom playback progress hairline when a finite timeline is present
+                if !frame.is_idle {
+                    if let Some(progress) = frame.progress {
+                        self.draw_progress_hairline(
+                            &layout,
+                            progress,
+                            frame.accent_color,
+                            frame.is_playing,
+                            frame.light_taskbar,
+                        );
+                    }
                 }
             }
 
@@ -1460,13 +1474,13 @@ impl BarRenderer {
             let u = (rect.width() / 24.0) * icon_scale;
 
             match zone {
-                HitZone::PrevButton => self.draw_prev_icon(cx, cy, u, &brush),
-                HitZone::NextButton => self.draw_next_icon(cx, cy, u, &brush),
+                HitZone::PrevButton => draw_prev_icon(&self.d2d_factory, &self.rt, cx, cy, u, &brush),
+                HitZone::NextButton => draw_next_icon(&self.d2d_factory, &self.rt, cx, cy, u, &brush),
                 HitZone::PlayPauseButton => {
                     if is_playing {
-                        self.draw_pause_icon(cx, cy, u, &brush);
+                        draw_pause_icon(&self.rt, cx, cy, u, &brush);
                     } else {
-                        self.draw_play_icon(cx, cy, u, &brush);
+                        draw_play_icon(&self.d2d_factory, &self.rt, cx, cy, u, &brush);
                     }
                 }
                 _ => {}
@@ -1474,152 +1488,118 @@ impl BarRenderer {
         }
     }
 
-    unsafe fn draw_prev_icon(
+    unsafe fn draw_progress_hairline(
         &self,
-        cx: f32,
-        cy: f32,
-        u: f32,
-        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+        layout: &BarLayout,
+        progress: f32,
+        accent: Rgb,
+        is_playing: bool,
+        light_taskbar: bool,
     ) {
-        let bar = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: cx - 5.2 * u,
-                top: cy - 5.0 * u,
-                right: cx - 3.4 * u,
-                bottom: cy + 5.0 * u,
-            },
-            radiusX: 0.9 * u,
-            radiusY: 0.9 * u,
-        };
-        self.rt.FillRoundedRectangle(&bar, brush);
+        let track = layout.progress_track_rect;
+        let rad = track.height() * 0.5;
+        let p = progress.clamp(0.0, 1.0);
 
-        if let Ok(tri) = self.d2d_factory.CreatePathGeometry() {
-            if let Ok(sink) = tri.Open() {
-                sink.BeginFigure(
-                    D2D_POINT_2F {
-                        x: cx - 2.3 * u,
-                        y: cy,
+        let track_col = if light_taskbar {
+            D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.10,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.12,
+            }
+        };
+        if let Ok(tb) = self.rt.CreateSolidColorBrush(&track_col, None) {
+            let rr = D2D1_ROUNDED_RECT {
+                rect: d2d_rect(track),
+                radiusX: rad,
+                radiusY: rad,
+            };
+            self.rt.FillRoundedRectangle(&rr, &tb);
+        }
+
+        let fill_w = (track.width() * p).clamp(0.0, track.width());
+        if fill_w < 0.8 {
+            return;
+        }
+        let fill_rect = RectF::new(track.left, track.top, track.left + fill_w, track.bottom);
+        let alpha = if is_playing { 0.92 } else { 0.56 };
+
+        let start_col = d2d_color_rgb(accent, alpha * 0.80);
+        let tip_c = d2d_color_rgb(accent, alpha);
+        let end_col = D2D1_COLOR_F {
+            r: (tip_c.r * 1.18 + 0.08).min(1.0),
+            g: (tip_c.g * 1.18 + 0.08).min(1.0),
+            b: (tip_c.b * 1.18 + 0.08).min(1.0),
+            a: alpha,
+        };
+        let stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: start_col,
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: end_col,
+            },
+        ];
+
+        let fill_rr = D2D1_ROUNDED_RECT {
+            rect: d2d_rect(fill_rect),
+            radiusX: rad,
+            radiusY: rad,
+        };
+        if let Ok(sc) =
+            self.rt
+                .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+        {
+            let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F {
+                    x: fill_rect.left,
+                    y: fill_rect.top,
+                },
+                endPoint: D2D_POINT_2F {
+                    x: fill_rect.right,
+                    y: fill_rect.top,
+                },
+            };
+            if let Ok(grad) = self.rt.CreateLinearGradientBrush(&props, None, &sc) {
+                self.rt.FillRoundedRectangle(&fill_rr, &grad);
+            }
+        } else if let Ok(fb) = self.rt.CreateSolidColorBrush(&tip_c, None) {
+            self.rt.FillRoundedRectangle(&fill_rr, &fb);
+        }
+
+        // Subtle luminous specular dot at the leading edge while playing
+        if is_playing && p > 0.01 && p < 0.995 {
+            let cy = (track.top + track.bottom) * 0.5;
+            let glow_r = (2.6 * layout.scale).max(2.0);
+            let glow_col = D2D1_COLOR_F {
+                r: end_col.r,
+                g: end_col.g,
+                b: end_col.b,
+                a: if light_taskbar { 0.34 } else { 0.42 },
+            };
+            if let Ok(gb) = self.rt.CreateSolidColorBrush(&glow_col, None) {
+                self.rt.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F {
+                            x: fill_rect.right,
+                            y: cy,
+                        },
+                        radiusX: glow_r,
+                        radiusY: glow_r * 0.72,
                     },
-                    D2D1_FIGURE_BEGIN_FILLED,
+                    &gb,
                 );
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx + 5.0 * u,
-                    y: cy - 5.0 * u,
-                });
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx + 5.0 * u,
-                    y: cy + 5.0 * u,
-                });
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                let _ = sink.Close();
-                self.rt.FillGeometry(&tri, brush, None);
             }
         }
-    }
-
-    unsafe fn draw_next_icon(
-        &self,
-        cx: f32,
-        cy: f32,
-        u: f32,
-        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
-    ) {
-        let bar = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: cx + 3.4 * u,
-                top: cy - 5.0 * u,
-                right: cx + 5.2 * u,
-                bottom: cy + 5.0 * u,
-            },
-            radiusX: 0.9 * u,
-            radiusY: 0.9 * u,
-        };
-        self.rt.FillRoundedRectangle(&bar, brush);
-
-        if let Ok(tri) = self.d2d_factory.CreatePathGeometry() {
-            if let Ok(sink) = tri.Open() {
-                sink.BeginFigure(
-                    D2D_POINT_2F {
-                        x: cx + 2.3 * u,
-                        y: cy,
-                    },
-                    D2D1_FIGURE_BEGIN_FILLED,
-                );
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx - 5.0 * u,
-                    y: cy - 5.0 * u,
-                });
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx - 5.0 * u,
-                    y: cy + 5.0 * u,
-                });
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                let _ = sink.Close();
-                self.rt.FillGeometry(&tri, brush, None);
-            }
-        }
-    }
-
-    unsafe fn draw_play_icon(
-        &self,
-        cx: f32,
-        cy: f32,
-        u: f32,
-        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
-    ) {
-        if let Ok(tri) = self.d2d_factory.CreatePathGeometry() {
-            if let Ok(sink) = tri.Open() {
-                sink.BeginFigure(
-                    D2D_POINT_2F {
-                        x: cx - 4.0 * u,
-                        y: cy - 6.0 * u,
-                    },
-                    D2D1_FIGURE_BEGIN_FILLED,
-                );
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx + 5.8 * u,
-                    y: cy,
-                });
-                sink.AddLine(D2D_POINT_2F {
-                    x: cx - 4.0 * u,
-                    y: cy + 6.0 * u,
-                });
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                let _ = sink.Close();
-                self.rt.FillGeometry(&tri, brush, None);
-            }
-        }
-    }
-
-    unsafe fn draw_pause_icon(
-        &self,
-        cx: f32,
-        cy: f32,
-        u: f32,
-        brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
-    ) {
-        let left = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: cx - 4.5 * u,
-                top: cy - 5.5 * u,
-                right: cx - 1.5 * u,
-                bottom: cy + 5.5 * u,
-            },
-            radiusX: 1.2 * u,
-            radiusY: 1.2 * u,
-        };
-        let right = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: cx + 1.5 * u,
-                top: cy - 5.5 * u,
-                right: cx + 4.5 * u,
-                bottom: cy + 5.5 * u,
-            },
-            radiusX: 1.2 * u,
-            radiusY: 1.2 * u,
-        };
-        self.rt.FillRoundedRectangle(&left, brush);
-        self.rt.FillRoundedRectangle(&right, brush);
     }
 
     /// Renders a DPI-aware anti-aliased grabbing hand cursor (`HCURSOR`) with dark outline and white fill.
@@ -1627,4 +1607,155 @@ impl BarRenderer {
     pub fn create_grabbing_cursor(&self, dpi: u32) -> windows::core::Result<(HCURSOR, bool)> {
         crate::ui::glass::create_grabbing_cursor(&self.rt, dpi)
     }
+}
+
+pub(super) unsafe fn draw_prev_icon(
+    factory: &ID2D1Factory1,
+    rt: &ID2D1DCRenderTarget,
+    cx: f32,
+    cy: f32,
+    u: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let bar = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: cx - 5.2 * u,
+            top: cy - 5.0 * u,
+            right: cx - 3.4 * u,
+            bottom: cy + 5.0 * u,
+        },
+        radiusX: 0.9 * u,
+        radiusY: 0.9 * u,
+    };
+    rt.FillRoundedRectangle(&bar, brush);
+
+    if let Ok(tri) = factory.CreatePathGeometry() {
+        if let Ok(sink) = tri.Open() {
+            sink.BeginFigure(
+                D2D_POINT_2F {
+                    x: cx - 2.3 * u,
+                    y: cy,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(D2D_POINT_2F {
+                x: cx + 5.0 * u,
+                y: cy - 5.0 * u,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx + 5.0 * u,
+                y: cy + 5.0 * u,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            let _ = sink.Close();
+            rt.FillGeometry(&tri, brush, None);
+        }
+    }
+}
+
+pub(super) unsafe fn draw_next_icon(
+    factory: &ID2D1Factory1,
+    rt: &ID2D1DCRenderTarget,
+    cx: f32,
+    cy: f32,
+    u: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let bar = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: cx + 3.4 * u,
+            top: cy - 5.0 * u,
+            right: cx + 5.2 * u,
+            bottom: cy + 5.0 * u,
+        },
+        radiusX: 0.9 * u,
+        radiusY: 0.9 * u,
+    };
+    rt.FillRoundedRectangle(&bar, brush);
+
+    if let Ok(tri) = factory.CreatePathGeometry() {
+        if let Ok(sink) = tri.Open() {
+            sink.BeginFigure(
+                D2D_POINT_2F {
+                    x: cx + 2.3 * u,
+                    y: cy,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(D2D_POINT_2F {
+                x: cx - 5.0 * u,
+                y: cy - 5.0 * u,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx - 5.0 * u,
+                y: cy + 5.0 * u,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            let _ = sink.Close();
+            rt.FillGeometry(&tri, brush, None);
+        }
+    }
+}
+
+pub(super) unsafe fn draw_play_icon(
+    factory: &ID2D1Factory1,
+    rt: &ID2D1DCRenderTarget,
+    cx: f32,
+    cy: f32,
+    u: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    if let Ok(tri) = factory.CreatePathGeometry() {
+        if let Ok(sink) = tri.Open() {
+            sink.BeginFigure(
+                D2D_POINT_2F {
+                    x: cx - 4.0 * u,
+                    y: cy - 6.0 * u,
+                },
+                D2D1_FIGURE_BEGIN_FILLED,
+            );
+            sink.AddLine(D2D_POINT_2F {
+                x: cx + 5.8 * u,
+                y: cy,
+            });
+            sink.AddLine(D2D_POINT_2F {
+                x: cx - 4.0 * u,
+                y: cy + 6.0 * u,
+            });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            let _ = sink.Close();
+            rt.FillGeometry(&tri, brush, None);
+        }
+    }
+}
+
+pub(super) unsafe fn draw_pause_icon(
+    rt: &ID2D1DCRenderTarget,
+    cx: f32,
+    cy: f32,
+    u: f32,
+    brush: &ID2D1SolidColorBrush,
+) {
+    let left = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: cx - 4.5 * u,
+            top: cy - 5.5 * u,
+            right: cx - 1.5 * u,
+            bottom: cy + 5.5 * u,
+        },
+        radiusX: 1.2 * u,
+        radiusY: 1.2 * u,
+    };
+    let right = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left: cx + 1.5 * u,
+            top: cy - 5.5 * u,
+            right: cx + 4.5 * u,
+            bottom: cy + 5.5 * u,
+        },
+        radiusX: 1.2 * u,
+        radiusY: 1.2 * u,
+    };
+    rt.FillRoundedRectangle(&left, brush);
+    rt.FillRoundedRectangle(&right, brush);
 }

@@ -49,6 +49,8 @@ src/
     ├── app.rs         # MediaBar 主窗口状态机、鼠标交互、内联音量 HUD（由宿主托管，不独占消息循环）
     ├── config.rs      # MediaBar.toml 持久化配置（enabled / locked / auto_color / offset_x）
     ├── popup.rs       # MediaBar 级联菜单（播放源 / 混音器 / 音频设备 / 设置）
+    ├── mini_player.rs # MediaBar 迷你播放浮窗（大封面、进度条点击/拖拽跳转与快捷播放控制）
+    ├── timeline.rs    # 跨平台 SMTC 播放进度插值、时间格式化与进度条拖拽定位算法
     ├── render.rs      # MediaBar 任务栏挂件渲染器与抓取光标生成
     ├── layout.rs      # MediaBar 挂件几何与命中测试
     ├── taskbar.rs     # Win11 任务栏定位、全屏/自动隐藏守卫、Z-order 维护
@@ -99,6 +101,6 @@ cargo check --workspace --tests --target x86_64-pc-windows-msvc
 ### 新增代码注意点
 - 新增非 Win32 逻辑（布局计算、配置解析、物理曲线、色彩/DSP 算法）应保持跨平台可编译并附带单元测试，以便在 Linux 环境通过 `cargo test` 即时验证。
 - 所有 Win32 窗口消息常量（`WM_APP + N`）需在模块内明确命名与分段，避免宿主/菜单/子模块之间产生消息编号冲突：
-  - `mediabar`：`WM_APP + 1` .. `WM_APP + 6`（当前已占用 `+1`..`+6`）
+  - `mediabar`：`WM_APP + 1` .. `WM_APP + 10`（当前已占用 `+1`..`+10`）
   - `tray`：`WM_APP + 20` .. `WM_APP + 29`（当前已占用 `+20`..`+28`）
   - `monitorbar`：`WM_APP + 40` .. `WM_APP + 49`（当前已占用 `+40`..`+49`）

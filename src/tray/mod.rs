@@ -140,6 +140,7 @@ mod win {
                 overflow_hook
                     .refresh_for_shell_experience_pid(taskbar.shell_experience_pid());
                 overflow_hook.refresh_for_shell_host_pid(taskbar.shell_host_pid());
+                overflow_hook.refresh_for_start_menu_pid(taskbar.start_menu_pid());
 
                 let mut host = Self {
                     hwnd,
@@ -265,6 +266,8 @@ mod win {
                 .refresh_for_shell_experience_pid(self.taskbar.shell_experience_pid());
             self.overflow_hook
                 .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
+            self.overflow_hook
+                .refresh_for_start_menu_pid(self.taskbar.start_menu_pid());
             self.sync_taskbar_timer();
             self.sync_menu_state();
         }
@@ -342,6 +345,8 @@ mod win {
                 .refresh_for_shell_experience_pid(self.taskbar.shell_experience_pid());
             self.overflow_hook
                 .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
+            self.overflow_hook
+                .refresh_for_start_menu_pid(self.taskbar.start_menu_pid());
             self.sync_taskbar_timer();
             if reverted {
                 self.sync_menu_state();
@@ -519,6 +524,10 @@ mod win {
                         state
                             .overflow_hook
                             .refresh_for_shell_host_pid(shell_host_pid);
+                        let start_menu_pid = state.taskbar.start_menu_pid();
+                        state
+                            .overflow_hook
+                            .refresh_for_start_menu_pid(start_menu_pid);
                         state.sync_taskbar_timer();
                     }
                 }

@@ -1,5 +1,6 @@
 use super::arbitration::PlaybackState;
 use super::process_util::{friendly_app_name, resolve_pid_for_source};
+use super::timeline::{current_filetime_100ns, MediaTimeline};
 use crate::color::{extract_accent_from_bgra, Rgb};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -26,17 +27,21 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 pub const WM_APP_SMTC_UPDATED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
 const THUMB_SIZE: u32 = 64;
+const ART_SIZE: u32 = 192;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COVER_RETRY_DELAY: Duration = Duration::from_millis(360);
 const OVERRIDE_TTL: Duration = Duration::from_millis(650);
 
-/// Decoded album artwork and theme-calibrated accent colors.
+/// Decoded album artwork (compact taskbar thumbnail + crisp mini-player art) and theme-calibrated accent colors.
 #[derive(Clone, Debug)]
 pub struct MediaCover {
     pub hash: u64,
     pub thumb_w: u32,
     pub thumb_h: u32,
     pub thumb_pbgra: Vec<u8>,
+    pub art_w: u32,
+    pub art_h: u32,
+    pub art_pbgra: Vec<u8>,
     pub accent_dark: Rgb,
     pub accent_light: Rgb,
 }
@@ -51,6 +56,7 @@ pub struct SourceItem {
     pub status: PlaybackState,
     pub pid: Option<u32>,
     pub cover: Option<Arc<MediaCover>>,
+    pub timeline: Option<MediaTimeline>,
 }
 
 /// Immutable snapshot shared from the SMTC worker thread to the UI thread.
@@ -67,6 +73,7 @@ pub enum SmtcCommand {
     TogglePlayPause(String),
     Next(String),
     Previous(String),
+    Seek(String, i64),
     Shutdown,
 }
 
@@ -112,12 +119,14 @@ struct TrackedSession {
     session: GlobalSystemMediaTransportControlsSession,
     playback_token: EventRegistrationToken,
     props_token: EventRegistrationToken,
+    timeline_token: EventRegistrationToken,
 }
 
 impl Drop for TrackedSession {
     fn drop(&mut self) {
         let _ = self.session.RemovePlaybackInfoChanged(self.playback_token);
         let _ = self.session.RemoveMediaPropertiesChanged(self.props_token);
+        let _ = self.session.RemoveTimelinePropertiesChanged(self.timeline_token);
     }
 }
 
@@ -181,6 +190,36 @@ fn extract_playback_state(sess: &GlobalSystemMediaTransportControlsSession) -> P
     }
 }
 
+fn extract_timeline(sess: &GlobalSystemMediaTransportControlsSession) -> Option<MediaTimeline> {
+    let tl = sess.GetTimelineProperties().ok()?;
+    let start_100ns = tl.StartTime().ok()?.Duration;
+    let end_100ns = tl.EndTime().ok()?.Duration;
+    let position_100ns = tl.Position().ok()?.Duration;
+    let raw_updated = tl
+        .LastUpdatedTime()
+        .ok()
+        .map(|dt| dt.UniversalTime)
+        .unwrap_or(0);
+    let last_updated_100ns = if raw_updated > 0 {
+        raw_updated
+    } else {
+        current_filetime_100ns()
+    };
+    let can_seek = sess
+        .GetPlaybackInfo()
+        .and_then(|pi| pi.Controls())
+        .and_then(|c| c.IsPlaybackPositionEnabled())
+        .unwrap_or(false);
+    let parsed = MediaTimeline {
+        start_100ns,
+        end_100ns,
+        position_100ns,
+        last_updated_100ns,
+        can_seek,
+    };
+    parsed.is_valid().then_some(parsed)
+}
+
 struct SessionCacheEntry {
     pid: Option<u32>,
     app_name: String,
@@ -204,6 +243,7 @@ fn snapshots_equal(a: &SmtcSnapshot, b: &SmtcSnapshot) -> bool {
             && x.status == y.status
             && x.pid == y.pid
             && x.cover.as_ref().map(|c| c.hash) == y.cover.as_ref().map(|c| c.hash)
+            && x.timeline == y.timeline
     })
 }
 
@@ -285,6 +325,7 @@ fn run_smtc_loop(
     let mut cover_by_hash: HashMap<u64, Arc<MediaCover>> = HashMap::new();
     let mut cover_retry_deadline: Option<Instant> = None;
     let mut pending_override: Option<(String, PlaybackState, Instant)> = None;
+    let mut pending_seek_override: Option<(String, i64, i64, Instant)> = None;
     let mut last_snapshot: Option<SmtcSnapshot> = None;
     let mut poll_cycle: u32 = 0;
 
@@ -393,6 +434,20 @@ fn run_smtc_loop(
                     }
                     need_full_refresh = true;
                 }
+                SmtcCommand::Seek(id, target_100ns) => {
+                    if let Some(sess) = find_live_session(&manager, &tracked, &id) {
+                        if let Ok(op) = sess.TryChangePlaybackPositionAsync(target_100ns) {
+                            let _ = op.get();
+                        }
+                        pending_seek_override = Some((
+                            id,
+                            target_100ns,
+                            current_filetime_100ns(),
+                            Instant::now() + OVERRIDE_TTL,
+                        ));
+                    }
+                    need_full_refresh = true;
+                }
             }
         }
         if shutdown {
@@ -410,6 +465,7 @@ fn run_smtc_loop(
                 &mut cover_by_hash,
                 need_full_refresh,
                 &mut pending_override,
+                &mut pending_seek_override,
             );
             if needs_retry {
                 cover_retry_deadline = Some(Instant::now() + COVER_RETRY_DELAY);
@@ -454,6 +510,7 @@ fn refresh_sessions(
     cover_by_hash: &mut HashMap<u64, Arc<MediaCover>>,
     fetch_properties: bool,
     pending_override: &mut Option<(String, PlaybackState, Instant)>,
+    pending_seek_override: &mut Option<(String, i64, i64, Instant)>,
 ) -> (SmtcSnapshot, bool) {
     let mut live_sessions: Vec<(String, GlobalSystemMediaTransportControlsSession)> = Vec::new();
     let mut seen_ids: HashMap<String, usize> = HashMap::new();
@@ -486,6 +543,11 @@ fn refresh_sessions(
     if let Some((_, _, dl)) = pending_override.as_ref() {
         if Instant::now() >= *dl {
             *pending_override = None;
+        }
+    }
+    if let Some((_, _, _, dl)) = pending_seek_override.as_ref() {
+        if Instant::now() >= *dl {
+            *pending_seek_override = None;
         }
     }
 
@@ -521,6 +583,14 @@ fn refresh_sessions(
                 }))
                 .unwrap_or_default();
 
+            let tx_t = self_tx.clone();
+            let timeline_token = sess
+                .TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
+                    let _ = tx_t.send(SmtcCommand::Refresh);
+                    Ok(())
+                }))
+                .unwrap_or_default();
+
             tracked.insert(
                 id.clone(),
                 TrackedSession {
@@ -528,6 +598,7 @@ fn refresh_sessions(
                     session: sess.clone(),
                     playback_token,
                     props_token,
+                    timeline_token,
                 },
             );
         }
@@ -619,7 +690,7 @@ fn refresh_sessions(
                                     decode_and_process_cover(factory, &bytes, hash, fallback_accent)
                                 {
                                     let arc = Arc::new(decoded);
-                                    if cover_by_hash.len() > 24 {
+                                    if cover_by_hash.len() > 12 {
                                         cover_by_hash.clear();
                                     }
                                     cover_by_hash.insert(hash, Arc::clone(&arc));
@@ -648,6 +719,22 @@ fn refresh_sessions(
             }
         }
 
+        let mut timeline = extract_timeline(&sess);
+        if let Some((ref seek_id, target_pos, seek_ts, _)) = pending_seek_override {
+            if seek_id == &id {
+                if let Some(ref mut tl) = timeline {
+                    if (tl.position_100ns - *target_pos).abs() <= 20_000_000
+                        && tl.last_updated_100ns >= *seek_ts
+                    {
+                        *pending_seek_override = None;
+                    } else {
+                        tl.position_100ns = (*target_pos).clamp(tl.start_100ns, tl.end_100ns);
+                        tl.last_updated_100ns = *seek_ts;
+                    }
+                }
+            }
+        }
+
         items.push(SourceItem {
             id: id.clone(),
             app_name: entry.app_name.clone(),
@@ -660,6 +747,7 @@ fn refresh_sessions(
             status,
             pid: entry.pid,
             cover: entry.cover.clone(),
+            timeline,
         });
     }
 
@@ -805,12 +893,20 @@ fn decode_and_process_cover(
     let accent_light =
         extract_accent_from_bgra(&straight_thumb, THUMB_SIZE, THUMB_SIZE, true, fallback_accent);
     let thumb_pbgra = straight_to_premul_bgra(&straight_thumb);
+    let (art_w, art_h, art_pbgra) =
+        match decode_wic_square_straight_bgra(wic, bytes, ART_SIZE) {
+            Some(straight_art) => (ART_SIZE, ART_SIZE, straight_to_premul_bgra(&straight_art)),
+            None => (THUMB_SIZE, THUMB_SIZE, thumb_pbgra.clone()),
+        };
 
     Some(MediaCover {
         hash,
         thumb_w: THUMB_SIZE,
         thumb_h: THUMB_SIZE,
         thumb_pbgra,
+        art_w,
+        art_h,
+        art_pbgra,
         accent_dark,
         accent_light,
     })

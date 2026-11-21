@@ -1511,7 +1511,7 @@ mod win {
     }
 
     /// RAII process-scoped WinEvent hook notifying the tray host immediately when Explorer,
-    /// `ShellExperienceHost`, or `ShellHost` flyouts show, move, cloak, or hide.
+    /// `ShellExperienceHost`, `ShellHost`, or `StartMenuExperienceHost` flyouts show, move, cloak, or hide.
     pub struct OverflowEventHook {
         host_hwnd: HWND,
         notify_msg: u32,
@@ -1527,6 +1527,10 @@ mod win {
         shell_host_show_hide_hook: HWINEVENTHOOK,
         shell_host_location_hook: HWINEVENTHOOK,
         shell_host_cloak_hook: HWINEVENTHOOK,
+        start_menu_pid: u32,
+        start_menu_show_hide_hook: HWINEVENTHOOK,
+        start_menu_location_hook: HWINEVENTHOOK,
+        start_menu_cloak_hook: HWINEVENTHOOK,
     }
 
     impl OverflowEventHook {
@@ -1549,6 +1553,10 @@ mod win {
                 shell_host_show_hide_hook: HWINEVENTHOOK::default(),
                 shell_host_location_hook: HWINEVENTHOOK::default(),
                 shell_host_cloak_hook: HWINEVENTHOOK::default(),
+                start_menu_pid: 0,
+                start_menu_show_hide_hook: HWINEVENTHOOK::default(),
+                start_menu_location_hook: HWINEVENTHOOK::default(),
+                start_menu_cloak_hook: HWINEVENTHOOK::default(),
             }
         }
 
@@ -1594,6 +1602,20 @@ mod win {
             );
         }
 
+        pub fn refresh_for_start_menu_pid(&mut self, pid: u32) {
+            OVERFLOW_NOTIFY_HWND.store(self.host_hwnd.0 as usize, WinOrdering::Release);
+            OVERFLOW_NOTIFY_MSG.store(self.notify_msg, WinOrdering::Release);
+            refresh_win_event_triplet(
+                &mut self.start_menu_pid,
+                [
+                    &mut self.start_menu_show_hide_hook,
+                    &mut self.start_menu_location_hook,
+                    &mut self.start_menu_cloak_hook,
+                ],
+                pid,
+            );
+        }
+
         fn unhook_all(&mut self) {
             unsafe {
                 unhook_triplet([
@@ -1611,10 +1633,16 @@ mod win {
                     &mut self.shell_host_location_hook,
                     &mut self.shell_host_cloak_hook,
                 ]);
+                unhook_triplet([
+                    &mut self.start_menu_show_hide_hook,
+                    &mut self.start_menu_location_hook,
+                    &mut self.start_menu_cloak_hook,
+                ]);
             }
             self.explorer_pid = 0;
             self.shell_exp_pid = 0;
             self.shell_host_pid = 0;
+            self.start_menu_pid = 0;
         }
     }
 

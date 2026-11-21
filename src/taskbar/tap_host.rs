@@ -250,9 +250,10 @@ mod win {
     const CMD_SET_MENU_FLYOUT_SUPPRESS: u8 = 0x10;
     const CMD_SET_MENU_FLYOUT_FALLBACK_STYLE: u8 = 0x11;
     const CMD_SHELL_CARD_RECTS: u8 = 0x12;
+    const CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE: u8 = 0x13;
     const MAX_MENU_FLYOUT_RECTS: usize = 3;
     const MAX_SHELL_CARD_RECTS: usize = 8;
-    const EXPECTED_TAP_PROTOCOL_VERSION: u8 = 11;
+    const EXPECTED_TAP_PROTOCOL_VERSION: u8 = 12;
 
     #[derive(Clone, Copy, Debug)]
     pub struct AltTabBoundsCache {
@@ -366,6 +367,11 @@ mod win {
     /// Locates the current desktop session's `ShellHost.exe` process ID, or `0`.
     pub fn find_shell_host_pid() -> u32 {
         find_process_pid_in_session("ShellHost.exe")
+    }
+
+    /// Locates the current desktop session's `StartMenuExperienceHost.exe` process ID, or `0`.
+    pub fn find_start_menu_pid() -> u32 {
+        find_process_pid_in_session("StartMenuExperienceHost.exe")
     }
 
     /// Checks via a toolhelp module snapshot (works even when UWP PLM has suspended all
@@ -591,6 +597,8 @@ mod win {
         synced_menu_flyout_fallback_colors: Option<(u32, u32)>,
         alt_tab_item_colors: Option<(u32, u32)>,
         synced_alt_tab_item_colors: Option<(u32, u32)>,
+        virtual_desktop_bar_colors: Option<(u32, u32)>,
+        synced_virtual_desktop_bar_colors: Option<(u32, u32)>,
         notify_hwnd_raw: usize,
         notify_msg: u32,
         last_inject_try: Option<Instant>,
@@ -646,6 +654,8 @@ mod win {
                         synced_menu_flyout_fallback_colors: None,
                         alt_tab_item_colors: None,
                         synced_alt_tab_item_colors: None,
+                        virtual_desktop_bar_colors: None,
+                        synced_virtual_desktop_bar_colors: None,
                         notify_hwnd_raw: 0,
                         notify_msg: 0,
                         last_inject_try: None,
@@ -1020,6 +1030,19 @@ mod win {
             });
         }
 
+        pub fn set_virtual_desktop_bar_colors(
+            &mut self,
+            explorer_pid: u32,
+            colors: Option<(u32, u32)>,
+        ) {
+            self.update_style_color_pair(explorer_pid, colors, |st| {
+                (
+                    &mut st.virtual_desktop_bar_colors,
+                    &mut st.synced_virtual_desktop_bar_colors,
+                )
+            });
+        }
+
         pub fn is_circuit_tripped(&self) -> bool {
             self.shared
                 .0
@@ -1037,6 +1060,7 @@ mod win {
                 st.attached_pid = None;
                 st.last_ping_ok = None;
                 st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                 st.synced_osd_fallback_colors = None;
                 st.synced_osd_suppressed = None;
                 st.osd_suppressed = false;
@@ -1106,6 +1130,7 @@ mod win {
                     st.attached_pid = None;
                     st.last_ping_ok = None;
                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                     st.synced_osd_fallback_colors = None;
                     st.synced_osd_suppressed = None;
                     st.osd_bounds = None;
@@ -1124,6 +1149,7 @@ mod win {
                     st.attached_pid = None;
                     st.last_ping_ok = None;
                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                     st.synced_osd_fallback_colors = None;
                     st.synced_osd_suppressed = None;
                     st.osd_bounds = None;
@@ -1314,6 +1340,7 @@ mod win {
                     st.synced_menu_flyout_suppressed = None;
                     st.synced_menu_flyout_fallback_colors = None;
                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                     st.shutdown_done = true;
                 }
                 cleanup_stale_shadow_dlls(&shadow_cache_dir(), None);
@@ -1347,6 +1374,7 @@ mod win {
                                 st.attached_pid = None;
                                 st.last_ping_ok = None;
                                 st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                                 st.synced_osd_fallback_colors = None;
                                 st.synced_osd_suppressed = None;
                                 st.osd_bounds = None;
@@ -1368,6 +1396,7 @@ mod win {
                     st.attached_pid = Some(target_pid);
                     st.last_ping_ok = Some(Instant::now());
                     st.synced_alt_tab_item_colors = None;
+                    st.synced_virtual_desktop_bar_colors = None;
                     st.synced_osd_fallback_colors = None;
                     st.synced_osd_suppressed = None;
                     st.synced_tooltip_fallback_colors = None;
@@ -1411,6 +1440,7 @@ mod win {
                             st.attached_pid = Some(target_pid);
                             st.last_ping_ok = Some(Instant::now());
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.synced_tooltip_fallback_colors = None;
@@ -1452,6 +1482,7 @@ mod win {
                                     st.attached_pid = None;
                                     st.last_ping_ok = None;
                                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                                     st.synced_osd_fallback_colors = None;
                                     st.synced_osd_suppressed = None;
                                     st.osd_bounds = None;
@@ -1491,6 +1522,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1528,6 +1560,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1564,6 +1597,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1601,6 +1635,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1637,6 +1672,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1674,6 +1710,45 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
+                            st.synced_osd_fallback_colors = None;
+                            st.synced_osd_suppressed = None;
+                            st.osd_bounds = None;
+                            st.synced_tooltip_fallback_colors = None;
+                            st.synced_tooltip_suppressed = None;
+                            st.tooltip_bounds = None;
+                            st.synced_menu_flyout_fallback_colors = None;
+                            st.synced_menu_flyout_suppressed = None;
+                            st.menu_flyout_bounds.clear();
+                        }
+                    }
+                }
+            }
+
+            if let Some(pid) = cur_attached {
+                let desired_vdb_colors = lock.lock().ok().and_then(|st| {
+                    (st.desired_hidden
+                        && !st.guard.is_tripped()
+                        && !st.stop_worker
+                        && st.virtual_desktop_bar_colors != st.synced_virtual_desktop_bar_colors)
+                        .then_some(st.virtual_desktop_bar_colors)
+                        .flatten()
+                });
+                if let Some((bg_argb, border_argb)) = desired_vdb_colors {
+                    if send_virtual_desktop_bar_style(pid, bg_argb, border_argb, 250) {
+                        if let Ok(mut st) = lock.lock() {
+                            st.synced_virtual_desktop_bar_colors = Some((bg_argb, border_argb));
+                            st.last_ping_ok = Some(Instant::now());
+                        }
+                    } else {
+                        cur_attached = None;
+                        if let Ok(mut st) = lock.lock() {
+                            if st.attached_pid == Some(pid) {
+                                st.attached_pid = None;
+                                st.last_ping_ok = None;
+                            }
+                            st.synced_alt_tab_item_colors = None;
+                            st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1710,6 +1785,7 @@ mod win {
                                 st.last_ping_ok = None;
                             }
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.osd_bounds = None;
@@ -1772,6 +1848,7 @@ mod win {
                                     st.attached_pid = None;
                                     st.last_ping_ok = None;
                                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                                     st.synced_osd_fallback_colors = None;
                                     st.synced_osd_suppressed = None;
                                     st.synced_tooltip_fallback_colors = None;
@@ -1866,6 +1943,7 @@ mod win {
                                     st.attached_pid = None;
                                     st.last_ping_ok = None;
                                     st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                                     st.synced_osd_fallback_colors = None;
                                     st.synced_osd_suppressed = None;
                                     st.synced_tooltip_fallback_colors = None;
@@ -1983,6 +2061,7 @@ mod win {
                             st.attached_pid = None;
                             st.last_ping_ok = None;
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.synced_tooltip_fallback_colors = None;
@@ -2092,6 +2171,7 @@ mod win {
                             st.attached_pid = None;
                             st.last_ping_ok = None;
                             st.synced_alt_tab_item_colors = None;
+                                st.synced_virtual_desktop_bar_colors = None;
                             st.synced_osd_fallback_colors = None;
                             st.synced_osd_suppressed = None;
                             st.synced_tooltip_fallback_colors = None;
@@ -2375,6 +2455,21 @@ mod win {
         send_style_colors_cmd(
             explorer_pid,
             CMD_SET_MENU_FLYOUT_FALLBACK_STYLE,
+            bg_argb,
+            border_argb,
+            wait_ms,
+        )
+    }
+
+    fn send_virtual_desktop_bar_style(
+        explorer_pid: u32,
+        bg_argb: u32,
+        border_argb: u32,
+        wait_ms: u32,
+    ) -> bool {
+        send_style_colors_cmd(
+            explorer_pid,
+            CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE,
             bg_argb,
             border_argb,
             wait_ms,
@@ -2673,6 +2768,10 @@ mod win {
 
         pub fn new_shell_host() -> Self {
             Self::with_config(r"\\.\pipe\PrettyWindows_ShellHostTap_", false)
+        }
+
+        pub fn new_start_menu() -> Self {
+            Self::with_config(r"\\.\pipe\PrettyWindows_StartMenuTap_", true)
         }
 
         pub fn set_notify_target(&mut self, hwnd: HWND, msg: u32) {
@@ -3846,7 +3945,8 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{
-    find_shell_experience_host_pid, find_shell_host_pid, ShellFlyoutTapClient, TapClient,
+    find_shell_experience_host_pid, find_shell_host_pid, find_start_menu_pid,
+    ShellFlyoutTapClient, TapClient,
 };
 
 #[cfg(test)]

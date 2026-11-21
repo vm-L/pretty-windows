@@ -4,6 +4,11 @@ use super::config::{portable_config_path, Config};
 use super::dsp::NUM_BARS;
 use super::layout::{hit_test_mode, BarLayout, HitZone, BAR_WIDTH_DIP};
 use super::marquee::MarqueeState;
+use super::mini_player::{
+    MiniPlayerPopup, MINI_ACTION_ACTIVATE, MINI_ACTION_NEXT, MINI_ACTION_OPEN_MENU,
+    MINI_ACTION_PLAY_PAUSE, MINI_ACTION_PREV, MINI_ACTION_TOGGLE_MUTE, WM_APP_MINI_PLAYER_ACTION,
+    WM_APP_MINI_PLAYER_CLOSED, WM_APP_MINI_PLAYER_SEEK, WM_APP_MINI_PLAYER_WHEEL,
+};
 use super::popup::{
     SourcePopup, SETTING_CLOSE, SETTING_RESET_POS, SETTING_TOGGLE_AUTO_COLOR, SETTING_TOGGLE_LOCK,
     WM_APP_AUDIO_OUTPUT_CHANGED, WM_APP_POPUP_CLOSED, WM_APP_SETTING_ACTION,
@@ -19,6 +24,7 @@ use super::taskbar::{
     compute_bar_rect, default_bar_x, ensure_above_taskbar, is_fullscreen_active, query_taskbar_state,
     TaskbarState,
 };
+use super::timeline::current_filetime_100ns;
 use super::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
 use crate::color::{
     derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK,
@@ -95,6 +101,8 @@ struct AppState {
     renderer: BarRenderer,
     popup: SourcePopup,
     popup_closed_at: Option<Instant>,
+    mini_player: MiniPlayerPopup,
+    mini_player_closed_at: Option<Instant>,
 
     hover_t: f32,
     target_hover_t: f32,
@@ -119,6 +127,7 @@ struct AppState {
     artist_marquee: MarqueeState,
     anim_timer_running: bool,
     last_anim_tick: Instant,
+    last_progress_draw: Instant,
     dirty: bool,
     arrow_cursor: HCURSOR,
     grab_cursor: HCURSOR,
@@ -164,6 +173,11 @@ impl AppState {
             renderer.d2d_factory.clone(),
             renderer.dwrite_factory.clone(),
         )?;
+        let mini_player = MiniPlayerPopup::new(
+            hwnd,
+            renderer.d2d_factory.clone(),
+            renderer.dwrite_factory.clone(),
+        )?;
 
         let smtc = start_smtc_worker(hwnd, NEUTRAL_BACKDROP_FALLBACK);
         let audio = start_audio_worker();
@@ -196,6 +210,8 @@ impl AppState {
             renderer,
             popup,
             popup_closed_at: None,
+            mini_player,
+            mini_player_closed_at: None,
             hover_t: 0.0,
             target_hover_t: 0.0,
             hover_zone: HitZone::None,
@@ -216,6 +232,7 @@ impl AppState {
             artist_marquee: MarqueeState::default(),
             anim_timer_running: false,
             last_anim_tick: Instant::now(),
+            last_progress_draw: Instant::now(),
             dirty: true,
             arrow_cursor,
             grab_cursor,
@@ -267,6 +284,20 @@ impl AppState {
             .is_some_and(|s| s.status == PlaybackState::Playing)
     }
 
+    fn active_progress(&self) -> Option<f32> {
+        let src = self.active_source()?;
+        let tl = src.timeline?;
+        tl.progress_ratio(current_filetime_100ns(), src.status == PlaybackState::Playing)
+    }
+
+    fn any_popup_visible(&self) -> bool {
+        self.popup.is_visible() || self.mini_player.is_visible()
+    }
+
+    fn any_popup_open(&self) -> bool {
+        self.popup.is_open() || self.mini_player.is_open()
+    }
+
     fn sync_taskbar_geometry(&mut self, force_render: bool) {
         self.sync_taskbar_geometry_with_mode(force_render, None, BarCollisionMode::Passive);
     }
@@ -292,6 +323,9 @@ impl AppState {
             self.hidden_by_guard = true;
             if self.popup.is_visible() {
                 self.popup.hide();
+            }
+            if self.mini_player.is_visible() {
+                self.mini_player.hide();
             }
             self.clear_vol_hud();
             self.set_bar_visible(false);
@@ -346,6 +380,7 @@ impl AppState {
             self.render_now();
         }
         self.popup.ensure_topmost();
+        self.mini_player.ensure_topmost();
     }
 
     fn set_bar_visible(&mut self, show: bool) {
@@ -404,6 +439,10 @@ impl AppState {
                 self.active_id.clone(),
             );
         }
+        if self.mini_player.is_visible() {
+            self.mini_player
+                .update_live_source(self.active_source().cloned());
+        }
         self.sync_marquee();
         self.dirty = true;
         self.render_now();
@@ -435,6 +474,7 @@ impl AppState {
             master_volume: self.master_vol,
             master_muted: self.master_muted,
             popup_open: false,
+            progress: None,
             bar_levels: &self.last_bars,
             title_marquee: &mut self.title_marquee,
             artist_marquee: &mut self.artist_marquee,
@@ -496,7 +536,8 @@ impl AppState {
         if !self.visible || self.hidden_by_guard {
             return;
         }
-        let popup_open = self.popup.is_visible();
+        let popup_open = self.any_popup_visible();
+        let progress = self.active_progress();
         let (is_idle, is_playing, title, artist, cover, accent) = self.frame_metadata();
         let mut frame = RenderFrame {
             hwnd: self.hwnd,
@@ -521,11 +562,13 @@ impl AppState {
             master_volume: self.master_vol,
             master_muted: self.master_muted,
             popup_open,
+            progress,
             bar_levels: &self.last_bars,
             title_marquee: &mut self.title_marquee,
             artist_marquee: &mut self.artist_marquee,
         };
         let _ = self.renderer.render(&mut frame);
+        self.last_progress_draw = Instant::now();
         self.dirty = false;
     }
 
@@ -536,9 +579,13 @@ impl AppState {
         let hover_animating = (self.hover_t - self.target_hover_t).abs() > 0.004;
         let is_playing = self.is_playing();
         let audio_animating = is_playing || self.audio.is_decaying_or_active();
-        let marquee_animating =
-            self.title_marquee.is_active(is_playing) || self.artist_marquee.is_active(is_playing);
-        hover_animating || audio_animating || marquee_animating
+        let marquee_animating = self.title_marquee.is_active() || self.artist_marquee.is_active();
+        let progress_animating = is_playing
+            && self
+                .active_source()
+                .and_then(|s| s.timeline)
+                .is_some_and(|tl| tl.is_valid());
+        hover_animating || audio_animating || marquee_animating || progress_animating
     }
 
     fn update_anim_timer(&mut self) {
@@ -580,15 +627,26 @@ impl AppState {
             .any(|(&a, &b)| (a - b).abs() > 0.003);
         if bars_changed {
             self.last_bars = bars;
+            if self.mini_player.is_visible() {
+                self.mini_player.update_bars(&self.last_bars);
+            }
             need_draw = true;
         }
 
-        // 3. Marquee scrolling
+        // 3. Marquee scrolling & taskbar hairline progress tick
         let is_playing = self.is_playing();
-        if self.title_marquee.tick(dt, is_playing) {
+        if self.title_marquee.tick(dt) {
             need_draw = true;
         }
-        if self.artist_marquee.tick(dt, is_playing) {
+        if self.artist_marquee.tick(dt) {
+            need_draw = true;
+        }
+        if !need_draw
+            && is_playing
+            && !self.vol_hud_active
+            && self.last_progress_draw.elapsed() >= Duration::from_millis(200)
+            && self.active_progress().is_some()
+        {
             need_draw = true;
         }
 
@@ -694,8 +752,49 @@ impl AppState {
         self.dirty = true;
     }
 
+    fn refresh_master_volume_state(&mut self) {
+        if self.master_vol_ctrl.is_none() {
+            self.master_vol_ctrl = MasterVolumeControl::open_default();
+        }
+        if let Some((vol, muted)) = self
+            .master_vol_ctrl
+            .as_ref()
+            .and_then(|c| c.get_state())
+        {
+            self.master_vol = vol;
+            self.master_muted = muted;
+        }
+    }
+
+    fn apply_mini_player_wheel(&mut self, wheel_delta: i16) {
+        self.refresh_master_volume_state();
+        let base_muted = self.master_muted;
+        let (next_vol, next_muted) =
+            step_volume_by_wheel(self.master_vol, base_muted, wheel_delta);
+        self.master_vol = next_vol;
+        self.master_muted = next_muted;
+        if let Some(ref ctrl) = self.master_vol_ctrl {
+            let _ = ctrl.set_volume(next_vol);
+            if base_muted != next_muted {
+                let _ = ctrl.set_mute(next_muted);
+            }
+        }
+        self.mini_player.update_volume(next_vol, next_muted, true);
+    }
+
+    fn toggle_mini_player_mute(&mut self) {
+        self.refresh_master_volume_state();
+        let next_muted = !self.master_muted;
+        self.master_muted = next_muted;
+        if let Some(ref ctrl) = self.master_vol_ctrl {
+            let _ = ctrl.set_mute(next_muted);
+        }
+        self.mini_player
+            .update_volume(self.master_vol, next_muted, true);
+    }
+
     fn sync_hover_with_cursor(&mut self) {
-        if !self.visible || self.hidden_by_guard || self.popup.is_visible() {
+        if !self.visible || self.hidden_by_guard || self.any_popup_visible() {
             return;
         }
         let mut pt = POINT::default();
@@ -763,10 +862,60 @@ impl AppState {
         }
     }
 
+    fn show_mini_player(&mut self) {
+        if self.vol_hud_active {
+            self.clear_vol_hud();
+            self.render_now();
+        }
+        if self.popup.is_visible() {
+            self.popup.hide();
+        }
+        if self.mini_player.is_open() {
+            self.mini_player.hide_animated();
+            return;
+        }
+        if self.mini_player.is_closing_recently() {
+            return;
+        }
+        if let Some(closed_at) = self.mini_player_closed_at.take() {
+            if closed_at.elapsed() < Duration::from_millis(POPUP_REOPEN_DEBOUNCE_MS) {
+                return;
+            }
+        }
+        self.refresh_master_volume_state();
+        self.hover_t = 1.0;
+        self.target_hover_t = 1.0;
+        let layout = self.current_layout();
+        let anchor = RECT {
+            left: self.win_x + layout.bg_rect.left.round() as i32,
+            top: self.win_y,
+            right: self.win_x + layout.bg_rect.right.round() as i32,
+            bottom: self.win_y + self.win_h,
+        };
+        let active_src = self.active_source().cloned();
+        self.mini_player.show(
+            anchor,
+            self.dpi,
+            self.light_taskbar,
+            self.backdrop_rgb,
+            self.config.auto_color,
+            active_src,
+            &self.last_bars,
+            self.master_vol,
+            self.master_muted,
+        );
+        self.dirty = true;
+        self.render_now();
+        self.mini_player.ensure_topmost();
+    }
+
     fn show_source_popup(&mut self, click_screen_x: i32) {
         if self.vol_hud_active {
             self.clear_vol_hud();
             self.render_now();
+        }
+        if self.mini_player.is_visible() {
+            self.mini_player.hide();
         }
         if self.popup.is_open() {
             self.popup.hide_animated();
@@ -921,6 +1070,7 @@ unsafe extern "system" fn main_wnd_proc(
         let _ = KillTimer(hwnd, TIMER_ANIM_ID);
         if let Ok(mut state) = rc.try_borrow_mut() {
             state.popup.hide();
+            state.mini_player.hide();
             state.audio.shutdown();
             state.smtc.send(SmtcCommand::Shutdown);
         }
@@ -973,7 +1123,7 @@ unsafe extern "system" fn main_wnd_proc(
             let wheel_delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             if wheel_delta != 0 {
                 if let Ok(mut state) = rc.try_borrow_mut() {
-                    if state.visible && !state.hidden_by_guard && !state.popup.is_open() {
+                    if state.visible && !state.hidden_by_guard && !state.any_popup_open() {
                         state.apply_master_wheel(wheel_delta);
                     }
                 }
@@ -1004,6 +1154,86 @@ unsafe extern "system" fn main_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_APP_MINI_PLAYER_CLOSED => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.mini_player_closed_at = Some(Instant::now());
+                state.dirty = true;
+                state.sync_hover_with_cursor();
+                if state.dirty {
+                    state.render_now();
+                }
+                state.update_anim_timer();
+            }
+            LRESULT(0)
+        }
+        WM_APP_MINI_PLAYER_ACTION => {
+            let mut open_menu = false;
+            let mut activate_target: Option<(String, Option<u32>)> = None;
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                match wparam.0 {
+                    MINI_ACTION_PREV => {
+                        if let Some(id) = state.active_id.clone() {
+                            state.smtc.send(SmtcCommand::Previous(id));
+                        }
+                    }
+                    MINI_ACTION_PLAY_PAUSE => {
+                        if let Some(id) = state.active_id.clone() {
+                            state.smtc.send(SmtcCommand::TogglePlayPause(id));
+                        }
+                    }
+                    MINI_ACTION_NEXT => {
+                        if let Some(id) = state.active_id.clone() {
+                            state.smtc.send(SmtcCommand::Next(id));
+                        }
+                    }
+                    MINI_ACTION_TOGGLE_MUTE => {
+                        state.toggle_mini_player_mute();
+                    }
+                    MINI_ACTION_ACTIVATE => {
+                        activate_target = state
+                            .active_source()
+                            .map(|s| (s.id.clone(), s.pid));
+                    }
+                    MINI_ACTION_OPEN_MENU => {
+                        state.mini_player.hide();
+                        state.popup_closed_at = None;
+                        open_menu = true;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some((id, pid)) = activate_target {
+                let raw_id = id.split('#').next().unwrap_or(&id);
+                activate_player_window(raw_id, pid);
+            }
+            if open_menu {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    state.show_source_popup(pt.x);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_MINI_PLAYER_SEEK => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                if let (Some(id), Some(target_100ns)) =
+                    (state.active_id.clone(), state.mini_player.take_pending_seek())
+                {
+                    state.smtc.send(SmtcCommand::Seek(id, target_100ns));
+                }
+            }
+            LRESULT(0)
+        }
+        WM_APP_MINI_PLAYER_WHEEL => {
+            let wheel_delta = wparam.0 as isize as i16;
+            if wheel_delta != 0 {
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    state.apply_mini_player_wheel(wheel_delta);
+                }
+            }
+            LRESULT(0)
+        }
         WM_APP_SOURCE_SELECTED => {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 if wparam.0 == usize::MAX {
@@ -1024,6 +1254,7 @@ unsafe extern "system" fn main_wnd_proc(
                         state.sync_shared_accent();
                         let auto_color = state.config.auto_color;
                         state.popup.set_auto_color(auto_color);
+                        state.mini_player.set_auto_color(auto_color);
                         state.dirty = true;
                         state.render_now();
                     }
@@ -1047,6 +1278,7 @@ unsafe extern "system" fn main_wnd_proc(
                     if let Ok(mut state) = rc.try_borrow_mut() {
                         if state.config.offset_x != 0 {
                             state.popup.hide();
+                            state.mini_player.hide();
                         }
                         state.config.offset_x = 0;
                         state.save_config();
@@ -1083,6 +1315,7 @@ unsafe extern "system" fn main_wnd_proc(
                 state.refresh_backdrop_sample();
                 let bg = state.backdrop_rgb;
                 state.popup.set_system_theme(light, bg);
+                state.mini_player.set_system_theme(light, bg);
                 state.dirty = true;
                 state.sync_taskbar_geometry(true);
                 if msg == WM_DPICHANGED {
@@ -1108,6 +1341,7 @@ unsafe extern "system" fn main_wnd_proc(
                         state.refresh_backdrop_sample();
                         let bg = state.backdrop_rgb;
                         state.popup.set_system_theme(light, bg);
+                        state.mini_player.set_system_theme(light, bg);
                         state.dirty = true;
                     }
                     state.sync_taskbar_geometry(false);
@@ -1218,7 +1452,7 @@ unsafe extern "system" fn main_wnd_proc(
                     }
                     state.hover_zone = HitZone::None;
                     state.pressed_zone = HitZone::None;
-                    state.target_hover_t = if state.popup.is_visible() { 1.0 } else { 0.0 };
+                    state.target_hover_t = if state.any_popup_visible() { 1.0 } else { 0.0 };
                     state.dirty = true;
                     state.render_now();
                     state.update_anim_timer();
@@ -1378,10 +1612,8 @@ unsafe extern "system" fn main_wnd_proc(
                 return LRESULT(0);
             }
             if open_popup {
-                let mut pt = POINT::default();
-                let _ = GetCursorPos(&mut pt);
                 if let Ok(mut state) = rc.try_borrow_mut() {
-                    state.show_source_popup(pt.x);
+                    state.show_mini_player();
                 }
             }
             LRESULT(0)

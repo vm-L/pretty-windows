@@ -2033,6 +2033,53 @@ pub fn find_visible_shell_host_windows(
     out
 }
 
+/// Enumerates visible uncloaked `CoreWindow` and secondary `Xaml_WindowedPopupClass` windows
+/// owned by `start_menu_pid` (`StartMenuExperienceHost.exe`, Start Menu + Companion + Power/Context menus).
+/// Returns `(hwnd, rect, dpi, tid, is_popup)`.
+pub fn find_visible_start_menu_windows(
+    start_menu_pid: u32,
+) -> Vec<(HWND, RECT, u32, u32, bool)> {
+    if start_menu_pid == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut prev = HWND::default();
+    for _ in 0..64 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev, w!("Windows.UI.Core.CoreWindow"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev {
+            break;
+        }
+        prev = hwnd;
+        if let Some((rect, dpi, tid)) =
+            inspect_visible_explorer_window(hwnd, start_menu_pid, 64, 28)
+        {
+            out.push((hwnd, rect, dpi, tid, false));
+        }
+    }
+    let mut prev_popup = HWND::default();
+    for _ in 0..128 {
+        let Ok(hwnd) =
+            (unsafe { FindWindowExW(None, prev_popup, w!("Xaml_WindowedPopupClass"), None) })
+        else {
+            break;
+        };
+        if hwnd.is_invalid() || hwnd == prev_popup {
+            break;
+        }
+        prev_popup = hwnd;
+        if let Some((rect, dpi, tid)) =
+            inspect_visible_explorer_window(hwnd, start_menu_pid, 64, 28)
+        {
+            out.push((hwnd, rect, dpi, tid, true));
+        }
+    }
+    out
+}
+
 unsafe fn xaml_island_screen_origin(hwnd: HWND) -> Option<[i32; 2]> {
     if hwnd.is_invalid() {
         return None;

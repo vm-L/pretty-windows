@@ -1,4 +1,4 @@
-/// Seamless looping marquee state machine with initial pause and hover/play awareness.
+/// Seamless looping marquee state machine with initial pause.
 #[derive(Clone, Debug)]
 pub struct MarqueeState {
     text: String,
@@ -66,13 +66,14 @@ impl MarqueeState {
 
     /// Whether a high-frequency animation timer should stay alive for this marquee.
     #[inline]
-    pub fn is_active(&self, is_playing: bool) -> bool {
-        is_playing && self.is_overflowing()
+    pub fn is_active(&self) -> bool {
+        self.is_overflowing()
     }
 
-    /// Advances the marquee state by `dt_secs`. Returns `true` if the visible offset changed.
-    pub fn tick(&mut self, dt_secs: f32, is_playing: bool) -> bool {
-        if !is_playing || !self.is_overflowing() || dt_secs <= 0.0 {
+    /// Advances the marquee state by `dt_secs` regardless of playback state.
+    /// Returns `true` if the visible offset changed.
+    pub fn tick(&mut self, dt_secs: f32) -> bool {
+        if !self.is_overflowing() || dt_secs <= 0.0 {
             return false;
         }
 
@@ -126,7 +127,8 @@ mod tests {
         let mut m = MarqueeState::new(120.0);
         m.set_text("Short Title", 80.0);
         assert!(!m.is_overflowing());
-        assert!(!m.tick(5.0, true));
+        assert!(!m.is_active());
+        assert!(!m.tick(5.0));
         assert_eq!(m.render_offsets(), (0.0, None));
     }
 
@@ -135,29 +137,25 @@ mod tests {
         let mut m = MarqueeState::new(100.0);
         m.set_text("A Very Long Track Name For Testing", 180.0);
         assert!(m.is_overflowing());
+        assert!(m.is_active());
 
         // Stays still during 2.5s initial pause
-        assert!(!m.tick(1.5, true));
+        assert!(!m.tick(1.5));
         assert_eq!(m.offset(), 0.0);
 
-        // Advances after 2.5s
-        assert!(m.tick(1.5, true)); // 0.5s past pause -> 14 DIP
+        // Advances after 2.5s regardless of playback state
+        assert!(m.tick(1.5)); // 0.5s past pause -> 14 DIP
         assert!((m.offset() - 14.0).abs() < 0.1);
 
-        // Freezes when paused
-        let frozen = m.offset();
-        assert!(!m.tick(1.0, false));
-        assert_eq!(m.offset(), frozen);
-
         // Scrolls until wrap copy enters viewport
-        m.tick(3.5, true); // +98 DIP -> 112 DIP; second copy at 180 + 34 - 112 = 102 > 100
-        m.tick(0.5, true); // +14 DIP -> 126 DIP; second copy at 214 - 126 = 88 < 100
+        m.tick(3.5); // +98 DIP -> 112 DIP; second copy at 180 + 34 - 112 = 102 > 100
+        m.tick(0.5); // +14 DIP -> 126 DIP; second copy at 214 - 126 = 88 < 100
         let (x1, x2) = m.render_offsets();
         assert!(x1 < 0.0);
         assert!(x2.is_some());
 
         // Completes cycle and resets to pause at 0
-        m.tick(5.0, true);
+        m.tick(5.0);
         assert_eq!(m.offset(), 0.0);
     }
 }
