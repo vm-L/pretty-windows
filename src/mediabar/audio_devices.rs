@@ -52,6 +52,24 @@ struct PolicyConfigVtbl {
     _pad14: usize,
 }
 
+/// Vista-era `IPolicyConfigVista` lacks `ResetDeviceFormat` (slot 5), placing `SetDefaultEndpoint` at slot 12.
+#[repr(C)]
+struct PolicyConfigVistaVtbl {
+    base: windows::core::IUnknown_Vtbl,
+    _pad3: usize,
+    _pad4: usize,
+    _pad5: usize,
+    _pad6: usize,
+    _pad7: usize,
+    _pad8: usize,
+    _pad9: usize,
+    _pad10: usize,
+    _pad11: usize,
+    set_default_endpoint:
+        unsafe extern "system" fn(this: *mut c_void, device_id: PCWSTR, role: ERole) -> HRESULT,
+    _pad13: usize,
+}
+
 struct OwnedPolicyConfig(*mut c_void);
 
 impl Drop for OwnedPolicyConfig {
@@ -95,8 +113,8 @@ pub fn enumerate_audio_endpoints(capture: bool) -> Vec<AudioEndpointItem> {
 
         let flow = if capture { eCapture } else { eRender };
         let default_id = enumerator
-            .GetDefaultAudioEndpoint(flow, eMultimedia)
-            .or_else(|_| enumerator.GetDefaultAudioEndpoint(flow, eConsole))
+            .GetDefaultAudioEndpoint(flow, eConsole)
+            .or_else(|_| enumerator.GetDefaultAudioEndpoint(flow, eMultimedia))
             .ok()
             .and_then(|dev| dev.GetId().ok())
             .map(|p| take_pwstr(p))
@@ -164,12 +182,14 @@ pub fn set_default_audio_endpoint(device_id: &str) -> bool {
         };
 
         let mut policy_ptr: *mut c_void = std::ptr::null_mut();
+        let mut is_vista = false;
         let mut hr = (client.vtable().QueryInterface)(
             client.as_raw(),
             &IID_IPOLICY_CONFIG,
             &mut policy_ptr,
         );
         if hr.is_err() || policy_ptr.is_null() {
+            is_vista = true;
             hr = (client.vtable().QueryInterface)(
                 client.as_raw(),
                 &IID_IPOLICY_CONFIG_VISTA,
@@ -181,14 +201,23 @@ pub fn set_default_audio_endpoint(device_id: &str) -> bool {
         }
 
         let _policy = OwnedPolicyConfig(policy_ptr);
-        let vtbl = *(policy_ptr as *const *const PolicyConfigVtbl);
         let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
         let pcw = PCWSTR(wide.as_ptr());
 
         let mut any_ok = false;
-        for role in [eConsole, eMultimedia, eCommunications] {
-            if ((*vtbl).set_default_endpoint)(policy_ptr, pcw, role).is_ok() {
-                any_ok = true;
+        if is_vista {
+            let vtbl = *(policy_ptr as *const *const PolicyConfigVistaVtbl);
+            for role in [eConsole, eMultimedia, eCommunications] {
+                if ((*vtbl).set_default_endpoint)(policy_ptr, pcw, role).is_ok() {
+                    any_ok = true;
+                }
+            }
+        } else {
+            let vtbl = *(policy_ptr as *const *const PolicyConfigVtbl);
+            for role in [eConsole, eMultimedia, eCommunications] {
+                if ((*vtbl).set_default_endpoint)(policy_ptr, pcw, role).is_ok() {
+                    any_ok = true;
+                }
             }
         }
         any_ok

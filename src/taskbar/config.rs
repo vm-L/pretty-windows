@@ -101,6 +101,7 @@ pub struct TaskbarConfig {
 impl TaskbarConfig {
     /// Parses configuration from TOML-formatted text, falling back to `LiquidGlass` for unknown values.
     pub fn parse(content: &str) -> Self {
+        let content = content.trim_start_matches('\u{feff}');
         let mut cfg = Self::default();
         for raw_line in content.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -137,10 +138,10 @@ impl TaskbarConfig {
         }
     }
 
-    /// Saves configuration to disk next to the executable.
+    /// Saves configuration atomically to disk next to the executable.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
-        fs::write(path, self.serialize())
+        crate::system::atomic_write_string(path, &self.serialize())
     }
 }
 
@@ -202,6 +203,13 @@ mod tests {
         assert_eq!(
             TaskbarConfig::load_from_path(Path::new("/nonexistent/Taskbar_missing.toml")),
             TaskbarConfig::default()
+        );
+        let bom_toml = "\u{feff}# BOM\nstyle = \"acrylic\"\n";
+        assert_eq!(
+            TaskbarConfig::parse(bom_toml),
+            TaskbarConfig {
+                style: TaskbarStyle::Acrylic
+            }
         );
     }
 }

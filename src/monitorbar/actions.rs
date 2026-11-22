@@ -5,12 +5,15 @@ use super::config::LeftClickAction;
 #[cfg(windows)]
 use std::mem::size_of;
 #[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
 use windows::core::{w, HSTRING, PCWSTR};
 #[cfg(windows)]
 use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_NODEREFERENCELINKS,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -30,13 +33,25 @@ pub fn open_shell_target(target: &str) -> bool {
         return false;
     }
     let wide_target = HSTRING::from(trimmed);
+    let target_path = Path::new(trimmed);
+    let wide_dir = if target_path.is_file() {
+        target_path
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(HSTRING::from)
+    } else {
+        None
+    };
+    let dir_ptr = wide_dir
+        .as_ref()
+        .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
     let ret = unsafe {
         ShellExecuteW(
             None,
             w!("open"),
             PCWSTR(wide_target.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            dir_ptr,
             SW_SHOWNORMAL,
         )
     };
@@ -98,7 +113,7 @@ pub fn pick_custom_app_file(owner: HWND, current_path: &str) -> Option<String> {
         lpstrFile: windows::core::PWSTR(file_buf.as_mut_ptr()),
         nMaxFile: file_buf.len() as u32,
         lpstrTitle: PCWSTR(title_utf16.as_ptr()),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_NODEREFERENCELINKS,
         ..Default::default()
     };
 

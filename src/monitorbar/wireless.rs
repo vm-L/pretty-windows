@@ -2,7 +2,9 @@
 
 #[cfg(windows)]
 use super::actions::open_shell_target;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+#[cfg(windows)]
+use std::collections::HashSet;
 #[cfg(windows)]
 use std::sync::mpsc::{self, Receiver, Sender};
 #[cfg(windows)]
@@ -149,36 +151,42 @@ pub fn dedup_and_sort_wifi(raw: Vec<WifiNetworkItem>) -> Vec<WifiNetworkItem> {
     list
 }
 
-/// Merges Classic BR/EDR and BLE paired device lists without duplicate dual-mode entries.
+/// Merges Classic BR/EDR and BLE paired device lists without duplicate dual-mode entries
+/// while preserving distinct physical devices that share the same display name.
 pub fn dedup_and_sort_bluetooth(
     classic: Vec<BluetoothDeviceItem>,
     ble: Vec<BluetoothDeviceItem>,
 ) -> Vec<BluetoothDeviceItem> {
     let mut result: Vec<BluetoothDeviceItem> = Vec::new();
-    let mut seen_addrs: HashSet<u64> = HashSet::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
 
-    for mut item in classic.into_iter().chain(ble.into_iter()) {
+    for mut item in classic.into_iter().chain(ble) {
         item.name = item.name.trim().to_string();
         if item.name.is_empty() {
             continue;
         }
         let name_key = item.name.to_lowercase();
-        let dup_addr = item.address != 0 && seen_addrs.contains(&item.address);
-        let dup_name = seen_names.contains(&name_key);
-        if dup_addr || dup_name {
-            if let Some(existing) = result.iter_mut().find(|e| {
-                (item.address != 0 && e.address == item.address)
-                    || e.name.to_lowercase() == name_key
-            }) {
-                existing.is_connected |= item.is_connected;
+        let existing_idx = if item.address != 0 {
+            result
+                .iter()
+                .position(|e| e.address == item.address)
+                .or_else(|| {
+                    result
+                        .iter()
+                        .position(|e| e.address == 0 && e.name.to_lowercase() == name_key)
+                })
+        } else {
+            result
+                .iter()
+                .position(|e| e.name.to_lowercase() == name_key)
+        };
+        if let Some(idx) = existing_idx {
+            let existing = &mut result[idx];
+            if existing.address == 0 && item.address != 0 {
+                existing.address = item.address;
             }
+            existing.is_connected |= item.is_connected;
             continue;
         }
-        if item.address != 0 {
-            seen_addrs.insert(item.address);
-        }
-        seen_names.insert(name_key);
         result.push(item);
     }
 
@@ -190,7 +198,8 @@ pub fn dedup_and_sort_bluetooth(
     result
 }
 
-#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 enum WirelessCmd {
     Refresh,
     ScanAndRefresh,
@@ -199,6 +208,46 @@ enum WirelessCmd {
     SetBluetoothEnabled(bool),
     ToggleBluetoothDevice(BluetoothDeviceItem),
     Shutdown,
+}
+
+/// Preserves strict FIFO order for state-changing wireless commands while coalescing redundant
+/// refreshes and short-circuiting immediately if `Shutdown` was queued.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn coalesce_wireless_batch(
+    first: WirelessCmd,
+    rest: impl IntoIterator<Item = WirelessCmd>,
+) -> (Vec<WirelessCmd>, bool) {
+    let mut ordered = Vec::new();
+    let mut pending_scan_refresh: Option<bool> = None;
+
+    for item in std::iter::once(first).chain(rest) {
+        match item {
+            WirelessCmd::Shutdown => return (Vec::new(), true),
+            WirelessCmd::Refresh => {
+                if pending_scan_refresh.is_none() {
+                    pending_scan_refresh = Some(false);
+                }
+            }
+            WirelessCmd::ScanAndRefresh => {
+                pending_scan_refresh = Some(true);
+            }
+            other => {
+                // Any state change triggers its own refresh afterward; clear earlier queued
+                // refreshes only if superseded or keep strict FIFO order.
+                pending_scan_refresh = None;
+                ordered.push(other);
+            }
+        }
+    }
+
+    if let Some(scan) = pending_scan_refresh {
+        ordered.push(if scan {
+            WirelessCmd::ScanAndRefresh
+        } else {
+            WirelessCmd::Refresh
+        });
+    }
+    (ordered, false)
 }
 
 /// Handle owning the MTA background worker communicating with WinRT Radios & Win32 WLAN/Bluetooth APIs.
@@ -300,29 +349,17 @@ fn wireless_worker_loop(
     };
 
     while let Ok(cmd) = rx.recv() {
-        // Coalesce back-to-back refresh requests cleanly.
-        let mut coalesced = cmd;
+        let mut rest = Vec::new();
         while let Ok(next_cmd) = rx.try_recv() {
-            match next_cmd {
-                WirelessCmd::Shutdown => {
-                    coalesced = WirelessCmd::Shutdown;
-                    break;
-                }
-                WirelessCmd::Refresh | WirelessCmd::ScanAndRefresh
-                    if matches!(coalesced, WirelessCmd::Refresh) =>
-                {
-                    coalesced = next_cmd;
-                }
-                other => {
-                    execute_cmd(other, hwnd_raw, notify_msg, &snapshot, &notify);
-                }
-            }
+            rest.push(next_cmd);
         }
-
-        if matches!(coalesced, WirelessCmd::Shutdown) {
+        let (ordered_cmds, shutdown) = coalesce_wireless_batch(cmd, rest);
+        if shutdown {
             break;
         }
-        execute_cmd(coalesced, hwnd_raw, notify_msg, &snapshot, &notify);
+        for queued_cmd in ordered_cmds {
+            execute_cmd(queued_cmd, hwnd_raw, notify_msg, &snapshot, &notify);
+        }
     }
 
     if need_uninit {
@@ -397,13 +434,13 @@ fn execute_cmd(
             notify(hwnd_raw, notify_msg);
         }
         WirelessCmd::ToggleBluetoothDevice(item) => {
-            if item.kind != BtDeviceKind::Classic || item.address == 0 {
+            if item.kind != BtDeviceKind::Classic || item.address == 0 || item.is_connected {
                 open_shell_target("ms-settings:bluetooth");
                 return;
             }
             set_busy(snapshot, None, Some(true));
             notify(hwnd_raw, notify_msg);
-            let ok = toggle_classic_bt_device(item.address, !item.is_connected);
+            let ok = connect_classic_bt_device(item.address);
             thread::sleep(Duration::from_millis(600));
             refresh_into(snapshot);
             set_busy(snapshot, None, Some(false));
@@ -904,7 +941,7 @@ fn enumerate_ble_bt_devices() -> Vec<BluetoothDeviceItem> {
 }
 
 #[cfg(windows)]
-fn toggle_classic_bt_device(target_addr: u64, connect: bool) -> bool {
+fn connect_classic_bt_device(target_addr: u64) -> bool {
     const STANDARD_PROFILE_GUIDS: [GUID; 4] = [
         // AudioSink (A2DP)
         GUID::from_u128(0x0000110b_0000_1000_8000_00805f9b34fb),
@@ -973,10 +1010,9 @@ fn toggle_classic_bt_device(target_addr: u64, connect: bool) -> bool {
             STANDARD_PROFILE_GUIDS.to_vec()
         };
 
-        let flag = if connect { 1u32 } else { 0u32 };
         let mut any_ok = false;
         for guid in &guids_to_apply {
-            if BluetoothSetServiceState(hradio, &dev_info, guid, flag) == 0 {
+            if BluetoothSetServiceState(hradio, &dev_info, guid, 1u32) == 0 {
                 any_ok = true;
             }
         }
@@ -1113,5 +1149,66 @@ mod tests {
         assert_eq!(merged[0].name, "Sony WH-1000XM5");
         assert!(merged[0].is_connected);
         assert_eq!(merged[0].kind, BtDeviceKind::Classic);
+    }
+
+    #[test]
+    fn wireless_batch_preserves_fifo_order_and_respects_shutdown() {
+        let (ordered, shutdown) = coalesce_wireless_batch(
+            WirelessCmd::SetWifiEnabled(true),
+            [WirelessCmd::SetWifiEnabled(false)],
+        );
+        assert!(!shutdown);
+        assert_eq!(
+            ordered,
+            vec![
+                WirelessCmd::SetWifiEnabled(true),
+                WirelessCmd::SetWifiEnabled(false),
+            ]
+        );
+
+        let (ordered_sd, shutdown_sd) = coalesce_wireless_batch(
+            WirelessCmd::Refresh,
+            [WirelessCmd::SetWifiEnabled(true), WirelessCmd::Shutdown],
+        );
+        assert!(shutdown_sd);
+        assert!(ordered_sd.is_empty());
+
+        let (ordered_scan, shutdown_scan) = coalesce_wireless_batch(
+            WirelessCmd::ScanAndRefresh,
+            [WirelessCmd::Refresh, WirelessCmd::Refresh],
+        );
+        assert!(!shutdown_scan);
+        assert_eq!(ordered_scan, vec![WirelessCmd::ScanAndRefresh]);
+    }
+
+    #[test]
+    fn bluetooth_dedup_keeps_same_name_devices_with_distinct_mac_addresses() {
+        let classic = vec![
+            BluetoothDeviceItem {
+                name: "AirPods Pro".to_string(),
+                address: 0x112233445566,
+                device_id: String::new(),
+                kind: BtDeviceKind::Classic,
+                is_connected: true,
+            },
+            BluetoothDeviceItem {
+                name: "AirPods Pro".to_string(),
+                address: 0xaabbccddeeff,
+                device_id: String::new(),
+                kind: BtDeviceKind::Classic,
+                is_connected: false,
+            },
+        ];
+        let ble = vec![BluetoothDeviceItem {
+            name: "AirPods Pro".to_string(),
+            address: 0,
+            device_id: "BluetoothLE#zero".to_string(),
+            kind: BtDeviceKind::Ble,
+            is_connected: false,
+        }];
+        let merged = dedup_and_sort_bluetooth(classic, ble);
+        assert_eq!(merged.len(), 2, "distinct physical MACs must not collapse");
+        assert_eq!(merged[0].address, 0x112233445566);
+        assert_eq!(merged[1].address, 0xaabbccddeeff);
     }
 }

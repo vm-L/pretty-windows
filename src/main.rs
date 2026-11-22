@@ -15,12 +15,16 @@ fn main() {
     use windows::Win32::System::Com::{
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
     };
+    use windows::Win32::System::LibraryLoader::{
+        SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
 
     unsafe {
+        let _ = SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32);
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let Ok(mutex) = CreateMutexW(None, false, w!("Local\\PrettyWindows_SingleInstance_Mutex"))
@@ -32,9 +36,11 @@ fn main() {
             return;
         }
 
-        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let com_ok = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
         let _ = tray::run();
-        CoUninitialize();
+        if com_ok {
+            CoUninitialize();
+        }
         let _ = CloseHandle(mutex);
     }
 }

@@ -5,12 +5,13 @@ use super::smtc::MediaCover;
 use super::volume::format_volume_pct;
 use crate::color::Rgb;
 use crate::ui::glass::{
-    create_round_cap_stroke, d2d_color_rgb, d2d_rect, identity_matrix, LayeredSurface,
+    create_dc_render_target, create_round_cap_stroke, d2d_color_rgb, d2d_rect, identity_matrix,
+    LayeredSurface,
 };
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use windows::core::{w, Interface};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::core::w;
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
     D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP,
@@ -22,9 +23,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ARC_SIZE_SMALL, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP,
     D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT, D2D1_SWEEP_DIRECTION_CLOCKWISE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout, DWRITE_FONT_STRETCH_NORMAL,
@@ -249,9 +248,11 @@ pub struct RenderFrame<'a> {
 pub struct BarRenderer {
     pub d2d_factory: ID2D1Factory1,
     pub dwrite_factory: IDWriteFactory,
+    // Declare RT-owned resources and `rt` before `surface` so `rt` releases before `DeleteDC`.
+    cached_cover: Option<CachedBitmap>,
+    layer: ID2D1Layer,
     rt: ID2D1DCRenderTarget,
     surface: LayeredSurface,
-    layer: ID2D1Layer,
     round_stroke: Option<ID2D1StrokeStyle>,
     font_scale_key: u32,
     title_fmt: Option<IDWriteTextFormat>,
@@ -260,7 +261,6 @@ pub struct BarRenderer {
     pct_fmt: Option<IDWriteTextFormat>,
     cached_title: Option<CachedText>,
     cached_artist: Option<CachedText>,
-    cached_cover: Option<CachedBitmap>,
 }
 
 impl BarRenderer {
@@ -269,18 +269,7 @@ impl BarRenderer {
         dwrite_factory: IDWriteFactory,
     ) -> windows::core::Result<Self> {
         unsafe {
-            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: Default::default(),
-            };
-            let rt = d2d_factory.CreateDCRenderTarget(&rt_props)?;
+            let rt = create_dc_render_target(&d2d_factory)?;
             let layer = rt.CreateLayer(None)?;
             let surface = LayeredSurface::new()?;
             let round_stroke = create_round_cap_stroke(&d2d_factory);
@@ -288,9 +277,10 @@ impl BarRenderer {
             Ok(Self {
                 d2d_factory,
                 dwrite_factory,
+                cached_cover: None,
+                layer,
                 rt,
                 surface,
-                layer,
                 round_stroke,
                 font_scale_key: 0,
                 title_fmt: None,
@@ -299,9 +289,17 @@ impl BarRenderer {
                 pct_fmt: None,
                 cached_title: None,
                 cached_artist: None,
-                cached_cover: None,
             })
         }
+    }
+
+    fn recreate_render_target(&mut self) -> windows::core::Result<()> {
+        self.cached_cover = None;
+        let new_rt = create_dc_render_target(&self.d2d_factory)?;
+        let new_layer = unsafe { new_rt.CreateLayer(None)? };
+        self.layer = new_layer;
+        self.rt = new_rt;
+        Ok(())
     }
 
     fn ensure_formats(&mut self, dpi: u32) -> windows::core::Result<()> {
@@ -482,6 +480,16 @@ impl BarRenderer {
     }
 
     pub fn render(&mut self, frame: &mut RenderFrame<'_>) -> windows::core::Result<()> {
+        match self.render_once(frame) {
+            Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
+                self.recreate_render_target()?;
+                self.render_once(frame)
+            }
+            res => res,
+        }
+    }
+
+    fn render_once(&mut self, frame: &mut RenderFrame<'_>) -> windows::core::Result<()> {
         self.surface.ensure_size(frame.width_px, frame.height_px)?;
         self.ensure_formats(frame.dpi)?;
 
@@ -983,7 +991,7 @@ impl BarRenderer {
             radiusY: layout.cover_radius,
         };
         if let Ok(geo) = self.d2d_factory.CreateRoundedRectangleGeometry(&rrect) {
-            let geom: ID2D1Geometry = geo.cast().unwrap();
+            let geom: ID2D1Geometry = geo.into();
             let params = D2D1_LAYER_PARAMETERS {
                 contentBounds: d2d_rect(layout.cover_rect),
                 geometricMask: ManuallyDrop::new(Some(geom)),
@@ -1002,6 +1010,8 @@ impl BarRenderer {
                 None,
             );
             self.rt.PopLayer();
+            let _ = ManuallyDrop::into_inner(params.geometricMask);
+            let _ = ManuallyDrop::into_inner(params.opacityBrush);
         }
 
         let ring_color = if light_taskbar {
@@ -1244,8 +1254,7 @@ impl BarRenderer {
             },
         ];
 
-        let mut pushed_layer = false;
-        let opacity_brush_keepalive;
+        let mut layer_params: Option<D2D1_LAYER_PARAMETERS> = None;
         if let Ok(stop_coll) =
             self.rt
                 .CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
@@ -1264,23 +1273,22 @@ impl BarRenderer {
                 .rt
                 .CreateLinearGradientBrush(&props, None, &stop_coll)
             {
-                let brush_iface: ID2D1Brush = grad.cast().unwrap();
-                opacity_brush_keepalive = brush_iface.clone();
-                let layer_params = D2D1_LAYER_PARAMETERS {
+                let brush_iface: ID2D1Brush = grad.into();
+                let lp = D2D1_LAYER_PARAMETERS {
                     contentBounds: d2d_rect(rect),
                     geometricMask: ManuallyDrop::new(None),
                     maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                     maskTransform: identity_matrix(),
                     opacity: 1.0,
-                    opacityBrush: ManuallyDrop::new(Some(opacity_brush_keepalive)),
+                    opacityBrush: ManuallyDrop::new(Some(brush_iface)),
                     layerOptions: D2D1_LAYER_OPTIONS_NONE,
                 };
-                self.rt.PushLayer(&layer_params, &self.layer);
-                pushed_layer = true;
+                self.rt.PushLayer(&lp, &self.layer);
+                layer_params = Some(lp);
             }
         }
 
-        if !pushed_layer {
+        if layer_params.is_none() {
             self.rt
                 .PushAxisAlignedClip(&d2d_rect(rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         }
@@ -1306,8 +1314,10 @@ impl BarRenderer {
             );
         }
 
-        if pushed_layer {
+        if let Some(lp) = layer_params {
             self.rt.PopLayer();
+            let _ = ManuallyDrop::into_inner(lp.geometricMask);
+            let _ = ManuallyDrop::into_inner(lp.opacityBrush);
         } else {
             self.rt.PopAxisAlignedClip();
         }

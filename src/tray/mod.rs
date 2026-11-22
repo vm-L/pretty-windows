@@ -31,6 +31,7 @@ mod win {
     use std::mem::size_of;
     use std::path::PathBuf;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Instant;
     use windows::core::{w, GUID, PCWSTR};
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -40,8 +41,11 @@ mod win {
     use windows::Win32::Graphics::DirectWrite::{
         DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED,
     };
+    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+    use windows::Win32::UI::HiDpi::{
+        GetDpiForMonitor, GetDpiForWindow, GetSystemMetricsForDpi, MDT_EFFECTIVE_DPI,
+    };
     use windows::Win32::UI::Shell::{
         Shell_NotifyIconGetRect, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
         NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0,
@@ -53,8 +57,8 @@ mod win {
         LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
         SetTimer, SetWindowLongPtrW, TranslateMessage, GWLP_USERDATA, HICON, IDC_ARROW,
         IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, MSG, SM_CXICON, SM_CXSMICON,
-        WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW,
-        WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_APP, WM_DESTROY, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_SETTINGCHANGE, WM_TIMER,
+        WNDCLASSEXW, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     const HOST_CLASS_NAME: PCWSTR = w!("PrettyWindowsTrayHostWnd");
@@ -67,6 +71,8 @@ mod win {
     const WM_APP_MEDIABAR_CLOSE_REQUEST: u32 = WM_APP + 25;
     const WM_APP_MONITORBAR_CLOSE_REQUEST: u32 = WM_APP + 28;
     const WM_APP_TRAY_OVERFLOW_CHANGED: u32 = WM_APP + 29;
+
+    static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
 
     struct TrayHostState {
         hwnd: HWND,
@@ -88,9 +94,33 @@ mod win {
         menu: TrayMenu,
         started_at: Instant,
         click_filter: TrayClickFilter,
+        cleaned_up: bool,
     }
 
     impl TrayHostState {
+        fn cleanup(&mut self) {
+            if self.cleaned_up {
+                return;
+            }
+            self.cleaned_up = true;
+            unsafe {
+                let _ = KillTimer(self.hwnd, TIMER_TASKBAR_MAINTAIN_ID);
+            }
+            self.mediabar.take();
+            self.monitorbar.take();
+            crate::monitorbar::brightness::restore_software_gamma_on_exit();
+            self.menu.hide();
+            self.taskbar.restore_default_and_shutdown();
+            delete_tray_icon(self.hwnd);
+            if self.tray_icon_owned && !self.tray_icon.is_invalid() {
+                unsafe {
+                    let _ = DestroyIcon(self.tray_icon);
+                }
+            }
+            self.tray_icon = HICON::default();
+            self.tray_icon_owned = false;
+        }
+
         fn new(hwnd: HWND, taskbar_created_msg: u32) -> windows::core::Result<Self> {
             unsafe {
                 let d2d_factory: ID2D1Factory1 =
@@ -101,10 +131,10 @@ mod win {
                 let light_taskbar = is_light_taskbar();
                 let accent = system_accent_color();
                 let dpi = current_shell_dpi(hwnd);
+                let menu = TrayMenu::new(hwnd, d2d_factory.clone(), dwrite_factory.clone())?;
                 let (tray_icon, tray_icon_owned) = load_app_icon(tray_icon_size_for_dpi(dpi), false);
                 let _ = register_tray_icon(hwnd, tray_icon);
 
-                let menu = TrayMenu::new(hwnd, d2d_factory.clone(), dwrite_factory.clone())?;
                 let config_path = portable_config_path();
                 let cfg = Config::load_from_path(&config_path);
 
@@ -141,6 +171,7 @@ mod win {
                     .refresh_for_shell_experience_pid(taskbar.shell_experience_pid());
                 overflow_hook.refresh_for_shell_host_pid(taskbar.shell_host_pid());
                 overflow_hook.refresh_for_start_menu_pid(taskbar.start_menu_pid());
+                overflow_hook.refresh_for_search_host_pid(taskbar.search_host_pid());
 
                 let mut host = Self {
                     hwnd,
@@ -162,6 +193,7 @@ mod win {
                     menu,
                     started_at: Instant::now(),
                     click_filter: TrayClickFilter::default(),
+                    cleaned_up: false,
                 };
                 host.sync_taskbar_timer();
                 Ok(host)
@@ -268,6 +300,8 @@ mod win {
                 .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
             self.overflow_hook
                 .refresh_for_start_menu_pid(self.taskbar.start_menu_pid());
+            self.overflow_hook
+                .refresh_for_search_host_pid(self.taskbar.search_host_pid());
             self.sync_taskbar_timer();
             self.sync_menu_state();
         }
@@ -288,8 +322,7 @@ mod win {
             }
 
             let anchor_pt = tray_anchor_point(self.hwnd, use_cursor);
-            let dpi = current_shell_dpi(self.hwnd);
-            self.dpi = dpi;
+            let menu_dpi = monitor_dpi_at_point(anchor_pt, self.hwnd);
             let light = is_light_taskbar();
             let accent = system_accent_color();
             self.light_taskbar = light;
@@ -299,7 +332,7 @@ mod win {
 
             self.menu.show(
                 anchor_pt,
-                dpi,
+                menu_dpi,
                 light,
                 accent,
                 self.is_mediabar_enabled(),
@@ -347,6 +380,8 @@ mod win {
                 .refresh_for_shell_host_pid(self.taskbar.shell_host_pid());
             self.overflow_hook
                 .refresh_for_start_menu_pid(self.taskbar.start_menu_pid());
+            self.overflow_hook
+                .refresh_for_search_host_pid(self.taskbar.search_host_pid());
             self.sync_taskbar_timer();
             if reverted {
                 self.sync_menu_state();
@@ -358,6 +393,7 @@ mod win {
         unsafe {
             let hinst = GetModuleHandleW(None)?;
             let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+            TASKBAR_CREATED_MSG.store(taskbar_created_msg, Ordering::Relaxed);
             let arrow_cursor = LoadCursorW(None, IDC_ARROW)?;
             let init_dpi = current_shell_dpi(HWND::default());
             let (app_icon_lg, _) = load_app_icon(GetSystemMetricsForDpi(SM_CXICON, init_dpi).max(32), true);
@@ -391,16 +427,29 @@ mod win {
                 None,
             )?;
 
-            let host = Rc::new(RefCell::new(TrayHostState::new(hwnd, taskbar_created_msg)?));
+            let host_state = match TrayHostState::new(hwnd, taskbar_created_msg) {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = DestroyWindow(hwnd);
+                    return Err(e);
+                }
+            };
+            let host = Rc::new(RefCell::new(host_state));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(host) as isize);
 
             let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
         Ok(())
+    }
+
+    impl Drop for TrayHostState {
+        fn drop(&mut self) {
+            self.cleanup();
+        }
     }
 
     unsafe extern "system" fn tray_host_wnd_proc(
@@ -418,18 +467,7 @@ mod win {
             let rc = Rc::from_raw(raw_ptr);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if let Ok(mut state) = rc.try_borrow_mut() {
-                let _ = KillTimer(hwnd, TIMER_TASKBAR_MAINTAIN_ID);
-                state.mediabar.take();
-                state.monitorbar.take();
-                crate::monitorbar::brightness::restore_software_gamma_on_exit();
-                state.menu.hide();
-                state.taskbar.restore_default_and_shutdown();
-                delete_tray_icon(hwnd);
-                if state.tray_icon_owned && !state.tray_icon.is_invalid() {
-                    let _ = DestroyIcon(state.tray_icon);
-                }
-                state.tray_icon = HICON::default();
-                state.tray_icon_owned = false;
+                state.cleanup();
             }
             PostQuitMessage(0);
             return LRESULT(0);
@@ -438,13 +476,17 @@ mod win {
         Rc::increment_strong_count(raw_ptr);
         let rc = Rc::from_raw(raw_ptr);
 
-        let taskbar_created_msg = rc
-            .try_borrow()
-            .map(|s| s.taskbar_created_msg)
-            .unwrap_or(0);
+        let cached_tb_msg = TASKBAR_CREATED_MSG.load(Ordering::Relaxed);
+        let taskbar_created_msg = if cached_tb_msg != 0 {
+            cached_tb_msg
+        } else {
+            rc.try_borrow().map(|s| s.taskbar_created_msg).unwrap_or(0)
+        };
         if taskbar_created_msg != 0 && msg == taskbar_created_msg {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 state.re_register_tray_icon();
+            } else {
+                let _ = PostMessageW(hwnd, msg, wparam, lparam);
             }
             return LRESULT(0);
         }
@@ -474,6 +516,8 @@ mod win {
             WM_APP_MEDIABAR_CLOSE_REQUEST => {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.set_mediabar_enabled(false);
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -489,6 +533,8 @@ mod win {
             WM_APP_MONITORBAR_CLOSE_REQUEST => {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.set_monitorbar_enabled(false);
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
                 }
                 LRESULT(0)
             }
@@ -516,6 +562,10 @@ mod win {
                         if state.taskbar.tick() {
                             state.sync_menu_state();
                         }
+                        let explorer_pid = state.taskbar.cached_explorer_pid();
+                        if explorer_pid != 0 {
+                            state.overflow_hook.refresh_for_explorer_pid(explorer_pid);
+                        }
                         let shell_exp_pid = state.taskbar.shell_experience_pid();
                         state
                             .overflow_hook
@@ -528,6 +578,10 @@ mod win {
                         state
                             .overflow_hook
                             .refresh_for_start_menu_pid(start_menu_pid);
+                        let search_host_pid = state.taskbar.search_host_pid();
+                        state
+                            .overflow_hook
+                            .refresh_for_search_host_pid(search_host_pid);
                         state.sync_taskbar_timer();
                     }
                 }
@@ -554,8 +608,30 @@ mod win {
                 }
                 LRESULT(0)
             }
+            WM_ENDSESSION => {
+                if wparam.0 != 0 {
+                    if let Ok(mut state) = rc.try_borrow_mut() {
+                        state.cleanup();
+                    }
+                }
+                LRESULT(0)
+            }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+
+    fn monitor_dpi_at_point(pt: POINT, fallback_hwnd: HWND) -> u32 {
+        unsafe {
+            let mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+            let mut dpi_x = 0u32;
+            let mut dpi_y = 0u32;
+            if GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok()
+                && dpi_x >= 96
+            {
+                return dpi_x;
+            }
+        }
+        current_shell_dpi(fallback_hwnd)
     }
 
     fn current_shell_dpi(fallback_hwnd: HWND) -> u32 {

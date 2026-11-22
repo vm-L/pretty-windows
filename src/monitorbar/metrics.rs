@@ -24,8 +24,8 @@ use windows::Win32::NetworkManagement::Ndis::{IfOperStatusUp, TUNNEL_TYPE_NONE};
 #[cfg(windows)]
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
-    PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE,
-    PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_MORE_DATA,
+    PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA,
+    PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_MORE_DATA,
 };
 #[cfg(windows)]
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -296,7 +296,7 @@ struct PdhSampler {
     query: isize,
     gpu_counter: isize,
     disk_counter: isize,
-    gpu_buf: Vec<u8>,
+    gpu_buf: Vec<u64>,
 }
 
 #[cfg(windows)]
@@ -364,7 +364,7 @@ impl PdhSampler {
             None,
             &mut value,
         );
-        if status == 0 && value.CStatus == PDH_CSTATUS_VALID_DATA {
+        if status == 0 && matches!(value.CStatus, PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA) {
             compute_disk_active_percent(value.Anonymous.doubleValue)
         } else {
             0
@@ -384,10 +384,11 @@ impl PdhSampler {
         if status != PDH_MORE_DATA || buf_size == 0 {
             return 0;
         }
-        let needed = buf_size as usize;
-        if self.gpu_buf.len() < needed {
-            self.gpu_buf.resize(needed, 0);
+        let needed_u64 = (buf_size as usize).div_ceil(std::mem::size_of::<u64>());
+        if self.gpu_buf.len() < needed_u64 {
+            self.gpu_buf.resize(needed_u64, 0);
         }
+        buf_size = (self.gpu_buf.len() * std::mem::size_of::<u64>()).min(u32::MAX as usize) as u32;
 
         let ptr = self.gpu_buf.as_mut_ptr().cast::<PDH_FMT_COUNTERVALUE_ITEM_W>();
         let status2 = PdhGetFormattedCounterArrayW(
@@ -404,7 +405,11 @@ impl PdhSampler {
         let items = std::slice::from_raw_parts(ptr, item_count as usize);
         let mut decoded: Vec<(String, f64)> = Vec::with_capacity(items.len());
         for item in items {
-            if item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA || item.szName.is_null() {
+            if !matches!(
+                item.FmtValue.CStatus,
+                PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
+            ) || item.szName.is_null()
+            {
                 continue;
             }
             let val = item.FmtValue.Anonymous.doubleValue;

@@ -39,7 +39,7 @@ fn push_res_record(
     out.extend_from_slice(&0u32.to_le_bytes()); // Characteristics
 
     out.extend_from_slice(data);
-    while out.len() % 4 != 0 {
+    while !out.len().is_multiple_of(4) {
         out.push(0);
     }
 }

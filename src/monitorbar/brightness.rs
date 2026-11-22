@@ -122,18 +122,21 @@ pub fn identity_gamma_ramp() -> [[u16; 256]; 3] {
     ramp
 }
 
-/// Computes a scaled gamma ramp preserving `original` verbatim at 100% and clamping 0% to `min_floor`.
-pub fn build_software_gamma_ramp(
+/// Computes a scaled gamma ramp preserving `original` verbatim at 100% and enforcing both a
+/// linear curve floor (`min_floor`) and a hard monotonic lower scale bound (`min_scale`).
+pub fn build_software_gamma_ramp_with_min_scale(
     original: &[[u16; 256]; 3],
     pct: u8,
     min_floor: f32,
+    min_scale: f32,
 ) -> [[u16; 256]; 3] {
     let clamped = pct.min(100);
     if clamped == 100 {
         return *original;
     }
     let floor = min_floor.clamp(0.05, 1.0);
-    let scale = floor + (1.0 - floor) * (f32::from(clamped) / 100.0);
+    let min_scale_clamped = min_scale.clamp(0.05, 1.0);
+    let scale = (floor + (1.0 - floor) * (f32::from(clamped) / 100.0)).max(min_scale_clamped);
     let mut scaled = *original;
     for ch in &mut scaled {
         for slot in ch.iter_mut() {
@@ -141,6 +144,15 @@ pub fn build_software_gamma_ramp(
         }
     }
     scaled
+}
+
+/// Computes a scaled gamma ramp preserving `original` verbatim at 100% and clamping 0% to `min_floor`.
+pub fn build_software_gamma_ramp(
+    original: &[[u16; 256]; 3],
+    pct: u8,
+    min_floor: f32,
+) -> [[u16; 256]; 3] {
+    build_software_gamma_ramp_with_min_scale(original, pct, min_floor, 0.05)
 }
 
 /// Returns `true` when the reported monitor name is empty or a generic Windows placeholder.
@@ -223,6 +235,17 @@ impl SoftwareGammaStore {
             self.dirty_software_ids.insert(id.to_string());
         } else {
             self.dirty_software_ids.remove(id);
+        }
+    }
+
+    /// Clears and returns the original gamma ramp for `id` if it had an active software dim,
+    /// resetting its remembered software percentage back to 100% (used when Hardware mode recovers).
+    pub fn take_dirty_for_display(&mut self, id: &str) -> Option<[[u16; 256]; 3]> {
+        if self.dirty_software_ids.remove(id) {
+            self.software_pcts.insert(id.to_string(), 100);
+            self.original_ramps.get(id).copied()
+        } else {
+            None
         }
     }
 
@@ -476,7 +499,19 @@ fn brightness_worker_loop(
 
         for (id, pct) in pending_sets {
             let clamped = pct.min(100);
-            apply_display_brightness(&id, clamped, &mut state);
+            if !apply_display_brightness(&id, clamped, &mut state) {
+                let actual_pct = software_gamma_store()
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.software_pcts.get(&id).copied())
+                    .unwrap_or(100);
+                if let Ok(mut guard) = snapshot.lock() {
+                    if let Some(item) = guard.displays.iter_mut().find(|d| d.id == id) {
+                        item.brightness = actual_pct;
+                    }
+                }
+                post_notify(hwnd_raw, notify_msg);
+            }
         }
 
         if need_refresh {
@@ -832,6 +867,13 @@ fn refresh_displays(state: &mut WorkerState) -> Vec<DisplayBrightnessItem> {
 
         // 4. Software Gamma Ramp fallback (marked with a red dot in the UI)
         let (brightness, mode, backend) = if let Some(hit) = probed {
+            if let Some(orig) = software_gamma_store()
+                .lock()
+                .ok()
+                .and_then(|mut s| s.take_dirty_for_display(&id))
+            {
+                let _ = apply_gdi_gamma_ramp(&id, &orig);
+            }
             hit
         } else {
             let already_tracked = software_gamma_store()
@@ -866,10 +908,10 @@ fn refresh_displays(state: &mut WorkerState) -> Vec<DisplayBrightnessItem> {
 }
 
 #[cfg(windows)]
-fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) {
+fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) -> bool {
     let clamped = pct.min(100);
     let Some(backend) = state.backends.get(id).copied() else {
-        return;
+        return true;
     };
 
     match backend {
@@ -885,6 +927,7 @@ fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) {
                 }
                 close_physical_monitors(&phys);
             }
+            true
         }
         DisplayBackend::Dxva2Vcp { max } => {
             if let Some(mon) = enumerate_gdi_monitors().into_iter().find(|m| m.device_name == id) {
@@ -898,9 +941,11 @@ fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) {
                 }
                 close_physical_monitors(&phys);
             }
+            true
         }
         DisplayBackend::InternalLcd => {
             let _ = set_internal_lcd_brightness(clamped);
+            true
         }
         DisplayBackend::SoftwareGamma => {
             let cached_orig = software_gamma_store()
@@ -921,9 +966,14 @@ fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) {
             let ramp = build_software_gamma_ramp(&original, clamped, SOFTWARE_BRIGHTNESS_FLOOR);
             let mut applied = apply_gdi_gamma_ramp(id, &ramp);
             if !applied {
-                // Retry with 50% floor if Windows ICM rejects ramps darker than half intensity.
-                let fallback =
-                    build_software_gamma_ramp(&original, clamped, SOFTWARE_ICM_FALLBACK_FLOOR);
+                // Clamp scale at the ICM 50% floor while staying on the same linear curve so
+                // dragging below 38% never jumps brighter than higher percentages.
+                let fallback = build_software_gamma_ramp_with_min_scale(
+                    &original,
+                    clamped,
+                    SOFTWARE_BRIGHTNESS_FLOOR,
+                    SOFTWARE_ICM_FALLBACK_FLOOR,
+                );
                 applied = apply_gdi_gamma_ramp(id, &fallback);
             }
             if applied {
@@ -931,6 +981,7 @@ fn apply_display_brightness(id: &str, pct: u8, state: &mut WorkerState) {
                     store.record_applied(id, clamped);
                 }
             }
+            applied
         }
     }
 }
@@ -1040,5 +1091,47 @@ mod tests {
             store.ensure_registered(r"\\.\DISPLAY2", || dimmed_ramp),
             100
         );
+    }
+
+    #[test]
+    fn software_gamma_icm_min_scale_is_monotonic_around_threshold() {
+        let orig = identity_gamma_ramp();
+        let simulate_apply = |pct: u8| -> u16 {
+            let primary = build_software_gamma_ramp(&orig, pct, SOFTWARE_BRIGHTNESS_FLOOR);
+            if primary[0][255] >= 32768 {
+                primary[0][255]
+            } else {
+                build_software_gamma_ramp_with_min_scale(
+                    &orig,
+                    pct,
+                    SOFTWARE_BRIGHTNESS_FLOOR,
+                    SOFTWARE_ICM_FALLBACK_FLOOR,
+                )[0][255]
+            }
+        };
+
+        for pct in 0u8..100 {
+            let cur = simulate_apply(pct);
+            let next = simulate_apply(pct + 1);
+            assert!(
+                cur <= next,
+                "brightness went backwards from {pct}% ({cur}) to {}% ({next})",
+                pct + 1
+            );
+        }
+        assert!(simulate_apply(37) <= simulate_apply(38));
+    }
+
+    #[test]
+    fn software_gamma_store_take_dirty_for_display_clears_once() {
+        let mut store = SoftwareGammaStore::default();
+        let orig = identity_gamma_ramp();
+        assert_eq!(store.ensure_registered(r"\\.\DISPLAY1", || orig), 100);
+        store.record_applied(r"\\.\DISPLAY1", 55);
+
+        assert_eq!(store.take_dirty_for_display(r"\\.\DISPLAY1"), Some(orig));
+        assert_eq!(store.take_dirty_for_display(r"\\.\DISPLAY1"), None);
+        assert!(store.drain_dirty_for_restore().is_empty());
+        assert_eq!(store.ensure_registered(r"\\.\DISPLAY1", || orig), 100);
     }
 }

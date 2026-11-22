@@ -525,7 +525,7 @@ impl MiniPlayerLayout {
 
 /// Computes the `(win_x, win_y)` screen origin for the mini-player popup centered cleanly above `anchor`,
 /// clamped inside `[work_left, work_top, work_right, work_bottom]`.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn compute_mini_player_window_origin(
     anchor_left: i32,
     anchor_top: i32,

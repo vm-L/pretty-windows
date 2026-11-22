@@ -4,20 +4,16 @@ use super::layout::{MetricSlot, MonitorLayout};
 use super::metrics::{format_percent, format_speed, MetricsSnapshot, HIGH_LOAD_THRESHOLD};
 use crate::color::Rgb;
 use crate::ui::glass::{
-    create_text_format, d2d_rect, draw_text_in_rect, identity_matrix, primary_text_color,
-    LayeredSurface,
+    create_dc_render_target, create_text_format, d2d_rect, draw_text_in_rect, identity_matrix,
+    primary_text_color, LayeredSurface,
 };
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F,
-};
+use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, HWND, RECT};
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
 use windows::Win32::Graphics::Direct2D::{
-    ID2D1DCRenderTarget, ID2D1Factory1, D2D1_DRAW_TEXT_OPTIONS_CLIP,
-    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    ID2D1DCRenderTarget, ID2D1Factory1, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_ROUNDED_RECT,
+    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::HCURSOR;
 
 /// Inputs required to render one frame of the MonitorBar layered window.
@@ -34,6 +30,7 @@ pub struct MonitorRenderInput<'a> {
 
 /// Hardware-backed Direct2D renderer committing frames into a 32-bit premultiplied layered surface.
 pub struct MonitorRenderer {
+    d2d_factory: ID2D1Factory1,
     pub dwrite_factory: IDWriteFactory,
     rt: ID2D1DCRenderTarget,
     surface: LayeredSurface,
@@ -48,22 +45,12 @@ impl MonitorRenderer {
         dwrite_factory: IDWriteFactory,
     ) -> windows::core::Result<Self> {
         unsafe {
-            let rt_props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: Default::default(),
-            };
-            let rt = d2d_factory.CreateDCRenderTarget(&rt_props)?;
+            let rt = create_dc_render_target(d2d_factory)?;
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let surface = LayeredSurface::new()?;
 
             Ok(Self {
+                d2d_factory: d2d_factory.clone(),
                 dwrite_factory,
                 rt,
                 surface,
@@ -72,6 +59,15 @@ impl MonitorRenderer {
                 value_fmt: None,
             })
         }
+    }
+
+    fn recreate_render_target(&mut self) -> windows::core::Result<()> {
+        let new_rt = create_dc_render_target(&self.d2d_factory)?;
+        unsafe {
+            new_rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+        }
+        self.rt = new_rt;
+        Ok(())
     }
 
     fn ensure_formats(&mut self, dpi: u32) -> windows::core::Result<()> {
@@ -101,6 +97,16 @@ impl MonitorRenderer {
     }
 
     pub fn render(&mut self, input: &MonitorRenderInput<'_>) -> windows::core::Result<()> {
+        match self.render_once(input) {
+            Err(e) if e.code() == D2DERR_RECREATE_TARGET => {
+                self.recreate_render_target()?;
+                self.render_once(input)
+            }
+            res => res,
+        }
+    }
+
+    fn render_once(&mut self, input: &MonitorRenderInput<'_>) -> windows::core::Result<()> {
         let w = (input.layout.width_px.round() as i32).max(1);
         let h = (input.layout.height_px.round() as i32).max(1);
         self.surface.ensure_size(w, h)?;

@@ -17,8 +17,8 @@ use windows::Win32::Media::Audio::{
     VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, IAgileObject,
+    IAgileObject_Impl, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 
@@ -130,10 +130,12 @@ struct RawBlobPropVariant {
     p_blob_data: *const u8,
 }
 
-#[implement(IActivateAudioInterfaceCompletionHandler)]
+#[implement(IActivateAudioInterfaceCompletionHandler, IAgileObject)]
 struct ActivationHandler {
-    event: HANDLE,
+    event: Arc<OwnedEvent>,
 }
+
+impl IAgileObject_Impl for ActivationHandler_Impl {}
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
     fn ActivateCompleted(
@@ -141,7 +143,7 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
         _activateoperation: Option<&IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
         unsafe {
-            let _ = SetEvent(self.event);
+            let _ = SetEvent(self.event.0);
         }
         Ok(())
     }
@@ -149,11 +151,33 @@ impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationHandler_Impl {
 
 struct OwnedEvent(HANDLE);
 
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+
 impl Drop for OwnedEvent {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.0);
+            }
+        }
+    }
+}
+
+struct ComMtaGuard(bool);
+
+impl ComMtaGuard {
+    fn new() -> Self {
+        let ok = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+        Self(ok)
+    }
+}
+
+impl Drop for ComMtaGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe {
+                CoUninitialize();
             }
         }
     }
@@ -200,8 +224,8 @@ fn activate_process_loopback(pid: u32) -> Option<CaptureSession> {
     }
 
     unsafe {
-        let event = CreateEventW(None, true, false, None).ok()?;
-        let _event_guard = OwnedEvent(event);
+        let raw_event = CreateEventW(None, true, false, None).ok()?;
+        let event = Arc::new(OwnedEvent(raw_event));
 
         let params = AUDIOCLIENT_ACTIVATION_PARAMS {
             ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
@@ -223,7 +247,10 @@ fn activate_process_loopback(pid: u32) -> Option<CaptureSession> {
             p_blob_data: (&params as *const AUDIOCLIENT_ACTIVATION_PARAMS).cast::<u8>(),
         };
 
-        let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler { event }.into();
+        let handler: IActivateAudioInterfaceCompletionHandler = ActivationHandler {
+            event: Arc::clone(&event),
+        }
+        .into();
         let op = ActivateAudioInterfaceAsync(
             VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
             &IAudioClient::IID,
@@ -232,7 +259,7 @@ fn activate_process_loopback(pid: u32) -> Option<CaptureSession> {
         )
         .ok()?;
 
-        if WaitForSingleObject(event, 2000) != WAIT_OBJECT_0 {
+        if WaitForSingleObject(event.0, 2000) != WAIT_OBJECT_0 {
             return None;
         }
 
@@ -418,9 +445,7 @@ fn read_capture_packets(
 }
 
 fn run_audio_loop(handle: Arc<AudioHandle>) {
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
+    let _com = ComMtaGuard::new();
 
     let mut analyzer = SpectrumAnalyzer::new(48_000);
     let mut mono_scratch = Vec::with_capacity(2048);
@@ -430,11 +455,11 @@ fn run_audio_loop(handle: Arc<AudioHandle>) {
     let mut last_nonzero_audio = Instant::now();
     let mut last_tick = Instant::now();
 
-    loop {
+    'audio: loop {
         let target = {
             let mut guard = match handle.state.lock() {
                 Ok(g) => g,
-                Err(_) => break,
+                Err(_) => break 'audio,
             };
             while !guard.is_playing && !guard.shutdown {
                 session = None;
@@ -451,7 +476,7 @@ fn run_audio_loop(handle: Arc<AudioHandle>) {
                     std::thread::sleep(Duration::from_millis(16));
                     guard = match handle.state.lock() {
                         Ok(g) => g,
-                        Err(_) => return,
+                        Err(_) => break 'audio,
                     };
                     continue;
                 }
@@ -460,7 +485,7 @@ fn run_audio_loop(handle: Arc<AudioHandle>) {
                 handle.write_bars(&[0.0; NUM_BARS]);
                 guard = match handle.cv.wait(guard) {
                     Ok(g) => g,
-                    Err(_) => return,
+                    Err(_) => break 'audio,
                 };
                 last_tick = Instant::now();
             }
@@ -547,7 +572,4 @@ fn run_audio_loop(handle: Arc<AudioHandle>) {
     }
 
     drop(session);
-    unsafe {
-        CoUninitialize();
-    }
 }

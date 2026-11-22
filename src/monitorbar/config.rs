@@ -185,31 +185,31 @@ pub fn portable_config_path() -> PathBuf {
     exe_dir.join("MonitorBar.toml")
 }
 
-/// Loads `MonitorBar.toml` or writes defaults if missing/unreadable.
+/// Loads `MonitorBar.toml`, creating defaults only when the file does not exist.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn load_or_create(path: &Path) -> MonitorConfig {
-    if let Ok(content) = fs::read_to_string(path) {
-        let cfg = parse_toml(&content);
-        return cfg;
+    match fs::read_to_string(path) {
+        Ok(content) => parse_toml(&content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let cfg = MonitorConfig::default();
+            let _ = save_config(path, &cfg);
+            cfg
+        }
+        Err(_) => MonitorConfig::default(),
     }
-    let cfg = MonitorConfig::default();
-    let _ = save_config(path, &cfg);
-    cfg
 }
 
-/// Serializes and writes `MonitorBar.toml`.
+/// Serializes and atomically writes `MonitorBar.toml`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn save_config(path: &Path, cfg: &MonitorConfig) -> bool {
     let mut normalized = cfg.clone();
     normalized.ensure_at_least_one_metric();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    fs::write(path, to_toml_string(&normalized)).is_ok()
+    crate::system::atomic_write_string(path, &to_toml_string(&normalized)).is_ok()
 }
 
 /// Parses MonitorBar TOML text, falling back to defaults for missing or invalid fields.
 pub fn parse_toml(input: &str) -> MonitorConfig {
+    let input = input.trim_start_matches('\u{feff}');
     let mut cfg = MonitorConfig::default();
 
     for raw_line in input.lines() {
@@ -450,5 +450,13 @@ mod tests {
         assert!(!cfg.show_network);
         assert!(!cfg.toggle_metric(MetricItem::Cpu));
         assert!(cfg.show_cpu);
+    }
+
+    #[test]
+    fn parse_toml_handles_utf8_bom() {
+        let parsed = parse_toml("\u{feff}enabled = false\nshow_gpu = false\n");
+        assert!(!parsed.enabled);
+        assert!(!parsed.show_gpu);
+        assert!(parsed.show_network);
     }
 }

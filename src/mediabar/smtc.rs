@@ -3,6 +3,7 @@ use super::process_util::{friendly_app_name, resolve_pid_for_source};
 use super::timeline::{current_filetime_100ns, MediaTimeline};
 use crate::color::{extract_accent_from_bgra, Rgb};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,17 +18,19 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICImagingFactory,
     WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom,
-    WICDecodeMetadataCacheOnDemand,
+    WICDecodeMetadataCacheOnDemand, WICRect,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 
 pub const WM_APP_SMTC_UPDATED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
 const THUMB_SIZE: u32 = 64;
 const ART_SIZE: u32 = 192;
+const MAX_COVER_SOURCE_DIM: u32 = 8192;
+const MAX_COVER_SOURCE_PIXELS: u64 = 32_000_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COVER_RETRY_DELAY: Duration = Duration::from_millis(360);
 const OVERRIDE_TTL: Duration = Duration::from_millis(650);
@@ -80,6 +83,7 @@ pub enum SmtcCommand {
 pub struct SmtcHandle {
     snapshot: Arc<Mutex<SmtcSnapshot>>,
     cmd_tx: Sender<SmtcCommand>,
+    stop: Arc<AtomicBool>,
 }
 
 impl SmtcHandle {
@@ -95,21 +99,30 @@ impl SmtcHandle {
     }
 }
 
-struct ComGuard;
+impl Drop for SmtcHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.cmd_tx.send(SmtcCommand::Shutdown);
+    }
+}
+
+struct ComGuard {
+    initialized: bool,
+}
 
 impl ComGuard {
     fn new_mta() -> Self {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
-        Self
+        let initialized = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).is_ok() };
+        Self { initialized }
     }
 }
 
 impl Drop for ComGuard {
     fn drop(&mut self) {
-        unsafe {
-            CoUninitialize();
+        if self.initialized {
+            unsafe {
+                CoUninitialize();
+            }
         }
     }
 }
@@ -136,16 +149,28 @@ pub fn start_smtc_worker(ui_hwnd: HWND, fallback_accent: Rgb) -> SmtcHandle {
     let snapshot_clone = Arc::clone(&snapshot);
     let (cmd_tx, cmd_rx) = mpsc::channel::<SmtcCommand>();
     let worker_tx = cmd_tx.clone();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = Arc::clone(&stop);
     let hwnd_raw = ui_hwnd.0 as isize;
 
-    std::thread::Builder::new()
+    let _ = std::thread::Builder::new()
         .name("mediabar-smtc".into())
         .spawn(move || {
-            run_smtc_loop(hwnd_raw, fallback_accent, snapshot_clone, worker_tx, cmd_rx);
-        })
-        .expect("failed to spawn SMTC worker thread");
+            run_smtc_loop(
+                hwnd_raw,
+                fallback_accent,
+                snapshot_clone,
+                worker_tx,
+                cmd_rx,
+                stop_clone,
+            );
+        });
 
-    SmtcHandle { snapshot, cmd_tx }
+    SmtcHandle {
+        snapshot,
+        cmd_tx,
+        stop,
+    }
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -222,6 +247,8 @@ fn extract_timeline(sess: &GlobalSystemMediaTransportControlsSession) -> Option<
 
 struct SessionCacheEntry {
     pid: Option<u32>,
+    pid_retry_failures: u32,
+    next_pid_retry_at: Option<Instant>,
     app_name: String,
     title: String,
     artist: String,
@@ -292,6 +319,7 @@ fn run_smtc_loop(
     snapshot: Arc<Mutex<SmtcSnapshot>>,
     self_tx: Sender<SmtcCommand>,
     cmd_rx: Receiver<SmtcCommand>,
+    stop: Arc<AtomicBool>,
 ) {
     let _com = ComGuard::new_mta();
     let wic: Option<IWICImagingFactory> =
@@ -333,6 +361,9 @@ fn run_smtc_loop(
     let _ = self_tx.send(SmtcCommand::Refresh);
 
     loop {
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         let poll_deadline = Instant::now() + POLL_INTERVAL;
         let deadline = match cover_retry_deadline {
             Some(c_dl) if c_dl < poll_deadline => c_dl,
@@ -450,7 +481,7 @@ fn run_smtc_loop(
                 }
             }
         }
-        if shutdown {
+        if shutdown || stop.load(Ordering::Acquire) {
             break;
         }
 
@@ -478,13 +509,11 @@ fn run_smtc_loop(
                     *guard = new_snapshot.clone();
                 }
                 last_snapshot = Some(new_snapshot);
-                unsafe {
-                    let _ = PostMessageW(
-                        HWND(hwnd_raw as *mut _),
-                        WM_APP_SMTC_UPDATED,
-                        WPARAM(0),
-                        LPARAM(0),
-                    );
+                let target = HWND(hwnd_raw as *mut _);
+                if !stop.load(Ordering::Acquire) && unsafe { IsWindow(target).as_bool() } {
+                    unsafe {
+                        let _ = PostMessageW(target, WM_APP_SMTC_UPDATED, WPARAM(0), LPARAM(0));
+                    }
                 }
             }
         }
@@ -616,11 +645,14 @@ fn refresh_sessions(
 
         let is_new_entry = !cache.contains_key(&id);
         let raw_source_id = id.split('#').next().unwrap_or(&id);
+        let now = Instant::now();
         let entry = cache.entry(id.clone()).or_insert_with(|| {
             let pid = resolve_pid_for_source(raw_source_id);
             let app_name = friendly_app_name(raw_source_id, pid);
             SessionCacheEntry {
                 pid,
+                pid_retry_failures: u32::from(pid.is_none()),
+                next_pid_retry_at: pid.is_none().then(|| now + Duration::from_secs(2)),
                 app_name,
                 title: String::new(),
                 artist: String::new(),
@@ -634,11 +666,21 @@ fn refresh_sessions(
         let status_changed = entry.last_status != status;
         entry.last_status = status;
 
-        // Re-resolve PID if missing or when switching to Playing so audio isolation stays accurate.
-        if entry.pid.is_none() || (status == PlaybackState::Playing && status_changed) {
+        // Re-resolve PID on switch to Playing, or with exponential backoff (2s..60s) when missing.
+        let switching_to_playing = status == PlaybackState::Playing && status_changed;
+        let retry_due =
+            entry.pid.is_none() && entry.next_pid_retry_at.is_none_or(|t| now >= t);
+        if switching_to_playing || retry_due {
             if let Some(pid) = resolve_pid_for_source(raw_source_id) {
                 entry.pid = Some(pid);
+                entry.pid_retry_failures = 0;
+                entry.next_pid_retry_at = None;
                 entry.app_name = friendly_app_name(raw_source_id, Some(pid));
+            } else if entry.pid.is_none() && !is_new_entry {
+                let failures = entry.pid_retry_failures;
+                let backoff_secs = 2u64.saturating_mul(1u64 << failures.min(5)).min(60);
+                entry.pid_retry_failures = failures.saturating_add(1);
+                entry.next_pid_retry_at = Some(now + Duration::from_secs(backoff_secs));
             }
         }
 
@@ -723,7 +765,7 @@ fn refresh_sessions(
         if let Some((ref seek_id, target_pos, seek_ts, _)) = pending_seek_override {
             if seek_id == &id {
                 if let Some(ref mut tl) = timeline {
-                    if (tl.position_100ns - *target_pos).abs() <= 20_000_000
+                    if tl.position_100ns.abs_diff(*target_pos) <= 20_000_000
                         && tl.last_updated_100ns >= *seek_ts
                     {
                         *pending_seek_override = None;
@@ -787,24 +829,43 @@ fn read_thumbnail_bytes(
     Some(buf)
 }
 
-fn center_crop_square_bgra(src: &[u8], w: u32, h: u32, target: u32) -> Vec<u8> {
-    let t = target as usize;
-    let sw = w as usize;
-    let sh = h as usize;
-    let start_x = sw.saturating_sub(t) / 2;
-    let start_y = sh.saturating_sub(t) / 2;
-    let mut out = vec![0u8; t * t * 4];
-
-    for y in 0..t {
-        let sy = (start_y + y).min(sh.saturating_sub(1));
-        for x in 0..t {
-            let sx = (start_x + x).min(sw.saturating_sub(1));
-            let src_idx = (sy * sw + sx) * 4;
-            let dst_idx = (y * t + x) * 4;
-            out[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
+fn downsample_square_bgra_box(src: &[u8], src_size: u32, dst_size: u32) -> Option<Vec<u8>> {
+    if src_size == 0 || dst_size == 0 || !src_size.is_multiple_of(dst_size) {
+        return None;
+    }
+    let factor = (src_size / dst_size) as usize;
+    let sw = src_size as usize;
+    let dw = dst_size as usize;
+    let expected = sw.checked_mul(sw)?.checked_mul(4)?;
+    if src.len() < expected {
+        return None;
+    }
+    let box_area = (factor * factor) as u32;
+    let mut out = vec![0u8; dw * dw * 4];
+    for dy in 0..dw {
+        let sy0 = dy * factor;
+        for dx in 0..dw {
+            let sx0 = dx * factor;
+            let mut sum = [0u32; 4];
+            for oy in 0..factor {
+                let row_off = (sy0 + oy) * sw + sx0;
+                for ox in 0..factor {
+                    let i = (row_off + ox) * 4;
+                    sum[0] += u32::from(src[i]);
+                    sum[1] += u32::from(src[i + 1]);
+                    sum[2] += u32::from(src[i + 2]);
+                    sum[3] += u32::from(src[i + 3]);
+                }
+            }
+            let out_idx = (dy * dw + dx) * 4;
+            let half = box_area / 2;
+            out[out_idx] = ((sum[0] + half) / box_area) as u8;
+            out[out_idx + 1] = ((sum[1] + half) / box_area) as u8;
+            out[out_idx + 2] = ((sum[2] + half) / box_area) as u8;
+            out[out_idx + 3] = ((sum[3] + half) / box_area) as u8;
         }
     }
-    out
+    Some(out)
 }
 
 fn straight_to_premul_bgra(src: &[u8]) -> Vec<u8> {
@@ -825,6 +886,9 @@ fn decode_wic_square_straight_bgra(
     bytes: &[u8],
     target_size: u32,
 ) -> Option<Vec<u8>> {
+    if target_size == 0 {
+        return None;
+    }
     unsafe {
         let stream = wic.CreateStream().ok()?;
         stream.InitializeFromMemory(bytes).ok()?;
@@ -835,19 +899,34 @@ fn decode_wic_square_straight_bgra(
         let mut orig_w = 0u32;
         let mut orig_h = 0u32;
         frame.GetSize(&mut orig_w, &mut orig_h).ok()?;
-        if orig_w == 0 || orig_h == 0 {
+        if orig_w == 0
+            || orig_h == 0
+            || orig_w > MAX_COVER_SOURCE_DIM
+            || orig_h > MAX_COVER_SOURCE_DIM
+            || u64::from(orig_w) * u64::from(orig_h) > MAX_COVER_SOURCE_PIXELS
+        {
             return None;
         }
 
-        // Aspect-preserving scale so the shortest side equals `target_size`, then center-crop square.
-        let min_side = orig_w.min(orig_h) as f32;
-        let scale = (target_size as f32) / min_side;
-        let scaled_w = ((orig_w as f32) * scale).round().max(target_size as f32) as u32;
-        let scaled_h = ((orig_h as f32) * scale).round().max(target_size as f32) as u32;
+        // Center-crop the largest square before scaling to bound intermediate buffers cleanly.
+        let min_side = orig_w.min(orig_h);
+        let clip_rect = WICRect {
+            X: ((orig_w - min_side) / 2) as i32,
+            Y: ((orig_h - min_side) / 2) as i32,
+            Width: min_side as i32,
+            Height: min_side as i32,
+        };
+        let clipper = wic.CreateBitmapClipper().ok()?;
+        clipper.Initialize(&frame, &clip_rect).ok()?;
 
         let scaler = wic.CreateBitmapScaler().ok()?;
         scaler
-            .Initialize(&frame, scaled_w, scaled_h, WICBitmapInterpolationModeFant)
+            .Initialize(
+                &clipper,
+                target_size,
+                target_size,
+                WICBitmapInterpolationModeFant,
+            )
             .ok()?;
 
         let converter = wic.CreateFormatConverter().ok()?;
@@ -862,22 +941,14 @@ fn decode_wic_square_straight_bgra(
             )
             .ok()?;
 
-        let stride = scaled_w * 4;
-        let mut full_buf = vec![0u8; (stride * scaled_h) as usize];
+        let stride = target_size.checked_mul(4)?;
+        let buf_len = (stride as usize).checked_mul(target_size as usize)?;
+        let mut full_buf = vec![0u8; buf_len];
         converter
             .CopyPixels(std::ptr::null(), stride, &mut full_buf)
             .ok()?;
 
-        if scaled_w == target_size && scaled_h == target_size {
-            Some(full_buf)
-        } else {
-            Some(center_crop_square_bgra(
-                &full_buf,
-                scaled_w,
-                scaled_h,
-                target_size,
-            ))
-        }
+        Some(full_buf)
     }
 }
 
@@ -887,25 +958,22 @@ fn decode_and_process_cover(
     hash: u64,
     fallback_accent: Rgb,
 ) -> Option<MediaCover> {
-    let straight_thumb = decode_wic_square_straight_bgra(wic, bytes, THUMB_SIZE)?;
+    let straight_art = decode_wic_square_straight_bgra(wic, bytes, ART_SIZE)?;
+    let straight_thumb = downsample_square_bgra_box(&straight_art, ART_SIZE, THUMB_SIZE)?;
     let accent_dark =
         extract_accent_from_bgra(&straight_thumb, THUMB_SIZE, THUMB_SIZE, false, fallback_accent);
     let accent_light =
         extract_accent_from_bgra(&straight_thumb, THUMB_SIZE, THUMB_SIZE, true, fallback_accent);
     let thumb_pbgra = straight_to_premul_bgra(&straight_thumb);
-    let (art_w, art_h, art_pbgra) =
-        match decode_wic_square_straight_bgra(wic, bytes, ART_SIZE) {
-            Some(straight_art) => (ART_SIZE, ART_SIZE, straight_to_premul_bgra(&straight_art)),
-            None => (THUMB_SIZE, THUMB_SIZE, thumb_pbgra.clone()),
-        };
+    let art_pbgra = straight_to_premul_bgra(&straight_art);
 
     Some(MediaCover {
         hash,
         thumb_w: THUMB_SIZE,
         thumb_h: THUMB_SIZE,
         thumb_pbgra,
-        art_w,
-        art_h,
+        art_w: ART_SIZE,
+        art_h: ART_SIZE,
         art_pbgra,
         accent_dark,
         accent_light,

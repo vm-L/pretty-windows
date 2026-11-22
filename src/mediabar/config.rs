@@ -29,6 +29,7 @@ impl Default for Config {
 impl Config {
     /// Parses configuration from TOML-formatted text, falling back to defaults for missing/invalid fields.
     pub fn parse(content: &str) -> Self {
+        let content = content.trim_start_matches('\u{feff}');
         let mut cfg = Self::default();
         for raw_line in content.lines() {
             let line = raw_line.split('#').next().unwrap_or("").trim();
@@ -83,10 +84,10 @@ impl Config {
         }
     }
 
-    /// Saves configuration to disk next to the executable.
+    /// Saves configuration atomically to disk next to the executable.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn save_to_path(&self, path: &Path) -> std::io::Result<()> {
-        fs::write(path, self.serialize())
+        crate::system::atomic_write_string(path, &self.serialize())
     }
 }
 
@@ -134,8 +135,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_returns_default() {
+    fn missing_file_and_utf8_bom_parse_safely() {
         let cfg = Config::load_from_path(Path::new("/nonexistent/path/MediaBar_does_not_exist.toml"));
         assert_eq!(cfg, Config::default());
+
+        let bom = Config::parse("\u{feff}enabled = false\nauto_color = false\noffset_x = 12\n");
+        assert!(!bom.enabled);
+        assert!(!bom.auto_color);
+        assert_eq!(bom.offset_x, 12);
     }
 }

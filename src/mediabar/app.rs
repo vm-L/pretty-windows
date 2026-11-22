@@ -25,7 +25,10 @@ use super::taskbar::{
     TaskbarState,
 };
 use super::timeline::current_filetime_100ns;
-use super::volume::{slider_ratio_from_x, step_volume_by_wheel, MasterVolumeControl};
+use super::volume::{
+    slider_ratio_from_x, MasterVolumeControl, VolumeWatcher, VOL_EVENT_DEVICE, VOL_EVENT_MASTER,
+    VOL_EVENT_SESSIONS, WM_APP_VOLUME_UPDATED,
+};
 use crate::color::{
     derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK,
 };
@@ -115,6 +118,7 @@ struct AppState {
     drag_start_screen_x: i32,
     drag_start_offset_x: i32,
 
+    volume_watcher: Option<VolumeWatcher>,
     master_vol_ctrl: Option<MasterVolumeControl>,
     master_vol: f32,
     master_muted: bool,
@@ -168,7 +172,7 @@ impl AppState {
             .unwrap_or(NEUTRAL_BACKDROP_FALLBACK);
 
         let renderer = BarRenderer::new_with_factories(d2d_factory, dwrite_factory)?;
-        let popup = SourcePopup::new(
+        let mut popup = SourcePopup::new(
             hwnd,
             renderer.d2d_factory.clone(),
             renderer.dwrite_factory.clone(),
@@ -178,6 +182,15 @@ impl AppState {
             renderer.d2d_factory.clone(),
             renderer.dwrite_factory.clone(),
         )?;
+
+        let volume_watcher = VolumeWatcher::start(hwnd);
+        if let Some(ref watcher) = volume_watcher {
+            popup.set_volume_shared(watcher.shared_state());
+        }
+        let (init_master_vol, init_master_muted) = volume_watcher
+            .as_ref()
+            .and_then(|w| w.current_master_state())
+            .unwrap_or((1.0, false));
 
         let smtc = start_smtc_worker(hwnd, NEUTRAL_BACKDROP_FALLBACK);
         let audio = start_audio_worker();
@@ -221,9 +234,10 @@ impl AppState {
             is_dragging: false,
             drag_start_screen_x: 0,
             drag_start_offset_x: 0,
+            volume_watcher,
             master_vol_ctrl: None,
-            master_vol: 1.0,
-            master_muted: false,
+            master_vol: init_master_vol,
+            master_muted: init_master_muted,
             vol_hud_active: false,
             vol_hud_dragging: false,
             vol_hud_deadline: None,
@@ -684,19 +698,13 @@ impl AppState {
         if self.master_vol_ctrl.is_none() {
             self.master_vol_ctrl = MasterVolumeControl::open_default();
         }
-        let (base_vol, base_muted) = self
+        if let Some((actual_vol, actual_muted)) = self
             .master_vol_ctrl
-            .as_ref()
-            .and_then(|c| c.get_state())
-            .unwrap_or((self.master_vol, self.master_muted));
-        let (next_vol, next_muted) = step_volume_by_wheel(base_vol, base_muted, wheel_delta);
-        self.master_vol = next_vol;
-        self.master_muted = next_muted;
-        if let Some(ref ctrl) = self.master_vol_ctrl {
-            let _ = ctrl.set_volume(next_vol);
-            if base_muted != next_muted {
-                let _ = ctrl.set_mute(next_muted);
-            }
+            .as_mut()
+            .and_then(|ctrl| ctrl.step_wheel_and_readback(wheel_delta))
+        {
+            self.master_vol = actual_vol;
+            self.master_muted = actual_muted;
         }
         self.vol_hud_active = true;
         self.vol_hud_deadline = Some(Instant::now() + VOL_HUD_TIMEOUT);
@@ -724,15 +732,17 @@ impl AppState {
         if self.master_vol_ctrl.is_none() {
             self.master_vol_ctrl = MasterVolumeControl::open_default();
         }
-        let unmute = self.master_muted && ratio > 0.0;
-        self.master_vol = ratio;
-        if unmute {
-            self.master_muted = false;
-        }
-        if let Some(ref ctrl) = self.master_vol_ctrl {
-            let _ = ctrl.set_volume(ratio);
-            if unmute {
-                let _ = ctrl.set_mute(false);
+        if let Some((actual_vol, actual_muted)) = self
+            .master_vol_ctrl
+            .as_mut()
+            .and_then(|ctrl| ctrl.set_volume_and_readback(ratio))
+        {
+            self.master_vol = actual_vol;
+            self.master_muted = actual_muted;
+        } else {
+            self.master_vol = ratio;
+            if self.master_muted && ratio > 0.0 {
+                self.master_muted = false;
             }
         }
         self.vol_hud_deadline = Some(Instant::now() + VOL_HUD_TIMEOUT);
@@ -744,9 +754,15 @@ impl AppState {
             self.master_vol_ctrl = MasterVolumeControl::open_default();
         }
         let next_muted = !self.master_muted;
-        self.master_muted = next_muted;
-        if let Some(ref ctrl) = self.master_vol_ctrl {
-            let _ = ctrl.set_mute(next_muted);
+        if let Some((actual_vol, actual_muted)) = self
+            .master_vol_ctrl
+            .as_mut()
+            .and_then(|ctrl| ctrl.set_mute_and_readback(next_muted))
+        {
+            self.master_vol = actual_vol;
+            self.master_muted = actual_muted;
+        } else {
+            self.master_muted = next_muted;
         }
         self.vol_hud_deadline = Some(Instant::now() + VOL_HUD_TIMEOUT);
         self.dirty = true;
@@ -758,7 +774,7 @@ impl AppState {
         }
         if let Some((vol, muted)) = self
             .master_vol_ctrl
-            .as_ref()
+            .as_mut()
             .and_then(|c| c.get_state())
         {
             self.master_vol = vol;
@@ -767,30 +783,110 @@ impl AppState {
     }
 
     fn apply_mini_player_wheel(&mut self, wheel_delta: i16) {
-        self.refresh_master_volume_state();
-        let base_muted = self.master_muted;
-        let (next_vol, next_muted) =
-            step_volume_by_wheel(self.master_vol, base_muted, wheel_delta);
-        self.master_vol = next_vol;
-        self.master_muted = next_muted;
-        if let Some(ref ctrl) = self.master_vol_ctrl {
-            let _ = ctrl.set_volume(next_vol);
-            if base_muted != next_muted {
-                let _ = ctrl.set_mute(next_muted);
-            }
+        if self.master_vol_ctrl.is_none() {
+            self.master_vol_ctrl = MasterVolumeControl::open_default();
         }
-        self.mini_player.update_volume(next_vol, next_muted, true);
+        if let Some((next_vol, next_muted)) = self
+            .master_vol_ctrl
+            .as_mut()
+            .and_then(|ctrl| ctrl.step_wheel_and_readback(wheel_delta))
+        {
+            self.master_vol = next_vol;
+            self.master_muted = next_muted;
+        } else {
+            self.refresh_master_volume_state();
+        }
+        self.mini_player
+            .update_volume(self.master_vol, self.master_muted, true);
     }
 
     fn toggle_mini_player_mute(&mut self) {
         self.refresh_master_volume_state();
         let next_muted = !self.master_muted;
-        self.master_muted = next_muted;
-        if let Some(ref ctrl) = self.master_vol_ctrl {
-            let _ = ctrl.set_mute(next_muted);
+        if let Some((actual_vol, actual_muted)) = self
+            .master_vol_ctrl
+            .as_mut()
+            .and_then(|ctrl| ctrl.set_mute_and_readback(next_muted))
+        {
+            self.master_vol = actual_vol;
+            self.master_muted = actual_muted;
+        } else {
+            self.master_muted = next_muted;
         }
         self.mini_player
-            .update_volume(self.master_vol, next_muted, true);
+            .update_volume(self.master_vol, self.master_muted, true);
+    }
+
+    fn handle_external_volume_events(&mut self, msg_flag: usize) {
+        let pending = self
+            .volume_watcher
+            .as_ref()
+            .map_or(0, VolumeWatcher::take_pending_events);
+        let flags = msg_flag | pending;
+
+        if (flags & VOL_EVENT_DEVICE) != 0 {
+            self.master_vol_ctrl = None;
+            let (render_changed, latest) = self
+                .volume_watcher
+                .as_mut()
+                .map_or((true, None), VolumeWatcher::rebind_default_endpoint);
+            if render_changed {
+                self.audio.notify_device_changed();
+            }
+            if let Some((vol, muted)) = latest {
+                self.master_vol = vol;
+                self.master_muted = muted;
+            } else {
+                self.refresh_master_volume_state();
+            }
+            if self.popup.is_visible() {
+                self.popup
+                    .sync_external_devices(self.master_vol, self.master_muted);
+            }
+            if self.mini_player.is_visible() {
+                self.mini_player
+                    .update_volume(self.master_vol, self.master_muted, false);
+            }
+            if self.vol_hud_active && !self.vol_hud_dragging {
+                self.dirty = true;
+                self.render_now();
+            }
+            return;
+        }
+
+        if (flags & VOL_EVENT_MASTER) != 0 {
+            let prev = (self.master_vol, self.master_muted);
+            if let Some((vol, muted)) = self
+                .volume_watcher
+                .as_ref()
+                .and_then(VolumeWatcher::current_master_state)
+            {
+                self.master_vol = vol;
+                self.master_muted = muted;
+            } else {
+                self.refresh_master_volume_state();
+            }
+            let changed =
+                (self.master_vol - prev.0).abs() > 0.001 || self.master_muted != prev.1;
+            if changed {
+                if self.vol_hud_active && !self.vol_hud_dragging {
+                    self.dirty = true;
+                    self.render_now();
+                }
+                if self.mini_player.is_visible() {
+                    self.mini_player
+                        .update_volume(self.master_vol, self.master_muted, true);
+                }
+            }
+            if self.popup.is_visible() {
+                self.popup
+                    .sync_external_master_volume(self.master_vol, self.master_muted);
+            }
+        }
+
+        if (flags & VOL_EVENT_SESSIONS) != 0 && self.popup.is_visible() {
+            self.popup.sync_external_sessions();
+        }
     }
 
     fn sync_hover_with_cursor(&mut self) {
@@ -960,6 +1056,24 @@ impl AppState {
     }
 }
 
+struct InitHwndGuard(Option<HWND>);
+
+impl InitHwndGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for InitHwndGuard {
+    fn drop(&mut self) {
+        if let Some(hwnd) = self.0.take() {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
+    }
+}
+
 /// Live hosted instance of the MediaBar taskbar controller.
 pub struct MediaBarInstance {
     hwnd: HWND,
@@ -1004,6 +1118,7 @@ impl MediaBarInstance {
                 hinst,
                 None,
             )?;
+            let mut hwnd_guard = InitHwndGuard(Some(hwnd));
             exclude_from_peek(hwnd);
 
             let app = Rc::new(RefCell::new(AppState::new(
@@ -1015,6 +1130,7 @@ impl MediaBarInstance {
                 dwrite_factory,
             )?));
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(app) as isize);
+            hwnd_guard.disarm();
             crate::system::register_taskbar_overlay(hwnd);
             register_taskbar_bar(TaskbarBarSlot::MediaBar, hwnd, WM_APP_MEDIABAR_RESYNC_POS);
             notify_peer_taskbar_bar_resync(TaskbarBarSlot::MediaBar);
@@ -1069,6 +1185,9 @@ unsafe extern "system" fn main_wnd_proc(
         let _ = KillTimer(hwnd, TIMER_GUARD_ID);
         let _ = KillTimer(hwnd, TIMER_ANIM_ID);
         if let Ok(mut state) = rc.try_borrow_mut() {
+            if let Some(ref mut watcher) = state.volume_watcher {
+                watcher.shutdown();
+            }
             state.popup.hide();
             state.mini_player.hide();
             state.audio.shutdown();
@@ -1238,7 +1357,7 @@ unsafe extern "system" fn main_wnd_proc(
             if let Ok(mut state) = rc.try_borrow_mut() {
                 if wparam.0 == usize::MAX {
                     state.arbitrator.set_auto();
-                } else if let Some(id) = state.popup.source_id_at(wparam.0) {
+                } else if let Some(id) = state.popup.take_selected_source_id() {
                     state.arbitrator.set_manual(id);
                 }
                 state.refresh_smtc_selection();
@@ -1303,8 +1422,23 @@ unsafe extern "system" fn main_wnd_proc(
         WM_APP_AUDIO_OUTPUT_CHANGED => {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 state.master_vol_ctrl = None;
+                if let Some(ref mut watcher) = state.volume_watcher {
+                    let (_, latest) = watcher.rebind_default_endpoint();
+                    if let Some((vol, muted)) = latest {
+                        state.master_vol = vol;
+                        state.master_muted = muted;
+                    }
+                } else {
+                    state.refresh_master_volume_state();
+                }
                 state.audio.notify_device_changed();
                 state.smtc.send(SmtcCommand::Refresh);
+            }
+            LRESULT(0)
+        }
+        WM_APP_VOLUME_UPDATED => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.handle_external_volume_events(wparam.0);
             }
             LRESULT(0)
         }

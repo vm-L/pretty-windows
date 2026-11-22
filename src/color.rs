@@ -122,8 +122,13 @@ pub fn extract_accent_from_bgra(
     fallback: Rgb,
 ) -> Rgb {
     const BUCKETS: usize = 24;
-    let total_pixels = (width as usize).saturating_mul(height as usize);
-    if total_pixels == 0 || bgra.len() < total_pixels * 4 {
+    let Some(total_pixels) = (width as usize).checked_mul(height as usize) else {
+        return adjust_accent_for_theme(fallback, light_taskbar);
+    };
+    let Some(required_len) = total_pixels.checked_mul(4) else {
+        return adjust_accent_for_theme(fallback, light_taskbar);
+    };
+    if total_pixels == 0 || bgra.len() < required_len {
         return adjust_accent_for_theme(fallback, light_taskbar);
     }
 
@@ -249,14 +254,15 @@ pub fn extract_accent_from_bgra(
 /// Computes the mean opaque RGB color of a BGRA8 image (used to sample popup/taskbar backdrops).
 pub fn extract_backdrop_base_rgb(bgra: &[u8], width: usize, height: usize) -> Option<Rgb> {
     let total_pixels = width.checked_mul(height)?;
-    if total_pixels == 0 || bgra.len() < total_pixels * 4 {
+    let byte_len = total_pixels.checked_mul(4)?;
+    if total_pixels == 0 || bgra.len() < byte_len {
         return None;
     }
     let mut sum_r = 0u64;
     let mut sum_g = 0u64;
     let mut sum_b = 0u64;
     let mut count = 0u64;
-    for px in bgra[..total_pixels * 4].chunks_exact(4) {
+    for px in bgra[..byte_len].chunks_exact(4) {
         if px[3] >= 128 {
             sum_b += u64::from(px[0]);
             sum_g += u64::from(px[1]);
@@ -388,11 +394,14 @@ pub fn enforce_ui_accent_deadzone(color: Rgb, light_theme: bool) -> Rgb {
 
 /// Applies a fast 3-pass separable box blur (approximating Gaussian blur) on BGRA8 pixels.
 pub fn gaussian_blur_bgra(bgra: &[u8], width: usize, height: usize, radius: usize) -> Vec<u8> {
-    if width == 0 || height == 0 || radius == 0 || bgra.len() < width * height * 4 {
+    let Some(byte_len) = width.checked_mul(height).and_then(|px| px.checked_mul(4)) else {
+        return bgra.to_vec();
+    };
+    if byte_len == 0 || radius == 0 || bgra.len() < byte_len {
         return bgra.to_vec();
     }
 
-    let mut src = bgra[..width * height * 4].to_vec();
+    let mut src = bgra[..byte_len].to_vec();
     let mut tmp = vec![0u8; src.len()];
 
     for _ in 0..3 {
@@ -948,5 +957,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dimension_multiplication_overflow_falls_back_safely_without_panic() {
+        let tiny = [0u8, 0, 0, 255];
+        let fb = Rgb::new(40, 100, 220);
+        let accent = extract_accent_from_bgra(&tiny, (usize::MAX / 2) as u32, 4, false, fb);
+        assert_eq!(accent, adjust_accent_for_theme(fb, false));
+        assert_eq!(extract_backdrop_base_rgb(&tiny, usize::MAX / 2, 4), None);
+        assert_eq!(gaussian_blur_bgra(&tiny, usize::MAX / 2, 4, 2), tiny);
     }
 }

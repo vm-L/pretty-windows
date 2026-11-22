@@ -25,8 +25,10 @@ use crate::system::{
     update_taskbar_bar_bounds, BarCollisionMode, TaskbarBarSlot,
 };
 use crate::ui::POPUP_REOPEN_DEBOUNCE_MS;
+use std::cell::RefCell;
 use std::mem::size_of;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::w;
@@ -59,6 +61,18 @@ const TIMER_SYNC_MS: u32 = 300;
 const TIMER_HOVER_MS: u32 = 16;
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const DRAG_THRESHOLD_PX: i32 = 4;
+
+struct InitHwndGuard(HWND);
+
+impl Drop for InitHwndGuard {
+    fn drop(&mut self) {
+        if !self.0 .0.is_null() {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+}
 
 /// Lifecycle handle for the running MonitorBar widget owned by the tray host.
 pub struct MonitorBarInstance {
@@ -99,6 +113,7 @@ impl MonitorBarInstance {
                 hinst,
                 None,
             )?;
+            let mut hwnd_guard = InitHwndGuard(hwnd);
             exclude_from_peek(hwnd);
 
             let d2d_factory: ID2D1Factory1 =
@@ -106,7 +121,8 @@ impl MonitorBarInstance {
             let dwrite_factory: IDWriteFactory =
                 DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
 
-            let cfg_val = load_or_create(&config_path);
+            let mut cfg_val = load_or_create(&config_path);
+            cfg_val.enabled = true;
             let cfg = Arc::new(Mutex::new(cfg_val));
 
             let metrics = MetricsHandle::start(hwnd, WM_APP_MONITOR_METRICS_UPDATED);
@@ -130,7 +146,7 @@ impl MonitorBarInstance {
             let init_dpi = query_taskbar_state().map(|t| t.dpi).unwrap_or(96);
             let (drag_cursor, drag_cursor_owned) = renderer.create_grabbing_cursor(init_dpi)?;
 
-            let mut state = Box::new(AppState {
+            let state = Rc::new(RefCell::new(AppState {
                 hwnd,
                 host_hwnd,
                 close_msg,
@@ -163,15 +179,17 @@ impl MonitorBarInstance {
                 arrow_cursor,
                 drag_cursor,
                 drag_cursor_owned,
-            });
+                cleaned_up: false,
+            }));
 
-            state.sync_taskbar_and_render(true);
+            state.borrow_mut().sync_taskbar_and_render(true);
 
             SetWindowLongPtrW(
                 hwnd,
                 GWLP_USERDATA,
-                Box::into_raw(state) as isize,
+                Rc::into_raw(state) as isize,
             );
+            hwnd_guard.0 = HWND::default();
             crate::system::register_taskbar_overlay(hwnd);
             register_taskbar_bar(TaskbarBarSlot::MonitorBar, hwnd, WM_APP_MONITOR_RESYNC_POS);
             notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
@@ -230,9 +248,27 @@ struct AppState {
     arrow_cursor: HCURSOR,
     drag_cursor: HCURSOR,
     drag_cursor_owned: bool,
+    cleaned_up: bool,
 }
 
 impl AppState {
+    fn cleanup_resources(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
+        self.cleaned_up = true;
+        self.popup.hide_immediately();
+        self.metrics.stop();
+        self.wireless.stop();
+        self.brightness.stop();
+        if self.drag_cursor_owned && !self.drag_cursor.is_invalid() {
+            unsafe {
+                let _ = DestroyIcon(HICON(self.drag_cursor.0));
+            }
+            self.drag_cursor = HCURSOR::default();
+            self.drag_cursor_owned = false;
+        }
+    }
     fn cfg_snapshot(&self) -> MonitorConfig {
         self.cfg.lock().map(|g| g.clone()).unwrap_or_default()
     }
@@ -443,21 +479,48 @@ impl AppState {
     }
 }
 
+impl Drop for AppState {
+    fn drop(&mut self) {
+        self.cleanup_resources();
+    }
+}
+
 unsafe extern "system" fn monitor_bar_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
-    if ptr.is_null() {
+    let raw_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<AppState>;
+    if raw_ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
-    let state = &mut *ptr;
 
-    if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
+    if msg == WM_DESTROY {
+        crate::system::unregister_taskbar_overlay(hwnd);
+        unregister_taskbar_bar(TaskbarBarSlot::MonitorBar, hwnd);
+        let _ = KillTimer(hwnd, TIMER_SYNC_ID);
+        let _ = KillTimer(hwnd, TIMER_HOVER_ANIM_ID);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        let rc = Rc::from_raw(raw_ptr);
+        if let Ok(mut owned) = rc.try_borrow_mut() {
+            owned.cleanup_resources();
+        }
+        return LRESULT(0);
+    }
+
+    Rc::increment_strong_count(raw_ptr);
+    let rc = Rc::from_raw(raw_ptr);
+
+    let taskbar_created_msg = rc
+        .try_borrow()
+        .map(|s| s.taskbar_created_msg)
+        .unwrap_or(0);
+    if taskbar_created_msg != 0 && msg == taskbar_created_msg {
         crate::system::refresh_taskbar_overlay_hooks();
-        state.sync_taskbar_and_render(true);
+        if let Ok(mut state) = rc.try_borrow_mut() {
+            state.sync_taskbar_and_render(true);
+        }
         return LRESULT(0);
     }
 
@@ -470,223 +533,239 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
         }
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_TIMER => {
-            if wparam.0 == TIMER_SYNC_ID {
-                state.sync_taskbar_and_render(false);
-            } else if wparam.0 == TIMER_HOVER_ANIM_ID {
-                let target = state.desired_hover_target();
-                let step: f32 = if target > state.hover_t { 0.18 } else { -0.14 };
-                state.hover_t = if (target - state.hover_t).abs() <= step.abs() {
-                    target
-                } else {
-                    (state.hover_t + step).clamp(0.0, 1.0)
-                };
-                state.ensure_hover_timer();
-                state.render_now();
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                if wparam.0 == TIMER_SYNC_ID {
+                    state.sync_taskbar_and_render(false);
+                } else if wparam.0 == TIMER_HOVER_ANIM_ID {
+                    let target = state.desired_hover_target();
+                    let step: f32 = if target > state.hover_t { 0.18 } else { -0.14 };
+                    state.hover_t = if (target - state.hover_t).abs() <= step.abs() {
+                        target
+                    } else {
+                        (state.hover_t + step).clamp(0.0, 1.0)
+                    };
+                    state.ensure_hover_timer();
+                    state.render_now();
+                }
             }
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            let cfg = state.cfg_snapshot();
-            let movable = state.dragging || !cfg.locked;
-            let _ = SetCursor(if movable {
-                state.drag_cursor
-            } else {
-                state.arrow_cursor
-            });
+            let cursor = rc
+                .try_borrow()
+                .map(|state| {
+                    let cfg = state.cfg_snapshot();
+                    let movable = state.dragging || !cfg.locked;
+                    if movable {
+                        state.drag_cursor
+                    } else {
+                        state.arrow_cursor
+                    }
+                })
+                .unwrap_or_else(|_| LoadCursorW(None, IDC_ARROW).unwrap_or_default());
+            let _ = SetCursor(cursor);
             LRESULT(1)
         }
         WM_MOUSEMOVE => {
-            if !state.tracking_leave {
-                let mut tme = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                if TrackMouseEvent(&mut tme).is_ok() {
-                    state.tracking_leave = true;
-                }
-            }
-            if !state.mouse_inside {
-                state.mouse_inside = true;
-                state.ensure_hover_timer();
-            }
-
-            if state.drag_pending || state.dragging {
-                let mut pt = POINT::default();
-                if GetCursorPos(&mut pt).is_ok() {
-                    let dx = pt.x - state.press_cursor_x;
-                    if state.drag_pending && dx.abs() >= DRAG_THRESHOLD_PX {
-                        state.drag_pending = false;
-                        state.dragging = true;
-                        let _ = SetCursor(state.drag_cursor);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                if !state.tracking_leave {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    if TrackMouseEvent(&mut tme).is_ok() {
+                        state.tracking_leave = true;
                     }
-                    if state.dragging {
-                        state.sync_taskbar_and_render_with_mode(
-                            true,
-                            Some(state.press_offset_x + dx),
-                            BarCollisionMode::Drag,
-                        );
+                }
+                if !state.mouse_inside {
+                    state.mouse_inside = true;
+                    state.ensure_hover_timer();
+                }
+
+                if state.drag_pending || state.dragging {
+                    let mut pt = POINT::default();
+                    if GetCursorPos(&mut pt).is_ok() {
+                        let dx = pt.x - state.press_cursor_x;
+                        if state.drag_pending && dx.abs() >= DRAG_THRESHOLD_PX {
+                            state.drag_pending = false;
+                            state.dragging = true;
+                            let _ = SetCursor(state.drag_cursor);
+                        }
+                        if state.dragging {
+                            let target_offset = state.press_offset_x + dx;
+                            state.sync_taskbar_and_render_with_mode(
+                                true,
+                                Some(target_offset),
+                                BarCollisionMode::Drag,
+                            );
+                        }
                     }
                 }
             }
             LRESULT(0)
         }
         WM_MOUSELEAVE_MSG => {
-            state.tracking_leave = false;
-            state.mouse_inside = false;
-            state.ensure_hover_timer();
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.tracking_leave = false;
+                state.mouse_inside = false;
+                state.ensure_hover_timer();
+            }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let cfg = state.cfg_snapshot();
-            let can_drag = !cfg.locked;
-            let press_offset_x = if state.bar_w > 0 {
-                query_taskbar_state()
-                    .map(|tb| {
-                        let width_dip = MonitorLayout::desired_width_dip(&cfg);
-                        state.bar_x - default_monitor_bar_x(&tb, width_dip)
-                    })
-                    .unwrap_or(cfg.offset_x)
-            } else {
-                cfg.offset_x
-            };
-            state.lbutton_down = true;
-            state.drag_pending = can_drag;
-            state.dragging = false;
-            state.press_cursor_x = pt.x;
-            state.press_offset_x = press_offset_x;
-            let _ = SetCapture(hwnd);
-            if can_drag {
-                let _ = SetCursor(state.drag_cursor);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let cfg = state.cfg_snapshot();
+                let can_drag = !cfg.locked;
+                let press_offset_x = if state.bar_w > 0 {
+                    query_taskbar_state()
+                        .map(|tb| {
+                            let width_dip = MonitorLayout::desired_width_dip(&cfg);
+                            state.bar_x - default_monitor_bar_x(&tb, width_dip)
+                        })
+                        .unwrap_or(cfg.offset_x)
+                } else {
+                    cfg.offset_x
+                };
+                state.lbutton_down = true;
+                state.drag_pending = can_drag;
+                state.dragging = false;
+                state.press_cursor_x = pt.x;
+                state.press_offset_x = press_offset_x;
+                let _ = SetCapture(hwnd);
+                if can_drag {
+                    let _ = SetCursor(state.drag_cursor);
+                }
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_pressed = state.lbutton_down;
-            let was_dragging = state.dragging;
-            // Clear flags before ReleaseCapture so synchronous WM_CAPTURECHANGED cannot clobber was_pressed.
-            state.lbutton_down = false;
-            state.drag_pending = false;
-            state.dragging = false;
+            let action_ctx = if let Ok(mut state) = rc.try_borrow_mut() {
+                let was_pressed = state.lbutton_down;
+                let was_dragging = state.dragging;
+                // Clear flags before ReleaseCapture so synchronous WM_CAPTURECHANGED cannot clobber was_pressed.
+                state.lbutton_down = false;
+                state.drag_pending = false;
+                state.dragging = false;
+                Some((was_pressed, was_dragging))
+            } else {
+                None
+            };
             let _ = ReleaseCapture();
 
-            let cfg = state.cfg_snapshot();
-            if was_dragging {
-                state.save_current_cfg(&cfg);
-                notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
-                state.ensure_hover_timer();
-                state.render_now();
-            } else if was_pressed && cfg.locked {
-                let mut pt = POINT::default();
-                let inside = GetCursorPos(&mut pt).is_ok()
-                    && pt.x >= state.bar_x
-                    && pt.x <= state.bar_x + state.bar_w
-                    && pt.y >= state.bar_y
-                    && pt.y <= state.bar_y + state.bar_h;
-                if inside {
-                    state.handle_left_click(pt.x);
+            if let Some((was_pressed, was_dragging)) = action_ctx {
+                if IsWindow(hwnd).as_bool() {
+                    if let Ok(mut state) = rc.try_borrow_mut() {
+                        let cfg = state.cfg_snapshot();
+                        if was_dragging {
+                            state.save_current_cfg(&cfg);
+                            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
+                            state.ensure_hover_timer();
+                            state.render_now();
+                        } else if was_pressed && cfg.locked {
+                            let mut pt = POINT::default();
+                            let inside = GetCursorPos(&mut pt).is_ok()
+                                && pt.x >= state.bar_x
+                                && pt.x <= state.bar_x + state.bar_w
+                                && pt.y >= state.bar_y
+                                && pt.y <= state.bar_y + state.bar_h;
+                            if inside {
+                                state.handle_left_click(pt.x);
+                            }
+                        }
+                    }
                 }
             }
             LRESULT(0)
         }
         WM_RBUTTONDOWN | WM_CONTEXTMENU => LRESULT(0),
         WM_RBUTTONUP => {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            state.toggle_popup(pt.x);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                state.toggle_popup(pt.x);
+            }
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            state.lbutton_down = false;
-            state.drag_pending = false;
-            state.dragging = false;
-            state.ensure_hover_timer();
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.lbutton_down = false;
+                state.drag_pending = false;
+                state.dragging = false;
+                state.ensure_hover_timer();
+            }
             LRESULT(0)
         }
         WM_DPICHANGED | WM_SETTINGCHANGE => {
-            state.sync_taskbar_and_render(true);
-            if msg == WM_DPICHANGED {
-                if let Ok((new_drag, new_owned)) = state.renderer.create_grabbing_cursor(state.dpi)
-                {
-                    if state.drag_cursor_owned && !state.drag_cursor.is_invalid() {
-                        let _ = DestroyIcon(HICON(state.drag_cursor.0));
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.sync_taskbar_and_render(true);
+                if msg == WM_DPICHANGED {
+                    if let Ok((new_drag, new_owned)) = state.renderer.create_grabbing_cursor(state.dpi)
+                    {
+                        if state.drag_cursor_owned && !state.drag_cursor.is_invalid() {
+                            let _ = DestroyIcon(HICON(state.drag_cursor.0));
+                        }
+                        state.drag_cursor = new_drag;
+                        state.drag_cursor_owned = new_owned;
                     }
-                    state.drag_cursor = new_drag;
-                    state.drag_cursor_owned = new_owned;
                 }
             }
             LRESULT(0)
         }
         WM_APP_MONITOR_METRICS_UPDATED => {
-            state.render_now();
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.render_now();
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_WIRELESS_UPDATED => {
-            state.popup.update_wireless(state.wireless.snapshot());
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let snap = state.wireless.snapshot();
+                state.popup.update_wireless(snap);
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_BRIGHTNESS_UPDATED => {
-            state.popup.update_brightness(state.brightness.snapshot());
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let snap = state.brightness.snapshot();
+                state.popup.update_brightness(snap);
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_POPUP_CLOSED => {
-            state.popup_closed_at = Some(Instant::now());
-            let mut pt = POINT::default();
-            state.mouse_inside = GetCursorPos(&mut pt).is_ok()
-                && pt.x >= state.bar_x
-                && pt.x <= state.bar_x + state.bar_w
-                && pt.y >= state.bar_y
-                && pt.y <= state.bar_y + state.bar_h;
-            state.ensure_hover_timer();
-            state.render_now();
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.popup_closed_at = Some(Instant::now());
+                let mut pt = POINT::default();
+                state.mouse_inside = GetCursorPos(&mut pt).is_ok()
+                    && pt.x >= state.bar_x
+                    && pt.x <= state.bar_x + state.bar_w
+                    && pt.y >= state.bar_y
+                    && pt.y <= state.bar_y + state.bar_h;
+                state.ensure_hover_timer();
+                state.render_now();
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_CONFIG_CHANGED => {
-            state.sync_taskbar_and_render(true);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.sync_taskbar_and_render(true);
+            }
             notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
             LRESULT(0)
         }
         WM_APP_MONITOR_RESYNC_POS => {
-            state.sync_taskbar_and_render(false);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.sync_taskbar_and_render(false);
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_TOGGLE_LOCK => {
-            let updated = if let Ok(mut guard) = state.cfg.lock() {
-                guard.locked = !guard.locked;
-                Some(guard.clone())
-            } else {
-                None
-            };
-            if let Some(cfg) = updated {
-                state.save_current_cfg(&cfg);
-            }
-            state.render_now();
-            LRESULT(0)
-        }
-        WM_APP_MONITOR_RESET_POS => {
-            let updated = if let Ok(mut guard) = state.cfg.lock() {
-                guard.offset_x = 0;
-                Some(guard.clone())
-            } else {
-                None
-            };
-            if let Some(cfg) = updated {
-                state.save_current_cfg(&cfg);
-            }
-            state.sync_taskbar_and_render(true);
-            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
-            LRESULT(0)
-        }
-        WM_APP_MONITOR_PICK_CUSTOM_APP => {
-            state.popup.hide_immediately();
-            let current = state.cfg_snapshot().custom_app_path;
-            if let Some(chosen) = pick_custom_app_file(hwnd, &current) {
+            if let Ok(mut state) = rc.try_borrow_mut() {
                 let updated = if let Ok(mut guard) = state.cfg.lock() {
-                    guard.custom_app_path = chosen;
-                    guard.left_click = LeftClickAction::CustomApp;
+                    guard.locked = !guard.locked;
                     Some(guard.clone())
                 } else {
                     None
@@ -694,31 +773,62 @@ unsafe extern "system" fn monitor_bar_wnd_proc(
                 if let Some(cfg) = updated {
                     state.save_current_cfg(&cfg);
                 }
+                state.render_now();
             }
-            state.ensure_hover_timer();
-            state.render_now();
+            LRESULT(0)
+        }
+        WM_APP_MONITOR_RESET_POS => {
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                let updated = if let Ok(mut guard) = state.cfg.lock() {
+                    guard.offset_x = 0;
+                    Some(guard.clone())
+                } else {
+                    None
+                };
+                if let Some(cfg) = updated {
+                    state.save_current_cfg(&cfg);
+                }
+                state.sync_taskbar_and_render(true);
+            }
+            notify_peer_taskbar_bar_resync(TaskbarBarSlot::MonitorBar);
+            LRESULT(0)
+        }
+        WM_APP_MONITOR_PICK_CUSTOM_APP => {
+            let current = if let Ok(mut state) = rc.try_borrow_mut() {
+                state.popup.hide_immediately();
+                Some(state.cfg_snapshot().custom_app_path)
+            } else {
+                None
+            };
+            if let Some(current) = current {
+                // Run the modal file picker without holding a RefCell borrow or topmost owner.
+                let chosen = pick_custom_app_file(HWND::default(), &current);
+                if IsWindow(hwnd).as_bool() {
+                    if let Ok(mut state) = rc.try_borrow_mut() {
+                        if let Some(chosen) = chosen {
+                            let updated = if let Ok(mut guard) = state.cfg.lock() {
+                                guard.custom_app_path = chosen;
+                                guard.left_click = LeftClickAction::CustomApp;
+                                Some(guard.clone())
+                            } else {
+                                None
+                            };
+                            if let Some(cfg) = updated {
+                                state.save_current_cfg(&cfg);
+                            }
+                        }
+                        state.ensure_hover_timer();
+                        state.render_now();
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_APP_MONITOR_CLOSE_SELF => {
-            state.popup.hide_immediately();
-            let _ = PostMessageW(state.host_hwnd, state.close_msg, WPARAM(0), LPARAM(0));
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            crate::system::unregister_taskbar_overlay(hwnd);
-            unregister_taskbar_bar(TaskbarBarSlot::MonitorBar, hwnd);
-            let _ = KillTimer(hwnd, TIMER_SYNC_ID);
-            let _ = KillTimer(hwnd, TIMER_HOVER_ANIM_ID);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            let mut owned = Box::from_raw(ptr);
-            owned.popup.hide_immediately();
-            owned.metrics.stop();
-            owned.wireless.stop();
-            owned.brightness.stop();
-            if owned.drag_cursor_owned && !owned.drag_cursor.is_invalid() {
-                let _ = DestroyIcon(HICON(owned.drag_cursor.0));
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.popup.hide_immediately();
+                let _ = PostMessageW(state.host_hwnd, state.close_msg, WPARAM(0), LPARAM(0));
             }
-            drop(owned);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),

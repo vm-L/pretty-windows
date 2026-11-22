@@ -115,6 +115,34 @@ pub fn rgb_luma(c: Rgb) -> f32 {
     (0.2126 * f32::from(c.r) + 0.7152 * f32::from(c.g) + 0.0722 * f32::from(c.b)) / 255.0
 }
 
+/// Uniform opacity lift factor applied across all backdrop surfaces (`a' = a + 0.10 * (1 - a)`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const BACKDROP_OPACITY_LIFT: f32 = 0.10;
+
+/// Moves a normalized `[0.0, 1.0]` alpha 10% closer to fully opaque (`1.0`).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub const fn lift_backdrop_alpha(alpha: f32) -> f32 {
+    let clamped = if alpha < 0.0 {
+        0.0
+    } else if alpha > 1.0 {
+        1.0
+    } else {
+        alpha
+    };
+    clamped + BACKDROP_OPACITY_LIFT * (1.0 - clamped)
+}
+
+/// Moves an `0xAARRGGBB` color's 8-bit alpha channel 10% closer to `255` (`0xFF`) without altering RGB.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub const fn lift_argb_alpha(argb: u32) -> u32 {
+    let a = (argb >> 24) & 0xFF;
+    let lifted = (a * 9 + 255 + 5) / 10;
+    let clamped = if lifted > 255 { 255 } else { lifted };
+    (clamped << 24) | (argb & 0x00FF_FFFF)
+}
+
 /// Computes unified popup glass surface parameters for a given taskbar style, system theme, and sampled backdrop luminance.
 /// Keeps dark-theme text white and light-theme text dark while softly boosting backing tint over high-contrast windows
 /// (e.g., dark theme popup over a bright white page) and preventing muddy gray cast.
@@ -136,7 +164,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 6,
             backdrop_alpha: 0.86,
             tint_rgb: tint(32.0, 32.0, 33.0),
-            tint_alpha: 0.62 + 0.04 * dark_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.62 + 0.04 * dark_bg_boost_t),
             frost_veil_top_alpha: 0.03,
             frost_veil_mid_alpha: 0.01,
             frost_veil_bot_alpha: 0.0,
@@ -153,7 +181,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 6,
             backdrop_alpha: 0.88,
             tint_rgb: tint(248.0, 248.0, 249.0),
-            tint_alpha: 0.72 + 0.04 * light_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.72 + 0.04 * light_bg_boost_t),
             frost_veil_top_alpha: 0.08,
             frost_veil_mid_alpha: 0.03,
             frost_veil_bot_alpha: 0.0,
@@ -170,7 +198,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 8,
             backdrop_alpha: 0.89,
             tint_rgb: tint(38.0, 38.0, 40.0),
-            tint_alpha: 0.52 + 0.08 * dark_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.52 + 0.08 * dark_bg_boost_t),
             frost_veil_top_alpha: 0.06,
             frost_veil_mid_alpha: 0.02,
             frost_veil_bot_alpha: 0.0,
@@ -187,7 +215,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 8,
             backdrop_alpha: 0.91,
             tint_rgb: tint(248.0, 248.0, 250.0),
-            tint_alpha: 0.63 + 0.07 * light_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.63 + 0.07 * light_bg_boost_t),
             frost_veil_top_alpha: 0.14,
             frost_veil_mid_alpha: 0.05,
             frost_veil_bot_alpha: 0.0,
@@ -204,7 +232,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 6,
             backdrop_alpha: 0.87,
             tint_rgb: tint(46.0, 46.0, 48.0),
-            tint_alpha: 0.43 + 0.13 * dark_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.43 + 0.13 * dark_bg_boost_t),
             frost_veil_top_alpha: 0.12,
             frost_veil_mid_alpha: 0.045,
             frost_veil_bot_alpha: 0.015,
@@ -221,7 +249,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 6,
             backdrop_alpha: 0.88,
             tint_rgb: tint(250.0, 250.0, 251.0),
-            tint_alpha: 0.52 + 0.12 * light_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.52 + 0.12 * light_bg_boost_t),
             frost_veil_top_alpha: 0.22,
             frost_veil_mid_alpha: 0.08,
             frost_veil_bot_alpha: 0.03,
@@ -238,7 +266,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 7,
             backdrop_alpha: 0.84,
             tint_rgb: tint(42.0, 42.0, 44.0),
-            tint_alpha: 0.36 + 0.17 * dark_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.36 + 0.17 * dark_bg_boost_t),
             frost_veil_top_alpha: 0.05,
             frost_veil_mid_alpha: 0.02,
             frost_veil_bot_alpha: 0.0,
@@ -255,7 +283,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 7,
             backdrop_alpha: 0.86,
             tint_rgb: tint(250.0, 250.0, 252.0),
-            tint_alpha: 0.42 + 0.17 * light_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.42 + 0.17 * light_bg_boost_t),
             frost_veil_top_alpha: 0.14,
             frost_veil_mid_alpha: 0.05,
             frost_veil_bot_alpha: 0.0,
@@ -272,7 +300,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 2,
             backdrop_alpha: 0.65,
             tint_rgb: tint(36.0, 36.0, 38.0),
-            tint_alpha: 0.31 + 0.19 * dark_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.31 + 0.19 * dark_bg_boost_t),
             frost_veil_top_alpha: 0.02,
             frost_veil_mid_alpha: 0.0,
             frost_veil_bot_alpha: 0.0,
@@ -289,7 +317,7 @@ pub fn popup_glass_recipe(
             blur_radius_4x: 2,
             backdrop_alpha: 0.69,
             tint_rgb: tint(250.0, 250.0, 251.0),
-            tint_alpha: 0.35 + 0.20 * light_bg_boost_t,
+            tint_alpha: lift_backdrop_alpha(0.35 + 0.20 * light_bg_boost_t),
             frost_veil_top_alpha: 0.06,
             frost_veil_mid_alpha: 0.02,
             frost_veil_bot_alpha: 0.0,
@@ -385,6 +413,10 @@ impl RectF {
     }
 }
 
+/// Outer meniscus fillet radius shared by liquid-fused cascading submenus (DIP).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const STEP_MENISCUS_DIP: f32 = 13.5;
+
 /// Lifecycle phase of a Liquid Glass popup card.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -392,6 +424,159 @@ pub enum PopupAnimPhase {
     Opening,
     Open,
     Closing,
+}
+
+/// Computes the primary card's animated envelope anchored at its bottom/sides during open/close.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn animated_primary_rect(
+    target: RectF,
+    phase: PopupAnimPhase,
+    open_pos: f32,
+    close_progress: f32,
+    s: f32,
+) -> RectF {
+    let target_h = target.height().max(1.0);
+    let min_h = (42.0 * s).min(target_h * 0.65);
+    match phase {
+        PopupAnimPhase::Opening => {
+            let h = (min_h + (target_h - min_h) * open_pos.max(0.0)).max(min_h);
+            RectF::new(
+                target.left,
+                (target.bottom - h).max(4.0 * s),
+                target.right,
+                target.bottom,
+            )
+        }
+        PopupAnimPhase::Open => target,
+        PopupAnimPhase::Closing => {
+            let r = ease_retract(close_progress);
+            let h = (target_h * (1.0 - 0.42 * r)).max(min_h);
+            RectF::new(
+                target.left,
+                (target.bottom - h).max(4.0 * s),
+                target.right,
+                target.bottom,
+            )
+        }
+    }
+}
+
+/// Computes the initial side-budding submenu droplet anchored at `seam_x` with safe minimum width.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn sub_bud_start_rect(
+    target_sub: RectF,
+    row: RectF,
+    seam_x: f32,
+    open_left: bool,
+    s: f32,
+) -> RectF {
+    let min_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s)
+        .min(target_sub.width());
+    let start_w = (target_sub.width() * 0.26).max(min_w).min(target_sub.width());
+    let row_cy = ((row.top + row.bottom) * 0.5).clamp(
+        target_sub.top + 20.0 * s,
+        (target_sub.bottom - 20.0 * s).max(target_sub.top + 20.0 * s),
+    );
+    let min_h = (44.0 * s).min(target_sub.height());
+    let start_h = (target_sub.height() * 0.42).max(min_h).min(target_sub.height());
+    let top = (row_cy - start_h * 0.5)
+        .clamp(target_sub.top, (target_sub.bottom - start_h).max(target_sub.top));
+    let bottom = top + start_h;
+    if open_left {
+        RectF::new(seam_x - start_w, top, seam_x, bottom)
+    } else {
+        RectF::new(seam_x, top, seam_x + start_w, bottom)
+    }
+}
+
+/// Clamps spring-driven submenu edges into geometry-safe bounds anchored at `seam_x`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn clamp_sub_spring_rect(
+    spring_top: f32,
+    spring_bottom: f32,
+    spring_width: f32,
+    target_sub: RectF,
+    seam_x: f32,
+    bottom_limit: f32,
+    win_w: f32,
+    open_left: bool,
+    s: f32,
+) -> RectF {
+    let min_safe_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s)
+        .min(target_sub.width().max(40.0 * s));
+    let max_avail_w = if open_left {
+        (seam_x - 5.0 * s).max(min_safe_w)
+    } else {
+        (win_w - 5.0 * s - seam_x).max(min_safe_w)
+    };
+    let w = spring_width.clamp(min_safe_w, max_avail_w);
+
+    let min_h = (44.0 * s).min(target_sub.height().max(44.0 * s));
+    let min_top = 4.0 * s;
+    let max_bot = bottom_limit.max(min_top + min_h);
+    let mut bot = spring_bottom.clamp(min_top + min_h, max_bot);
+    let mut top = spring_top.clamp(min_top, max_bot - min_h);
+    if bot - top < min_h {
+        top = (bot - min_h).max(min_top);
+        bot = (top + min_h).min(max_bot);
+    }
+
+    if open_left {
+        RectF::new(seam_x - w, top, seam_x, bot)
+    } else {
+        RectF::new(seam_x, top, seam_x + w, bot)
+    }
+}
+
+/// Computes the submenu's closing collapse rectangle anchored to `seam_x` and clamped above `bottom_limit`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn animated_closing_sub_rect(
+    sub: RectF,
+    anim_primary: RectF,
+    seam_x: f32,
+    bottom_limit: f32,
+    open_left: bool,
+    close_progress: f32,
+    s: f32,
+) -> RectF {
+    let r = ease_retract(close_progress);
+    let min_w = ((STEP_MENISCUS_DIP + PANEL_RADIUS_DIP + 10.0).max(40.0) * s).min(sub.width());
+    let cur_w = (sub.width() * (1.0 - 0.22 * r)).max(min_w);
+    let drop = 12.0 * s * r;
+    let max_bot = bottom_limit.min(anim_primary.bottom);
+    let cur_bot = (sub.bottom + drop).min(max_bot).max(44.0 * s);
+    let min_h = (42.0 * s).min(sub.height());
+    let cur_h = (sub.height() * (1.0 - 0.20 * r))
+        .max(min_h)
+        .min((cur_bot - 4.0 * s).max(min_h));
+    let cur_top = (cur_bot - cur_h).max(4.0 * s);
+    if open_left {
+        RectF::new(seam_x - cur_w, cur_top, seam_x, cur_bot)
+    } else {
+        RectF::new(seam_x, cur_top, seam_x + cur_w, cur_bot)
+    }
+}
+
+/// Computes vertical `(top, bottom)` for a cascading submenu aligning to `row_top` downward when space permits.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn compute_submenu_vertical_span(
+    row_top: f32,
+    inner_pad: f32,
+    natural_sh: f32,
+    top_limit: f32,
+    bottom_limit: f32,
+) -> (f32, f32) {
+    let max_sh = (bottom_limit - top_limit).max(1.0);
+    let sh = natural_sh.min(max_sh);
+
+    let down_top = row_top - inner_pad;
+    if down_top >= top_limit && down_top + sh <= bottom_limit + 0.5 {
+        return (down_top, (down_top + sh).min(bottom_limit));
+    }
+
+    let up_top = (bottom_limit - sh).max(top_limit);
+    (up_top, (up_top + sh).min(bottom_limit))
 }
 
 /// Critically/lightly damped 1D second-order spring preserving velocity across target changes.
@@ -573,6 +758,21 @@ pub fn sample_liquid_silk_field(
     (r, g, b, alpha)
 }
 
+/// Accumulates raw `WM_MOUSEWHEEL` deltas across precision touchpad ticks and returns signed list scroll steps.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn accumulate_wheel_scroll(accum: &mut i32, delta: i32) -> i32 {
+    if delta == 0 {
+        return 0;
+    }
+    if *accum != 0 && (*accum > 0) != (delta > 0) {
+        *accum = 0;
+    }
+    *accum = accum.saturating_add(delta);
+    let notches = *accum / 120;
+    *accum -= notches * 120;
+    -notches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,5 +917,88 @@ mod tests {
         let lg_light_on_white = popup_glass_recipe(GlassSurfaceStyle::LiquidGlass, true, 0.90);
         let lg_light_on_black = popup_glass_recipe(GlassSurfaceStyle::LiquidGlass, true, 0.05);
         assert!(lg_light_on_black.tint_alpha > lg_light_on_white.tint_alpha);
+    }
+
+    #[test]
+    fn backdrop_opacity_lift_moves_ten_percent_toward_opaque_monotonically() {
+        assert!((lift_backdrop_alpha(-0.5) - 0.10).abs() < 1e-6);
+        assert!((lift_backdrop_alpha(0.0) - 0.10).abs() < 1e-6);
+        assert!((lift_backdrop_alpha(0.26) - 0.334).abs() < 1e-5);
+        assert!((lift_backdrop_alpha(0.53) - 0.577).abs() < 1e-5);
+        assert!((lift_backdrop_alpha(1.0) - 1.0).abs() < 1e-6);
+        assert!((lift_backdrop_alpha(1.5) - 1.0).abs() < 1e-6);
+        assert!(lift_backdrop_alpha(0.45) > lift_backdrop_alpha(0.30));
+
+        assert_eq!(lift_argb_alpha(0x00_123456), 0x1A_123456);
+        assert_eq!(lift_argb_alpha(0xFF_ABCDEF), 0xFF_ABCDEF);
+        assert_eq!(lift_argb_alpha(0x52_141822), 0x63_141822);
+        assert_eq!(lift_argb_alpha(0x5C_141822), 0x6C_141822);
+        assert_eq!(lift_argb_alpha(0x60_141822), 0x70_141822);
+        assert_eq!(lift_argb_alpha(0x49_1A1D24), 0x5B_1A1D24);
+        assert_eq!(lift_argb_alpha(0x4E_141A26), 0x60_141A26);
+        assert!((lift_argb_alpha(0x60_000000) >> 24) > (lift_argb_alpha(0x40_000000) >> 24));
+    }
+
+    #[test]
+    fn shared_popup_geometry_preserves_anchors_and_safe_bounds() {
+        let target_primary = RectF::new(14.0, 20.0, 168.0, 240.0);
+        let opening = animated_primary_rect(target_primary, PopupAnimPhase::Opening, 0.35, 0.0, 1.0);
+        assert!((opening.bottom - target_primary.bottom).abs() < 1e-4);
+        assert!(opening.top >= 4.0 && opening.height() >= 42.0);
+        let closing = animated_primary_rect(target_primary, PopupAnimPhase::Closing, 1.0, 0.6, 1.0);
+        assert!((closing.bottom - target_primary.bottom).abs() < 1e-4);
+
+        let (top_fit, bot_fit) = compute_submenu_vertical_span(100.0, 8.0, 110.0, 16.0, 240.0);
+        assert_eq!(top_fit, 92.0);
+        assert_eq!(bot_fit, 202.0);
+        let (top_up, bot_up) = compute_submenu_vertical_span(190.0, 8.0, 120.0, 16.0, 240.0);
+        assert_eq!(bot_up, 240.0);
+        assert_eq!(top_up, 120.0);
+
+        let sub = RectF::new(168.0, 92.0, 420.0, 240.0);
+        let row = RectF::new(22.0, 100.0, 160.0, 134.0);
+        let bud = sub_bud_start_rect(sub, row, 168.0, false, 1.0);
+        assert!((bud.left - 168.0).abs() < 1e-4);
+        assert!(bud.width() >= 40.0 && bud.height() >= 44.0);
+
+        let clamped = clamp_sub_spring_rect(-20.0, 320.0, 300.0, sub, 168.0, 240.0, 460.0, false, 1.0);
+        assert!(clamped.top >= 4.0 && clamped.bottom <= 240.0 && clamped.width() >= 40.0);
+
+        let close_sub = animated_closing_sub_rect(
+            sub,
+            RectF::new(14.0, 80.0, 168.0, 240.0),
+            168.0,
+            240.0,
+            false,
+            0.5,
+            1.0,
+        );
+        assert!(close_sub.height() >= 42.0 && close_sub.bottom <= 240.0);
+    }
+
+    #[test]
+    fn wheel_scroll_accumulator_handles_standard_precision_and_reversals() {
+        let mut accum = 0i32;
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 0), 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 120), -1);
+        assert_eq!(accum, 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, -120), 1);
+        assert_eq!(accum, 0);
+
+        // Precision touchpad small deltas accumulate until 120.
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 40), 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 40), 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 40), -1);
+        assert_eq!(accum, 0);
+
+        // Remainder is preserved across ticks and cleared cleanly on direction reversal.
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 50), 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 50), 0);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, 50), -1);
+        assert_eq!(accum, 30);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, -40), 0);
+        assert_eq!(accum, -40);
+        assert_eq!(accumulate_wheel_scroll(&mut accum, -80), 1);
+        assert_eq!(accum, 0);
     }
 }

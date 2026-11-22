@@ -138,6 +138,19 @@ pub fn inset_overflow_card_rect(
     ]
 }
 
+/// Converts a finite DIP coordinate/dimension into bounded physical pixels without `i32` overflow.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn scale_dip_to_px_checked(dip: f32, scale: f32) -> Option<i32> {
+    if !dip.is_finite() || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let scaled = (dip * scale).round();
+    if !scaled.is_finite() || scaled.abs() > 1_000_000.0 {
+        return None;
+    }
+    Some(scaled as i32)
+}
+
 /// Maps a XAML element's DIP bounding box `[left, top, right, bottom]` inside a Win32 island
 /// host window into clamped physical screen coordinates, rejecting degenerate or non-finite bounds.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -148,21 +161,33 @@ pub fn map_xaml_card_rect_to_screen_with_min(
     min_w_dip: f32,
     min_h_dip: f32,
 ) -> Option<[i32; 4]> {
-    if card_dip.iter().any(|v| !v.is_finite()) {
+    if card_dip.iter().any(|v| !v.is_finite())
+        || host_rect[0] >= host_rect[2]
+        || host_rect[1] >= host_rect[3]
+    {
         return None;
     }
     let scale = (dpi.max(96) as f32) / 96.0;
-    let left =
-        (host_rect[0] + (card_dip[0] * scale).round() as i32).clamp(host_rect[0], host_rect[2]);
-    let top =
-        (host_rect[1] + (card_dip[1] * scale).round() as i32).clamp(host_rect[1], host_rect[3]);
-    let right =
-        (host_rect[0] + (card_dip[2] * scale).round() as i32).clamp(host_rect[0], host_rect[2]);
-    let bottom =
-        (host_rect[1] + (card_dip[3] * scale).round() as i32).clamp(host_rect[1], host_rect[3]);
-    let min_w = (min_w_dip * scale).round() as i32;
-    let min_h = (min_h_dip * scale).round() as i32;
-    if right - left < min_w || bottom - top < min_h {
+    let l_off = scale_dip_to_px_checked(card_dip[0], scale)?;
+    let t_off = scale_dip_to_px_checked(card_dip[1], scale)?;
+    let r_off = scale_dip_to_px_checked(card_dip[2], scale)?;
+    let b_off = scale_dip_to_px_checked(card_dip[3], scale)?;
+    let min_w = scale_dip_to_px_checked(min_w_dip, scale)?;
+    let min_h = scale_dip_to_px_checked(min_h_dip, scale)?;
+
+    let left = host_rect[0]
+        .saturating_add(l_off)
+        .clamp(host_rect[0], host_rect[2]);
+    let top = host_rect[1]
+        .saturating_add(t_off)
+        .clamp(host_rect[1], host_rect[3]);
+    let right = host_rect[0]
+        .saturating_add(r_off)
+        .clamp(host_rect[0], host_rect[2]);
+    let bottom = host_rect[1]
+        .saturating_add(b_off)
+        .clamp(host_rect[1], host_rect[3]);
+    if right.saturating_sub(left) < min_w || bottom.saturating_sub(top) < min_h {
         return None;
     }
     Some([left, top, right, bottom])
@@ -178,7 +203,8 @@ pub fn map_xaml_card_rect_to_screen(
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn map_popup_card_rect_with_bounds(
+#[allow(clippy::too_many_arguments)]
+fn map_popup_card_rect_with_bounds_tiered(
     host_rect: [i32; 4],
     dpi: u32,
     card_dip: [f32; 4],
@@ -188,82 +214,99 @@ fn map_popup_card_rect_with_bounds(
     min_h_dip: f32,
     max_h_dip: f32,
     max_pad_dip: f32,
-) -> Option<[i32; 4]> {
-    if card_dip.iter().any(|v| !v.is_finite()) {
+) -> Option<(u8, [i32; 4])> {
+    if card_dip.iter().any(|v| !v.is_finite())
+        || host_rect[0] >= host_rect[2]
+        || host_rect[1] >= host_rect[3]
+    {
         return None;
     }
     let rw = card_dip[2] - card_dip[0];
     let rh = card_dip[3] - card_dip[1];
-    if rw < min_w_dip || rh < min_h_dip || rw > max_w_dip || rh > max_h_dip {
+    if !rw.is_finite()
+        || !rh.is_finite()
+        || rw < min_w_dip
+        || rh < min_h_dip
+        || rw > max_w_dip
+        || rh > max_h_dip
+    {
         return None;
     }
     let scale = (dpi.max(96) as f32) / 96.0;
-    let host_w = host_rect[2] - host_rect[0];
-    let host_h = host_rect[3] - host_rect[1];
-    let min_w = (min_w_dip * scale).round() as i32;
-    let min_h = (min_h_dip * scale).round() as i32;
+    let host_w = host_rect[2].saturating_sub(host_rect[0]);
+    let host_h = host_rect[3].saturating_sub(host_rect[1]);
+    let min_w = scale_dip_to_px_checked(min_w_dip, scale)?;
+    let min_h = scale_dip_to_px_checked(min_h_dip, scale)?;
     if host_w < min_w || host_h < min_h {
         return None;
     }
-    let w_px = (rw * scale).round() as i32;
-    let h_px = (rh * scale).round() as i32;
+    let w_px = scale_dip_to_px_checked(rw, scale)?;
+    let h_px = scale_dip_to_px_checked(rh, scale)?;
+    let l0_px = scale_dip_to_px_checked(card_dip[0], scale)?;
+    let t0_px = scale_dip_to_px_checked(card_dip[1], scale)?;
+    let r0_px = scale_dip_to_px_checked(card_dip[2], scale)?;
+    let b0_px = scale_dip_to_px_checked(card_dip[3], scale)?;
     let tol = (4.0 * scale).round().max(4.0) as i32;
-    let max_pad = (max_pad_dip * scale).round() as i32;
+    let max_pad = scale_dip_to_px_checked(max_pad_dip, scale)?;
 
-    if w_px > host_w + tol * 2
-        || h_px > host_h + tol * 2
-        || host_w > w_px + max_pad
-        || host_h > h_px + max_pad
+    if w_px > host_w.saturating_add(tol * 2)
+        || h_px > host_h.saturating_add(tol * 2)
+        || host_w > w_px.saturating_add(max_pad)
+        || host_h > h_px.saturating_add(max_pad)
     {
         return None;
     }
 
-    // Branch 1: Island-relative TransformToVisual(null) coordinates (exact pixel placement).
+    // Tier 0: Island-relative TransformToVisual(null) coordinates (exact pixel placement).
     for &[ox, oy] in island_origins {
         if ox == host_rect[0] && oy == host_rect[1] {
             continue;
         }
-        let l = ox + (card_dip[0] * scale).round() as i32;
-        let t = oy + (card_dip[1] * scale).round() as i32;
-        let r = ox + (card_dip[2] * scale).round() as i32;
-        let b = oy + (card_dip[3] * scale).round() as i32;
-        if l >= host_rect[0] - tol
-            && t >= host_rect[1] - tol
-            && r <= host_rect[2] + tol
-            && b <= host_rect[3] + tol
+        let l = ox.saturating_add(l0_px);
+        let t = oy.saturating_add(t0_px);
+        let r = ox.saturating_add(r0_px);
+        let b = oy.saturating_add(b0_px);
+        if l >= host_rect[0].saturating_sub(tol)
+            && t >= host_rect[1].saturating_sub(tol)
+            && r <= host_rect[2].saturating_add(tol)
+            && b <= host_rect[3].saturating_add(tol)
         {
             let cl = l.clamp(host_rect[0], host_rect[2]);
             let ct = t.clamp(host_rect[1], host_rect[3]);
             let cr = r.clamp(host_rect[0], host_rect[2]);
             let cb = b.clamp(host_rect[1], host_rect[3]);
-            if cr - cl >= min_w && cb - ct >= min_h {
-                return Some([cl, ct, cr, cb]);
+            if cr.saturating_sub(cl) >= min_w && cb.saturating_sub(ct) >= min_h {
+                return Some((0, [cl, ct, cr, cb]));
             }
         }
     }
 
-    // Branch 2: Popup-local coordinates inside `Xaml_WindowedPopupClass`.
+    // Tier 1: Popup-local coordinates inside `Xaml_WindowedPopupClass`.
     if card_dip[0] >= -2.0
         && card_dip[1] >= -2.0
-        && (card_dip[2] * scale).round() as i32 <= host_w + tol
-        && (card_dip[3] * scale).round() as i32 <= host_h + tol
+        && r0_px <= host_w.saturating_add(tol)
+        && b0_px <= host_h.saturating_add(tol)
     {
         return map_xaml_card_rect_to_screen_with_min(
             host_rect, dpi, card_dip, min_w_dip, min_h_dip,
-        );
+        )
+        .map(|rect| (1, rect));
     }
 
-    // Branch 3: Fallback when owning Island origin is unavailable (account for downward ThemeShadow pad).
+    // Tier 2: Centered fallback when owning Island origin is unavailable (account for downward ThemeShadow pad).
     let cw = w_px.min(host_w);
     let ch = h_px.min(host_h);
     let dx = (host_w - cw) / 2;
     let dy = ((((host_h - ch) as f32) * 0.35).round() as i32).clamp(0, host_h - ch);
-    Some([
-        host_rect[0] + dx,
-        host_rect[1] + dy,
-        host_rect[0] + dx + cw,
-        host_rect[1] + dy + ch,
-    ])
+    Some((
+        2,
+        [
+            host_rect[0] + dx,
+            host_rect[1] + dy,
+            host_rect[0] + dx + cw,
+            host_rect[1] + dy + ch,
+        ],
+    ))
 }
 
 /// Maps `ToolTip > ContentPresenter#LayoutRoot` DIP bounds inside `Xaml_WindowedPopupClass` to
@@ -276,7 +319,7 @@ pub fn map_tooltip_card_rect_to_screen(
     card_dip: [f32; 4],
     island_origins: &[[i32; 2]],
 ) -> Option<[i32; 4]> {
-    map_popup_card_rect_with_bounds(
+    map_popup_card_rect_with_bounds_tiered(
         host_rect,
         dpi,
         card_dip,
@@ -287,18 +330,17 @@ pub fn map_tooltip_card_rect_to_screen(
         420.0,
         48.0,
     )
+    .map(|(_, rect)| rect)
 }
 
-/// Maps `MenuFlyoutPresenter` / `JumpList` surface DIP bounds inside `Xaml_WindowedPopupClass`
-/// to clamped screen pixels.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn map_menu_flyout_card_rect_to_screen(
+fn map_menu_flyout_card_rect_to_screen_tiered(
     host_rect: [i32; 4],
     dpi: u32,
     card_dip: [f32; 4],
     island_origins: &[[i32; 2]],
-) -> Option<[i32; 4]> {
-    map_popup_card_rect_with_bounds(
+) -> Option<(u8, [i32; 4])> {
+    map_popup_card_rect_with_bounds_tiered(
         host_rect,
         dpi,
         card_dip,
@@ -311,44 +353,64 @@ pub fn map_menu_flyout_card_rect_to_screen(
     )
 }
 
+/// Maps `MenuFlyoutPresenter` / `JumpList` surface DIP bounds inside `Xaml_WindowedPopupClass`
+/// to clamped screen pixels.
+#[allow(dead_code)]
+pub fn map_menu_flyout_card_rect_to_screen(
+    host_rect: [i32; 4],
+    dpi: u32,
+    card_dip: [f32; 4],
+    island_origins: &[[i32; 2]],
+) -> Option<[i32; 4]> {
+    map_menu_flyout_card_rect_to_screen_tiered(host_rect, dpi, card_dip, island_origins)
+        .map(|(_, rect)| rect)
+}
+
 /// Matches up to `MAX_MENU_FLYOUT_SLOTS` visible `Xaml_WindowedPopupClass` host windows
-/// against TAP-reported active menu/JumpList card rectangles in 1-to-1 greedy best-fit order.
+/// against TAP-reported active menu/JumpList card rectangles in 1-to-1 precision-then-size order.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn match_menu_flyout_hosts_to_rects(
     hosts: &[([i32; 4], u32, u32)],
     tap_rects: &[(u32, [f32; 4])],
     island_origins_per_host: &[Vec<[i32; 2]>],
 ) -> Vec<(usize, [i32; 4])> {
-    let mut candidates: Vec<(i32, usize, usize, [i32; 4])> = Vec::new();
+    let mut candidates: Vec<(u8, i32, usize, usize, [i32; 4])> = Vec::new();
     for (hi, &(host_rect, dpi, host_tid)) in hosts.iter().enumerate() {
         let origins = island_origins_per_host
             .get(hi)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let scale = (dpi.max(96) as f32) / 96.0;
-        let host_w = host_rect[2] - host_rect[0];
-        let host_h = host_rect[3] - host_rect[1];
+        let host_w = host_rect[2].saturating_sub(host_rect[0]);
+        let host_h = host_rect[3].saturating_sub(host_rect[1]);
         for (ti, &(tap_tid, card_dip)) in tap_rects.iter().enumerate() {
             if tap_tid != 0 && tap_tid != host_tid {
                 continue;
             }
-            let Some(card_rect) =
-                map_menu_flyout_card_rect_to_screen(host_rect, dpi, card_dip, origins)
+            let Some((precision_tier, card_rect)) =
+                map_menu_flyout_card_rect_to_screen_tiered(host_rect, dpi, card_dip, origins)
             else {
                 continue;
             };
-            let card_w = ((card_dip[2] - card_dip[0]) * scale).round() as i32;
-            let card_h = ((card_dip[3] - card_dip[1]) * scale).round() as i32;
-            let score = (host_w - card_w).abs() + (host_h - card_h).abs();
-            candidates.push((score, hi, ti, card_rect));
+            let Some(card_w) = scale_dip_to_px_checked(card_dip[2] - card_dip[0], scale) else {
+                continue;
+            };
+            let Some(card_h) = scale_dip_to_px_checked(card_dip[3] - card_dip[1], scale) else {
+                continue;
+            };
+            let score = host_w
+                .saturating_sub(card_w)
+                .saturating_abs()
+                .saturating_add(host_h.saturating_sub(card_h).saturating_abs());
+            candidates.push((precision_tier, score, hi, ti, card_rect));
         }
     }
-    candidates.sort_by_key(|&(score, hi, ti, _)| (score, hi, ti));
+    candidates.sort_by_key(|&(tier, score, hi, ti, _)| (tier, score, hi, ti));
 
     let mut used_hosts = vec![false; hosts.len()];
     let mut used_taps = vec![false; tap_rects.len()];
     let mut matched = Vec::with_capacity(MAX_MENU_FLYOUT_SLOTS.min(hosts.len()));
-    for (_, hi, ti, card_rect) in candidates {
+    for (_, _, hi, ti, card_rect) in candidates {
         if used_hosts[hi] || used_taps[ti] {
             continue;
         }
@@ -397,6 +459,9 @@ fn rect_iou_px(a: [i32; 4], b: [i32; 4]) -> f32 {
 /// host 1-to-1 and deduplicating nearly identical rectangles before returning deterministic
 /// `(host_hwnd_raw, screen_card_rect)` pairs.
 #[cfg_attr(not(windows), allow(dead_code))]
+type ShellCardCandidate = (u8, u8, i32, usize, usize, isize, [i32; 4]);
+
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn match_shell_host_cards_to_screen(
     hosts: &[([i32; 4], u32, u32, isize, bool)],
     tap_rects: &[(u32, [f32; 4])],
@@ -405,11 +470,14 @@ pub fn match_shell_host_cards_to_screen(
         return Vec::new();
     }
 
-    let mut candidates: Vec<(u8, i32, usize, usize, isize, [i32; 4])> = Vec::new();
+    let mut candidates: Vec<ShellCardCandidate> = Vec::new();
     for (hi, &(host_rect, dpi, host_tid, hwnd_raw, is_popup)) in hosts.iter().enumerate() {
         let scale = (dpi.max(96) as f32) / 96.0;
-        let host_w = host_rect[2] - host_rect[0];
-        let host_h = host_rect[3] - host_rect[1];
+        let host_w = host_rect[2].saturating_sub(host_rect[0]);
+        let host_h = host_rect[3].saturating_sub(host_rect[1]);
+        if host_w <= 0 || host_h <= 0 {
+            continue;
+        }
         let tol = (4.0 * scale).round().max(4.0) as i32;
         for (ti, &(tap_tid, card_dip)) in tap_rects.iter().enumerate() {
             if tap_tid != 0 && tap_tid != host_tid {
@@ -420,34 +488,44 @@ pub fn match_shell_host_cards_to_screen(
             }
             let rw = card_dip[2] - card_dip[0];
             let rh = card_dip[3] - card_dip[1];
-            if rw < 64.0 || rh < 28.0 {
+            if !rw.is_finite() || !rh.is_finite() || rw < 64.0 || rh < 28.0 {
                 continue;
             }
-            let w_px = (rw * scale).round() as i32;
-            let h_px = (rh * scale).round() as i32;
-            if w_px > host_w + tol * 2 || h_px > host_h + tol * 2 {
+            let Some(w_px) = scale_dip_to_px_checked(rw, scale) else {
+                continue;
+            };
+            let Some(h_px) = scale_dip_to_px_checked(rh, scale) else {
+                continue;
+            };
+            if w_px > host_w.saturating_add(tol * 2) || h_px > host_h.saturating_add(tol * 2) {
                 continue;
             }
-            let card_rect_opt = if is_popup {
-                map_menu_flyout_card_rect_to_screen(host_rect, dpi, card_dip, &[])
+            let mapped = if is_popup {
+                map_menu_flyout_card_rect_to_screen_tiered(host_rect, dpi, card_dip, &[])
             } else {
                 map_xaml_card_rect_to_screen_with_min(host_rect, dpi, card_dip, 64.0, 28.0)
+                    .map(|rect| (0u8, rect))
             };
-            let Some(card_rect) = card_rect_opt else {
+            let Some((precision_tier, card_rect)) = mapped else {
                 continue;
             };
-            let tier = if is_popup { 0 } else { 1 };
-            let score = (host_w - w_px).abs() + (host_h - h_px).abs();
-            candidates.push((tier, score, hi, ti, hwnd_raw, card_rect));
+            let host_tier = u8::from(!is_popup);
+            let score = host_w
+                .saturating_sub(w_px)
+                .saturating_abs()
+                .saturating_add(host_h.saturating_sub(h_px).saturating_abs());
+            candidates.push((host_tier, precision_tier, score, hi, ti, hwnd_raw, card_rect));
         }
     }
-    candidates.sort_by_key(|&(tier, score, hi, ti, _, _)| (tier, score, hi, ti));
+    candidates.sort_by_key(|&(host_tier, prec_tier, score, hi, ti, _, _)| {
+        (host_tier, prec_tier, score, hi, ti)
+    });
 
     let mut used_popup_hosts = vec![false; hosts.len()];
     let mut used_taps = vec![false; tap_rects.len()];
     let mut matched: Vec<(isize, [i32; 4])> = Vec::with_capacity(MAX_SHELL_CARD_SLOTS);
-    for (tier, _, hi, ti, hwnd_raw, card_rect) in candidates {
-        if used_taps[ti] || (tier == 0 && used_popup_hosts[hi]) {
+    for (host_tier, _, _, hi, ti, hwnd_raw, card_rect) in candidates {
+        if used_taps[ti] || (host_tier == 0 && used_popup_hosts[hi]) {
             continue;
         }
         let overlaps_existing = matched.iter().any(|&(_, prev)| {
@@ -461,7 +539,7 @@ pub fn match_shell_host_cards_to_screen(
             continue;
         }
         used_taps[ti] = true;
-        if tier == 0 {
+        if host_tier == 0 {
             used_popup_hosts[hi] = true;
         }
         matched.push((hwnd_raw, card_rect));
@@ -488,38 +566,39 @@ pub const fn alt_tab_item_card_colors(
     style: TaskbarStyle,
     light_glass: bool,
 ) -> Option<AltTabItemCardColors> {
+    use crate::ui::lift_argb_alpha;
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x41_181B22,
+            bg_argb: lift_argb_alpha(0x41_181B22),
             border_argb: 0x30_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x50_1A1C22,
+            bg_argb: lift_argb_alpha(0x50_1A1C22),
             border_argb: 0x34_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x58_181A20,
+            bg_argb: lift_argb_alpha(0x58_181A20),
             border_argb: 0x38_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(AltTabItemCardColors {
-            bg_argb: 0x49_1A1D24,
+            bg_argb: lift_argb_alpha(0x49_1A1D24),
             border_argb: 0x42_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x56_FAFBFD,
+            bg_argb: lift_argb_alpha(0x56_FAFBFD),
             border_argb: 0x22_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x67_F8FAFC,
+            bg_argb: lift_argb_alpha(0x67_F8FAFC),
             border_argb: 0x22_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x70_F6F8FB,
+            bg_argb: lift_argb_alpha(0x70_F6F8FB),
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(AltTabItemCardColors {
-            bg_argb: 0x5F_FAFCFF,
+            bg_argb: lift_argb_alpha(0x5F_FAFCFF),
             border_argb: 0x20_1E2430,
         }),
     }
@@ -540,38 +619,39 @@ pub const fn osd_fallback_card_colors(
     style: TaskbarStyle,
     light_glass: bool,
 ) -> Option<OsdFallbackCardColors> {
+    use crate::ui::lift_argb_alpha;
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x47_12151D,
+            bg_argb: lift_argb_alpha(0x47_12151D),
             border_argb: 0x38_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x5C_161922,
+            bg_argb: lift_argb_alpha(0x5C_161922),
             border_argb: 0x42_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x69_181B24,
+            bg_argb: lift_argb_alpha(0x69_181B24),
             border_argb: 0x48_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(OsdFallbackCardColors {
-            bg_argb: 0x52_141822,
+            bg_argb: lift_argb_alpha(0x52_141822),
             border_argb: 0x52_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x5B_FAFBFD,
+            bg_argb: lift_argb_alpha(0x5B_FAFBFD),
             border_argb: 0x24_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x6D_F8FAFC,
+            bg_argb: lift_argb_alpha(0x6D_F8FAFC),
             border_argb: 0x28_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x7D_F6F8FB,
+            bg_argb: lift_argb_alpha(0x7D_F6F8FB),
             border_argb: 0x2C_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(OsdFallbackCardColors {
-            bg_argb: 0x66_FAFCFF,
+            bg_argb: lift_argb_alpha(0x66_FAFCFF),
             border_argb: 0x2A_1E2430,
         }),
     }
@@ -587,38 +667,39 @@ pub const fn tooltip_fallback_card_colors(
     style: TaskbarStyle,
     light_glass: bool,
 ) -> Option<TooltipFallbackCardColors> {
+    use crate::ui::lift_argb_alpha;
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x52_12151D,
+            bg_argb: lift_argb_alpha(0x52_12151D),
             border_argb: 0x3C_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x62_161922,
+            bg_argb: lift_argb_alpha(0x62_161922),
             border_argb: 0x44_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x6F_181B24,
+            bg_argb: lift_argb_alpha(0x6F_181B24),
             border_argb: 0x4A_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x5C_141822,
+            bg_argb: lift_argb_alpha(0x5C_141822),
             border_argb: 0x54_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x60_FAFBFD,
+            bg_argb: lift_argb_alpha(0x60_FAFBFD),
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x71_F8FAFC,
+            bg_argb: lift_argb_alpha(0x71_F8FAFC),
             border_argb: 0x2A_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x81_F6F8FB,
+            bg_argb: lift_argb_alpha(0x81_F6F8FB),
             border_argb: 0x2E_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(TooltipFallbackCardColors {
-            bg_argb: 0x6A_FAFCFF,
+            bg_argb: lift_argb_alpha(0x6A_FAFCFF),
             border_argb: 0x2C_1E2430,
         }),
     }
@@ -634,38 +715,39 @@ pub const fn menu_flyout_fallback_card_colors(
     style: TaskbarStyle,
     light_glass: bool,
 ) -> Option<MenuFlyoutFallbackCardColors> {
+    use crate::ui::lift_argb_alpha;
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x55_12151D,
+            bg_argb: lift_argb_alpha(0x55_12151D),
             border_argb: 0x3E_FFFFFF,
         }),
         (TaskbarStyle::Blur, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x66_161922,
+            bg_argb: lift_argb_alpha(0x66_161922),
             border_argb: 0x46_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x73_181B24,
+            bg_argb: lift_argb_alpha(0x73_181B24),
             border_argb: 0x4C_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x60_141822,
+            bg_argb: lift_argb_alpha(0x60_141822),
             border_argb: 0x56_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x64_FAFBFD,
+            bg_argb: lift_argb_alpha(0x64_FAFBFD),
             border_argb: 0x26_1A1D24,
         }),
         (TaskbarStyle::Blur, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x75_F8FAFC,
+            bg_argb: lift_argb_alpha(0x75_F8FAFC),
             border_argb: 0x2A_1A1D24,
         }),
         (TaskbarStyle::Acrylic, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x85_F6F8FB,
+            bg_argb: lift_argb_alpha(0x85_F6F8FB),
             border_argb: 0x2E_1A1D24,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(MenuFlyoutFallbackCardColors {
-            bg_argb: 0x6E_FAFCFF,
+            bg_argb: lift_argb_alpha(0x6E_FAFCFF),
             border_argb: 0x2C_1E2430,
         }),
     }
@@ -680,38 +762,39 @@ pub const fn virtual_desktop_bar_colors(
     style: TaskbarStyle,
     light_glass: bool,
 ) -> Option<VirtualDesktopBarColors> {
+    use crate::ui::lift_argb_alpha;
     match (style, light_glass) {
         (TaskbarStyle::Default, _) => None,
         (TaskbarStyle::Transparent, false) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x38_10141C,
+            bg_argb: lift_argb_alpha(0x38_10141C),
             border_argb: 0x36_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, false) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x4E_141A26,
+            bg_argb: lift_argb_alpha(0x4E_141A26),
             border_argb: 0x58_E6F0FF,
         }),
         (TaskbarStyle::Blur, false) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x62_181C26,
+            bg_argb: lift_argb_alpha(0x62_181C26),
             border_argb: 0x44_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, false) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x7A_1B1F28,
+            bg_argb: lift_argb_alpha(0x7A_1B1F28),
             border_argb: 0x3A_FFFFFF,
         }),
         (TaskbarStyle::Transparent, true) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x44_F2F6FC,
+            bg_argb: lift_argb_alpha(0x44_F2F6FC),
             border_argb: 0x58_FFFFFF,
         }),
         (TaskbarStyle::LiquidGlass, true) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x5C_F4F8FF,
+            bg_argb: lift_argb_alpha(0x5C_F4F8FF),
             border_argb: 0x78_FFFFFF,
         }),
         (TaskbarStyle::Blur, true) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x72_F2F5FA,
+            bg_argb: lift_argb_alpha(0x72_F2F5FA),
             border_argb: 0x60_FFFFFF,
         }),
         (TaskbarStyle::Acrylic, true) => Some(VirtualDesktopBarColors {
-            bg_argb: 0x8A_F0F3F8,
+            bg_argb: lift_argb_alpha(0x8A_F0F3F8),
             border_argb: 0x52_FFFFFF,
         }),
     }
@@ -1072,11 +1155,11 @@ mod tests {
             let dark_bg_alpha = (dark.bg_argb >> 24) & 0xFF;
             let light_bg_alpha = (light.bg_argb >> 24) & 0xFF;
             assert!(
-                (0x38..=0x60).contains(&dark_bg_alpha),
+                (0x4C..=0x70).contains(&dark_bg_alpha),
                 "dark alpha {dark_bg_alpha:#x} out of calibrated glass range"
             );
             assert!(
-                (0x4C..=0x78).contains(&light_bg_alpha),
+                (0x5E..=0x88).contains(&light_bg_alpha),
                 "light alpha {light_bg_alpha:#x} out of calibrated frost range"
             );
             // Dark theme uses white glass edge; light theme uses subtle dark ink edge.
@@ -1114,8 +1197,8 @@ mod tests {
                 osd_fallback_card_colors(style, true).expect("non-default light osd colors");
             let dark_alpha = dark.bg_argb >> 24;
             let light_alpha = light.bg_argb >> 24;
-            assert!((0x40..=0x74).contains(&dark_alpha));
-            assert!((0x54..=0x88).contains(&light_alpha));
+            assert!((0x50..=0x80).contains(&dark_alpha));
+            assert!((0x60..=0x94).contains(&light_alpha));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert!((dark.bg_argb & 0xFF) < 0x40);
@@ -1239,8 +1322,8 @@ mod tests {
                 tooltip_fallback_card_colors(style, true).expect("non-default light tooltip");
             let dark_alpha = dark.bg_argb >> 24;
             let light_alpha = light.bg_argb >> 24;
-            assert!((0x48..=0x78).contains(&dark_alpha));
-            assert!((0x58..=0x8C).contains(&light_alpha));
+            assert!((0x58..=0x88).contains(&dark_alpha));
+            assert!((0x68..=0x98).contains(&light_alpha));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert!((dark.bg_argb & 0xFF) < 0x40);
@@ -1324,8 +1407,8 @@ mod tests {
                 menu_flyout_fallback_card_colors(style, false).expect("non-default dark menu");
             let light =
                 menu_flyout_fallback_card_colors(style, true).expect("non-default light menu");
-            assert!((0x4C..=0x7C).contains(&(dark.bg_argb >> 24)));
-            assert!((0x5C..=0x90).contains(&(light.bg_argb >> 24)));
+            assert!((0x5C..=0x8C).contains(&(dark.bg_argb >> 24)));
+            assert!((0x68..=0x9A).contains(&(light.bg_argb >> 24)));
             assert_eq!(dark.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
             assert_ne!(light.border_argb & 0x00FF_FFFF, 0x00FF_FFFF);
         }
@@ -1389,5 +1472,41 @@ mod tests {
             assert!(b.bg_argb >> 24 < a.bg_argb >> 24);
             assert!(lg.border_argb >> 24 > t.border_argb >> 24);
         }
+    }
+
+    #[test]
+    fn scale_dip_overflow_and_menu_precision_tier_ordering_work_safely() {
+        assert_eq!(
+            map_xaml_card_rect_to_screen([0, 0, 1920, 1080], 192, [0.0, 0.0, 1e12, 500.0]),
+            None
+        );
+        assert_eq!(
+            map_tooltip_card_rect_to_screen(
+                [0, 0, 300, 100],
+                144,
+                [f32::INFINITY, 0.0, 120.0, 40.0],
+                &[]
+            ),
+            None
+        );
+
+        // Host 0 uses exact popup-local placement (tier 1); Host 1 only falls back to tier 2,
+        // so identical sizes still award the higher-precision match first.
+        let hosts = [
+            ([100, 100, 320, 340], 96, 55u32), // 220x240 -> exact local fit -> tier 1
+            ([500, 100, 720, 340], 96, 55u32), // 220x240 -> negative offsets -> tier 2 fallback
+        ];
+        let tap_rects = [
+            (55u32, [-10.0, -50.0, 190.0, 170.0]), // 200x220 -> only matches tier 2
+            (55u32, [10.0, 10.0, 210.0, 230.0]),   // 200x220 -> matches host 0 & 1 with tier 1
+        ];
+        let origins = [
+            Vec::new(),
+            Vec::new(),
+        ];
+        let matched = match_menu_flyout_hosts_to_rects(&hosts, &tap_rects, &origins);
+        assert_eq!(matched.len(), 2);
+        let for_h0 = matched.iter().find(|(hi, _)| *hi == 0).unwrap().1;
+        assert_eq!(for_h0, [110, 110, 310, 330]);
     }
 }
