@@ -1,4 +1,4 @@
-use super::super::tree_match::TargetKind;
+use super::super::tree_match::{TapHostScope, TargetKind};
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -207,6 +207,9 @@ unsafe extern "system" fn watcher_on_visual_tree_change(
             || type_name.contains("FlexiblePriorityToastView")
             || type_name.contains("InputSwitcher")
             || type_name.contains("TaskbarSearchPage")
+            || type_name.contains("FolderModal")
+            || type_name.contains("ExpandedFolderList")
+            || (rt.host_scope == TapHostScope::StartMenu && name == "Root")
             || matches!(
                 name.as_str(),
                 "NotificationCenterGrid"
@@ -235,6 +238,9 @@ unsafe extern "system" fn watcher_on_visual_tree_change(
                     | "StartDropShadow"
                     | "LeftCompanionDropShadow"
                     | "RightCompanionDropShadow"
+                    | "StartFolderModal"
+                    | "FolderModal"
+                    | "ExpandedFolderList"
                     | "OuterBorderGrid"
                     | "BorderGrid"
                     | "AppBorder"
@@ -270,6 +276,7 @@ unsafe extern "system" fn watcher_on_visual_tree_change(
                                     TargetKind::MenuFlyoutSurface
                                         | TargetKind::ShellCardSurface
                                         | TargetKind::ShellCardSubSurface
+                                        | TargetKind::StartMenuModalSurface
                                 ))
                             .then_some((h, t.kind))
                         })

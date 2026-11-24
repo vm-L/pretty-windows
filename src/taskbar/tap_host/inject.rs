@@ -149,6 +149,7 @@ pub(super) const CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE: u8 = 0x13;
 pub(super) const CMD_INPUT_SWITCHER_RECT: u8 = 0x14;
 pub(super) const CMD_SET_INPUT_SWITCHER_SUPPRESS: u8 = 0x15;
 pub(super) const CMD_SET_INPUT_SWITCHER_FALLBACK_STYLE: u8 = 0x16;
+pub(super) const CMD_SET_START_MODAL_STYLE: u8 = 0x17;
 pub(super) const MAX_MENU_FLYOUT_RECTS: usize = 3;
 pub(super) const MAX_SHELL_CARD_RECTS: usize = 8;
 

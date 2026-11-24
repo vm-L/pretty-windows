@@ -36,10 +36,13 @@ pub const CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE: u8 = 0x13;
 pub const CMD_INPUT_SWITCHER_RECT: u8 = 0x14;
 pub const CMD_SET_INPUT_SWITCHER_SUPPRESS: u8 = 0x15;
 pub const CMD_SET_INPUT_SWITCHER_FALLBACK_STYLE: u8 = 0x16;
+pub const CMD_SET_START_MODAL_STYLE: u8 = 0x17;
 pub const MAX_MENU_FLYOUT_RECTS: usize = 3;
 pub const MAX_SHELL_CARD_RECTS: usize = 8;
-pub const TAP_PROTOCOL_VERSION: u8 = 13;
+pub const TAP_PROTOCOL_VERSION: u8 = 15;
 pub const ALTTAB_ITEM_OVERLAY_NAME: &str = "PrettyWindowsAltTabItemBg";
+pub const START_MENU_OVERLAY_NAME: &str = "PrettyWindowsStartMenuOverlay";
+pub const START_MODAL_OVERLAY_NAME: &str = "PrettyWindowsStartModalBg";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TapHostScope {
@@ -65,6 +68,7 @@ pub enum TargetKind {
     MenuFlyoutSurface,
     ShellCardSurface,
     ShellCardSubSurface,
+    StartMenuModalSurface,
     VirtualDesktopBarSurface,
     InputSwitcherPanel,
     InputSwitcherSubPanel,

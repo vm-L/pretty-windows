@@ -144,6 +144,7 @@ struct TapRuntime {
     menu_flyout_suppressed: AtomicBool,
     menu_flyout_fallback_bg_argb: AtomicU32,
     menu_flyout_fallback_border_argb: AtomicU32,
+    start_modal_style: Mutex<(u8, bool, u32, u32)>,
     input_switcher_bounds_dip: Mutex<Option<(u32, [f32; 4])>>,
     input_switcher_suppressed: AtomicBool,
     input_switcher_fallback_bg_argb: AtomicU32,
@@ -198,6 +199,7 @@ impl TapRuntime {
             menu_flyout_suppressed: AtomicBool::new(false),
             menu_flyout_fallback_bg_argb: AtomicU32::new(0x70_141822),
             menu_flyout_fallback_border_argb: AtomicU32::new(0x56_FFFFFF),
+            start_modal_style: Mutex::new((4, false, 0xC2C2C7, 0xD1D1D6)),
             input_switcher_bounds_dip: Mutex::new(None),
             input_switcher_suppressed: AtomicBool::new(false),
             input_switcher_fallback_bg_argb: AtomicU32::new(0x70_141822),
@@ -931,6 +933,36 @@ impl TapRuntime {
     }
 
     #[inline]
+    fn start_modal_style_spec(&self) -> (u8, bool, u32, u32) {
+        self.start_modal_style
+            .lock()
+            .map(|g| *g)
+            .unwrap_or((4, false, 0xC2C2C7, 0xD1D1D6))
+    }
+
+    fn set_start_modal_style(
+        self: &Arc<Self>,
+        style_id: u8,
+        light_glass: bool,
+        halo0_rgb: u32,
+        halo1_rgb: u32,
+    ) {
+        let next = (style_id, light_glass, halo0_rgb, halo1_rgb);
+        let changed = self
+            .start_modal_style
+            .lock()
+            .map(|mut g| {
+                let prev = *g;
+                *g = next;
+                prev != next
+            })
+            .unwrap_or(false);
+        if changed && self.desired_hide() {
+            self.dispatch_apply_filtered(0, Some(TargetKind::StartMenuModalSurface));
+        }
+    }
+
+    #[inline]
     fn menu_flyout_target_colors(&self) -> (RawUiColor, RawUiColor) {
         if self.is_menu_flyout_suppressed() {
             (
@@ -1416,7 +1448,10 @@ unsafe fn on_target_added(rt: &Arc<TapRuntime>, handle: u64, kind: TargetKind) {
             if kind == TargetKind::ToolTipPresenter {
                 tooltip_extra_disp =
                     Some(OwnedDispatcher::Queue(dq.clone().into_raw() as usize));
-            } else if kind == TargetKind::MenuFlyoutSurface {
+            } else if matches!(
+                kind,
+                TargetKind::MenuFlyoutSurface | TargetKind::StartMenuModalSurface
+            ) {
                 menu_flyout_extra_disp =
                     Some(OwnedDispatcher::Queue(dq.clone().into_raw() as usize));
             }
@@ -1457,6 +1492,7 @@ unsafe fn on_target_added(rt: &Arc<TapRuntime>, handle: u64, kind: TargetKind) {
                 TargetKind::MenuFlyoutSurface
                     | TargetKind::ShellCardSurface
                     | TargetKind::ShellCardSubSurface
+                    | TargetKind::StartMenuModalSurface
             ) {
                 if let Ok(extra_cookie) =
                     git.RegisterInterfaceInGlobal(cd_unk, &IID_ICOREDISPATCHER)

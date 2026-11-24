@@ -588,6 +588,143 @@ fn start_menu_targets_acrylic_border_overlay_shadows_and_context_menus() {
 }
 
 #[test]
+fn start_menu_targets_folder_modal_and_expanded_folder_list_subpanels() {
+    let mut idx = VisualTreeIndex::new();
+
+    // 1. Category / Unified FolderModal (StartFolderModal) > Grid#Root > LightDismissLayer + nameless Border + ContentControl
+    idx.on_add_on_thread(0, 9100, "StartMenu.FolderModal".into(), "StartFolderModal".into(), 702);
+    idx.on_add_on_thread(9100, 9101, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 702);
+    idx.on_add_on_thread(
+        9101,
+        9102,
+        "Windows.UI.Xaml.Shapes.Rectangle".into(),
+        "LightDismissLayer".into(),
+        702,
+    );
+    idx.on_add_on_thread(9101, 9103, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+    idx.on_add_on_thread(
+        9101,
+        9104,
+        "Windows.UI.Xaml.Controls.ContentControl".into(),
+        "ContentControl".into(),
+        702,
+    );
+    idx.on_add_on_thread(
+        9104,
+        9105,
+        "Windows.UI.Xaml.Controls.GridView".into(),
+        "LevelOneGridView".into(),
+        702,
+    );
+    idx.on_add_on_thread(
+        9105,
+        9106,
+        "Windows.UI.Xaml.Controls.GridViewItem".into(),
+        "".into(),
+        702,
+    );
+    idx.on_add_on_thread(9106, 9107, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 702);
+    idx.on_add_on_thread(9107, 9108, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+
+    // 2. Named FolderModal variant inside inner frame
+    idx.on_add_on_thread(0, 9110, "StartMenu.FolderModal".into(), "FolderModal".into(), 702);
+    idx.on_add_on_thread(9110, 9111, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 702);
+    idx.on_add_on_thread(9111, 9112, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+
+    // 3. Pinned ExpandedFolderList subpanel + inner control Border isolation
+    idx.on_add_on_thread(
+        0,
+        9120,
+        "StartMenu.ExpandedFolderList".into(),
+        "".into(),
+        702,
+    );
+    idx.on_add_on_thread(9120, 9121, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 702);
+    idx.on_add_on_thread(9121, 9122, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+    idx.on_add_on_thread(9121, 9123, "Windows.UI.Xaml.Controls.Grid".into(), "".into(), 702);
+    idx.on_add_on_thread(
+        9123,
+        9124,
+        "Windows.UI.Xaml.Controls.TextBox".into(),
+        "ExpandedFolderNameTextBox".into(),
+        702,
+    );
+    idx.on_add_on_thread(9124, 9125, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 702);
+    idx.on_add_on_thread(9125, 9126, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+
+    // 4. Out-of-order tree insertion: Border arrives before Grid#Root and FolderModal
+    idx.on_add_on_thread(9131, 9132, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 703);
+    assert_eq!(
+        idx.classify_target_in_scope(9132, TapHostScope::StartMenu),
+        None
+    );
+    idx.on_add_on_thread(9130, 9131, "Windows.UI.Xaml.Controls.Grid".into(), "Root".into(), 703);
+    assert_eq!(
+        idx.classify_target_in_scope(9132, TapHostScope::StartMenu),
+        None
+    );
+    idx.on_add_on_thread(0, 9130, "StartMenu.FolderModal".into(), "StartFolderModal".into(), 703);
+    assert_eq!(
+        idx.classify_target_in_scope(9132, TapHostScope::StartMenu),
+        Some(TargetKind::StartMenuModalSurface)
+    );
+
+    // Self-created sibling overlays must NEVER match
+    idx.on_add_on_thread(
+        9101,
+        9140,
+        "Windows.UI.Xaml.Controls.Grid".into(),
+        START_MODAL_OVERLAY_NAME.into(),
+        702,
+    );
+    idx.on_add_on_thread(9140, 9141, "Windows.UI.Xaml.Controls.Border".into(), "".into(), 702);
+    idx.on_add_on_thread(
+        9101,
+        9142,
+        "Windows.UI.Xaml.Controls.Border".into(),
+        START_MENU_OVERLAY_NAME.into(),
+        702,
+    );
+
+    assert_eq!(
+        idx.classify_target_in_scope(9102, TapHostScope::StartMenu),
+        None
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9140, TapHostScope::StartMenu),
+        None
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9141, TapHostScope::StartMenu),
+        None
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9142, TapHostScope::StartMenu),
+        None
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9103, TapHostScope::StartMenu),
+        Some(TargetKind::StartMenuModalSurface)
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9108, TapHostScope::StartMenu),
+        None
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9112, TapHostScope::StartMenu),
+        Some(TargetKind::StartMenuModalSurface)
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9122, TapHostScope::StartMenu),
+        Some(TargetKind::StartMenuModalSurface)
+    );
+    assert_eq!(
+        idx.classify_target_in_scope(9126, TapHostScope::StartMenu),
+        None
+    );
+}
+
+#[test]
 fn visual_tree_index_removes_deep_subtrees_reparents_and_guards_cycles() {
     // 1. Deep 5000-node tree removes every descendant without 4096-node orphan leakage
     let mut idx = VisualTreeIndex::new();

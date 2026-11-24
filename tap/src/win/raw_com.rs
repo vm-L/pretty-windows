@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::{IInspectable, IUnknown, Interface, GUID, HRESULT, HSTRING};
-use windows::System::{DispatcherQueue};
+use windows::System::DispatcherQueue;
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
 use windows::Win32::System::Com::{CoCreateFreeThreadedMarshaler, CoCreateInstance, IGlobalInterfaceTable, CLSCTX_INPROC_SERVER};
 use windows::Win32::System::WinRT::{RoGetActivationFactory};
@@ -64,6 +64,7 @@ pub(super) const IID_IBRUSH: GUID = GUID::from_u128(0x8806A321_1E06_422C_A1CC_01
 pub(super) const IID_ISOLIDCOLORBRUSH: GUID = GUID::from_u128(0x9D850850_66F3_48DF_9A8F_824BD5E070AF);
 pub(super) const IID_ISOLIDCOLORBRUSHFACTORY: GUID =
     GUID::from_u128(0xD935CE0C_86F5_4DA6_8A27_B1619EF7F92B);
+pub(super) const IID_IGRIDSTATICS: GUID = GUID::from_u128(0x64FE2E9F_F951_42B6_A9CE_BB179AF11595);
 pub(super) const IID_IDEPENDENCYPROPERTYSTATICS: GUID =
     GUID::from_u128(0x49E5F28F_8259_4D5C_AAE0_83D56DBB68D9);
 pub(super) const IID_IVISUALTREEHELPERSTATICS: GUID =
@@ -563,6 +564,22 @@ const _: () = {
             == 7 * size_of::<usize>()
     );
     assert!(core::mem::offset_of!(RawIToolTipVtbl, get_is_open) == 8 * PTR_SIZE);
+    assert!(
+        core::mem::offset_of!(RawIElementCompositionPreviewStaticsVtbl, get_element_child_visual)
+            == 7 * PTR_SIZE
+    );
+    assert!(
+        core::mem::offset_of!(RawIElementCompositionPreviewStaticsVtbl, set_element_child_visual)
+            == 8 * PTR_SIZE
+    );
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, get_row) == 7 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, set_row) == 8 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, get_column) == 10 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, set_column) == 11 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, get_row_span) == 13 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, set_row_span) == 14 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, get_column_span) == 16 * PTR_SIZE);
+    assert!(core::mem::offset_of!(RawIGridStaticsVtbl, set_column_span) == 17 * PTR_SIZE);
 };
 
 pub(super) const VISIBILITY_VISIBLE: i32 = 0;
@@ -721,6 +738,10 @@ pub(super) struct RawIElementCompositionPreviewStaticsVtbl {
     pub(super) get_trust_level: unsafe extern "system" fn(*mut c_void),
     pub(super) get_element_visual:
         unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) get_element_child_visual:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) set_element_child_visual:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT,
 }
 
 #[repr(C)]
@@ -784,6 +805,40 @@ pub(super) struct RawISolidColorBrushFactoryVtbl {
 #[repr(C)]
 pub(super) struct RawISolidColorBrushFactory {
     pub(super) lp_vtbl: *const RawISolidColorBrushFactoryVtbl,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+pub(super) struct RawIGridStaticsVtbl {
+    pub(super) query_interface:
+        unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT,
+    pub(super) add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub(super) release: unsafe extern "system" fn(*mut c_void) -> u32,
+    pub(super) get_iids: unsafe extern "system" fn(*mut c_void),
+    pub(super) get_runtime_class_name: unsafe extern "system" fn(*mut c_void),
+    pub(super) get_trust_level: unsafe extern "system" fn(*mut c_void),
+    pub(super) get_row_property: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) get_row: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
+    pub(super) set_row: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT,
+    pub(super) get_column_property:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) get_column: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
+    pub(super) set_column: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT,
+    pub(super) get_row_span_property:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) get_row_span:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
+    pub(super) set_row_span: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT,
+    pub(super) get_column_span_property:
+        unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    pub(super) get_column_span:
+        unsafe extern "system" fn(*mut c_void, *mut c_void, *mut i32) -> HRESULT,
+    pub(super) set_column_span: unsafe extern "system" fn(*mut c_void, *mut c_void, i32) -> HRESULT,
+}
+
+#[repr(C)]
+pub(super) struct RawIGridStatics {
+    pub(super) lp_vtbl: *const RawIGridStaticsVtbl,
 }
 
 #[repr(C)]
@@ -1473,6 +1528,18 @@ pub(super) unsafe fn fetch_solid_brush(color: RawUiColor) -> Option<ComRaw> {
 
 pub(super) unsafe fn fetch_transparent_brush() -> Option<ComRaw> {
     fetch_solid_brush(RawUiColor::TRANSPARENT)
+}
+
+pub(super) unsafe fn fetch_grid_statics() -> Option<ComRaw> {
+    activate_factory_iface("Windows.UI.Xaml.Controls.Grid", &IID_IGRIDSTATICS)
+}
+
+pub(super) unsafe fn cached_grid_statics() -> Option<ComRaw> {
+    ensure_cached_com(
+        |s| s.grid_statics.as_ref(),
+        |s, v| s.grid_statics = Some(v),
+        fetch_grid_statics,
+    )
 }
 
 pub(super) unsafe fn fetch_unset_value() -> Option<ComRaw> {

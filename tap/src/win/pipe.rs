@@ -1,4 +1,4 @@
-use super::super::tree_match::{pipe_name_for_pid, CMD_ALTTAB_RECT, CMD_HIDE, CMD_HOVER_FLYOUT_RECT, CMD_INPUT_SWITCHER_RECT, CMD_MENU_FLYOUT_RECTS, CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE, CMD_SET_INPUT_SWITCHER_FALLBACK_STYLE, CMD_SET_INPUT_SWITCHER_SUPPRESS, CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS, CMD_SET_OSD_FALLBACK_STYLE, CMD_SET_OSD_SUPPRESS, CMD_SET_TOOLTIP_FALLBACK_STYLE, CMD_SET_TOOLTIP_SUPPRESS, CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE, CMD_SHELL_CARD_RECTS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT, CMD_VERSION, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS, TAP_PROTOCOL_VERSION};
+use super::super::tree_match::{pipe_name_for_pid, CMD_ALTTAB_RECT, CMD_HIDE, CMD_HOVER_FLYOUT_RECT, CMD_INPUT_SWITCHER_RECT, CMD_MENU_FLYOUT_RECTS, CMD_OSD_RECT, CMD_PING, CMD_RESTORE, CMD_SET_ALTTAB_ITEM_STYLE, CMD_SET_INPUT_SWITCHER_FALLBACK_STYLE, CMD_SET_INPUT_SWITCHER_SUPPRESS, CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS, CMD_SET_OSD_FALLBACK_STYLE, CMD_SET_OSD_SUPPRESS, CMD_SET_START_MODAL_STYLE, CMD_SET_TOOLTIP_FALLBACK_STYLE, CMD_SET_TOOLTIP_SUPPRESS, CMD_SET_VIRTUAL_DESKTOP_BAR_STYLE, CMD_SHELL_CARD_RECTS, CMD_SHUTDOWN, CMD_STATUS, CMD_TOOLTIP_RECT, CMD_VERSION, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS, TAP_PROTOCOL_VERSION};
 use std::ffi::c_void;
 use std::sync::atomic::{Ordering};
 use std::sync::{Arc};
@@ -343,6 +343,18 @@ unsafe fn handle_pipe_command(
                     rt.set_menu_flyout_fallback_colors(bg_argb, border_argb);
                 }
             }
+            if !write_pipe_exact_with_stop(pipe, io_event, stop, &[cmd], 1000) {
+                return PipeAction::Disconnect;
+            }
+        }
+        CMD_SET_START_MODAL_STYLE => {
+            let mut extra = [0u8; 10];
+            if !read_pipe_exact_with_stop(pipe, io_event, stop, &mut extra, 1000) {
+                return PipeAction::Disconnect;
+            }
+            let halo0_rgb = u32::from_le_bytes([extra[2], extra[3], extra[4], extra[5]]);
+            let halo1_rgb = u32::from_le_bytes([extra[6], extra[7], extra[8], extra[9]]);
+            rt.set_start_modal_style(extra[0], extra[1] != 0, halo0_rgb, halo1_rgb);
             if !write_pipe_exact_with_stop(pipe, io_event, stop, &[cmd], 1000) {
                 return PipeAction::Disconnect;
             }

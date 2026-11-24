@@ -1,4 +1,6 @@
-use super::{NodeMeta, TargetKind, VisualTreeIndex};
+use super::{
+    NodeMeta, TargetKind, VisualTreeIndex, START_MENU_OVERLAY_NAME, START_MODAL_OVERLAY_NAME,
+};
 
 impl VisualTreeIndex {
     pub(super) fn is_forbidden_shell_card_item_node(meta: &NodeMeta) -> bool {
@@ -252,9 +254,52 @@ impl VisualTreeIndex {
         self.classify_control_center_card_node(handle, node)
     }
 
+    fn is_forbidden_start_menu_overlay_node(meta: &NodeMeta) -> bool {
+        meta.name.starts_with("PrettyWindows")
+            || meta.name == START_MENU_OVERLAY_NAME
+            || meta.name == START_MODAL_OVERLAY_NAME
+    }
+
+    fn is_start_menu_modal_card_border(&self, node: &NodeMeta) -> bool {
+        if node.name.starts_with("PrettyWindows")
+            || !(node.name.is_empty()
+                || node.name.contains("Background")
+                || node.name.contains("Border"))
+        {
+            return false;
+        }
+        let Some(parent) = self.nodes.get(&node.parent) else {
+            return false;
+        };
+        let parent_is_root_grid = parent.name == "Root"
+            && (parent.type_name.ends_with(".Grid") || parent.type_name == "Grid");
+        if !parent_is_root_grid || parent.parent == 0 {
+            return false;
+        }
+        let Some(grandparent) = self.nodes.get(&parent.parent) else {
+            return false;
+        };
+        grandparent.type_name.contains("FolderModal")
+            || grandparent.type_name.contains("ExpandedFolderList")
+            || matches!(
+                grandparent.name.as_str(),
+                "StartFolderModal" | "FolderModal" | "ExpandedFolderList"
+            )
+    }
+
     pub(super) fn classify_start_menu_target(&self, handle: u64) -> Option<TargetKind> {
         let node = self.nodes.get(&handle)?;
-        if self.has_forbidden_shell_card_item_ancestor(handle) {
+        if node.name.starts_with("PrettyWindows")
+            || !self.has_ancestor_matching(
+                handle,
+                |m| {
+                    Self::is_forbidden_shell_card_item_node(m)
+                        || Self::is_forbidden_start_menu_overlay_node(m)
+                },
+                |_| false,
+                false,
+            )
+        {
             return None;
         }
         let is_border = node.type_name.ends_with(".Border") || node.type_name == "Border";
@@ -269,6 +314,9 @@ impl VisualTreeIndex {
                 .is_some_and(|p| p.type_name.contains("MenuFlyoutPresenter"))
         {
             return Some(TargetKind::MenuFlyoutSurface);
+        }
+        if is_border && self.is_start_menu_modal_card_border(node) {
+            return Some(TargetKind::StartMenuModalSurface);
         }
         if node.name == "AcrylicBorder" {
             return Some(TargetKind::ShellCardSurface);

@@ -3,8 +3,8 @@ use super::inject::{
     is_any_tap_dll_loaded_in_process, is_process_alive, prepare_tap_dll_for_injection,
     reverse_pipe_name_wide, verify_pipe_client_pid, AltTabBoundsCache, ComMtaGuard,
     WatchedProcessHandle, CMD_HIDE, CMD_MENU_FLYOUT_RECTS, CMD_RESTORE,
-    CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS, CMD_SHELL_CARD_RECTS,
-    MAINTAIN_PING_INTERVAL, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS,
+    CMD_SET_MENU_FLYOUT_FALLBACK_STYLE, CMD_SET_MENU_FLYOUT_SUPPRESS, CMD_SET_START_MODAL_STYLE,
+    CMD_SHELL_CARD_RECTS, MAINTAIN_PING_INTERVAL, MAX_MENU_FLYOUT_RECTS, MAX_SHELL_CARD_RECTS,
 };
 use super::{ProcessExitKind, TapSafetyGuard};
 use std::mem::size_of;
@@ -102,6 +102,8 @@ struct ShellFlyoutWorkerShared {
     synced_flyout_suppressed: Option<bool>,
     flyout_fallback_colors: Option<(u32, u32)>,
     synced_flyout_fallback_colors: Option<(u32, u32)>,
+    modal_style: Option<(u8, bool, u32, u32)>,
+    synced_modal_style: Option<(u8, bool, u32, u32)>,
     notify_hwnd_raw: usize,
     notify_msg: u32,
     last_inject_try: Option<Instant>,
@@ -171,6 +173,8 @@ impl ShellFlyoutTapClient {
                     synced_flyout_suppressed: None,
                     flyout_fallback_colors: None,
                     synced_flyout_fallback_colors: None,
+                    modal_style: None,
+                    synced_modal_style: None,
                     notify_hwnd_raw: 0,
                     notify_msg: 0,
                     last_inject_try: None,
@@ -251,6 +255,7 @@ impl ShellFlyoutTapClient {
                 st.flyout_suppressed = false;
                 st.synced_flyout_suppressed = None;
                 st.synced_flyout_fallback_colors = None;
+                st.synced_modal_style = None;
                 st.flyout_bounds.clear();
             }
             st.wake_seq = st.wake_seq.wrapping_add(1);
@@ -282,6 +287,7 @@ impl ShellFlyoutTapClient {
                 st.flyout_active = false;
                 st.synced_flyout_suppressed = None;
                 st.synced_flyout_fallback_colors = None;
+                st.synced_modal_style = None;
                 st.flyout_bounds.clear();
                 st.target_pid = target_pid;
                 st.track_process_pid(target_pid);
@@ -301,6 +307,7 @@ impl ShellFlyoutTapClient {
                 st.flyout_active = false;
                 st.synced_flyout_suppressed = None;
                 st.synced_flyout_fallback_colors = None;
+                st.synced_modal_style = None;
                 st.flyout_bounds.clear();
             }
 
@@ -437,6 +444,40 @@ impl ShellFlyoutTapClient {
         }
     }
 
+    pub fn set_modal_style(&mut self, target_pid: u32, style: Option<(u8, bool, u32, u32)>) {
+        let should_wake = if let Ok(mut st) = self.shared.0.lock() {
+            let changed = st.modal_style != style;
+            st.modal_style = style;
+            if style.is_none() {
+                st.synced_modal_style = None;
+            }
+            if target_pid != 0 {
+                st.target_pid = target_pid;
+            }
+            if changed
+                && style.is_some()
+                && st.desired_hidden
+                && !st.guard.is_tripped()
+                && !st.stop_worker
+            {
+                st.wake_seq = st.wake_seq.wrapping_add(1);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if should_wake {
+            if target_pid != 0 {
+                self.ensure_worker_started();
+            }
+            if self.worker.is_some() {
+                self.shared.1.set();
+            }
+        }
+    }
+
     /// Triggers a throttled reconnect/injection retry or dirty-state flush when a hosted
     /// flyout opens (without resetting a tripped crash guard).
     pub fn retry_attach_on_flyout_open(&mut self, target_pid: u32) {
@@ -462,6 +503,7 @@ impl ShellFlyoutTapClient {
             } else if st.synced_flyout_suppressed != Some(st.flyout_suppressed)
                 || (st.flyout_fallback_colors.is_some()
                     && st.flyout_fallback_colors != st.synced_flyout_fallback_colors)
+                || (st.modal_style.is_some() && st.modal_style != st.synced_modal_style)
             {
                 st.target_pid = target_pid;
                 st.wake_seq = st.wake_seq.wrapping_add(1);
@@ -686,6 +728,43 @@ unsafe fn pipe_send_style_colors(
         && (ack[0] == cmd || ack[0] == 0xFF)
 }
 
+unsafe fn pipe_send_start_modal_style(
+    pipe: HANDLE,
+    io_event: HANDLE,
+    style_id: u8,
+    light_glass: bool,
+    halo0_rgb: u32,
+    halo1_rgb: u32,
+    wait_ms: u32,
+) -> bool {
+    let host_pid = GetCurrentProcessId().to_le_bytes();
+    let h0 = halo0_rgb.to_le_bytes();
+    let h1 = halo1_rgb.to_le_bytes();
+    let req = [
+        CMD_SET_START_MODAL_STYLE,
+        host_pid[0],
+        host_pid[1],
+        host_pid[2],
+        host_pid[3],
+        style_id,
+        u8::from(light_glass),
+        h0[0],
+        h0[1],
+        h0[2],
+        h0[3],
+        h1[0],
+        h1[1],
+        h1[2],
+        h1[3],
+    ];
+    if !pipe_write_exact_timeout(pipe, io_event, &req, wait_ms) {
+        return false;
+    }
+    let mut ack = [0u8; 1];
+    pipe_read_exact_timeout(pipe, io_event, &mut ack, wait_ms)
+        && (ack[0] == CMD_SET_START_MODAL_STYLE || ack[0] == 0xFF)
+}
+
 unsafe fn pipe_query_menu_flyout_rects(
     pipe: HANDLE,
     io_event: HANDLE,
@@ -872,6 +951,7 @@ fn close_pipe_state(
         }
         st.synced_flyout_suppressed = None;
         st.synced_flyout_fallback_colors = None;
+        st.synced_modal_style = None;
         st.flyout_bounds.clear();
     }
 }
@@ -883,6 +963,7 @@ fn mark_shell_flyout_connected(lock: &Mutex<ShellFlyoutWorkerShared>, pid: u32) 
         st.idle_inject_failures = 0;
         st.synced_flyout_suppressed = None;
         st.synced_flyout_fallback_colors = None;
+        st.synced_modal_style = None;
         st.track_process_pid(pid);
         st.guard.record_success();
         (st.notify_hwnd_raw, st.notify_msg)
@@ -1299,6 +1380,48 @@ fn run_shell_flyout_worker(shared: Arc<(Mutex<ShellFlyoutWorkerShared>, OwnedEve
                 } {
                     if let Ok(mut st) = lock.lock() {
                         st.synced_flyout_fallback_colors = Some((bg_argb, border_argb));
+                        st.last_ping_ok = Some(Instant::now());
+                    }
+                } else {
+                    close_pipe_state(&mut pipe_state, lock, Some(pid));
+                    if try_start_listening_pipe(
+                        pipe_prefix,
+                        pid,
+                        grant_appcontainer_acl,
+                        conn_event,
+                        &mut pipe_state,
+                        lock,
+                    ) {
+                        just_connected = true;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if let ShellFlyoutPipeState::Connected { pid, pipe, .. } = pipe_state {
+            let desired_modal = lock.lock().ok().and_then(|st| {
+                (st.desired_hidden
+                    && !st.guard.is_tripped()
+                    && !st.stop_worker
+                    && st.modal_style != st.synced_modal_style)
+                    .then_some(st.modal_style)
+                    .flatten()
+            });
+            if let Some((style_id, light_glass, halo0_rgb, halo1_rgb)) = desired_modal {
+                if unsafe {
+                    pipe_send_start_modal_style(
+                        pipe,
+                        io_event,
+                        style_id,
+                        light_glass,
+                        halo0_rgb,
+                        halo1_rgb,
+                        500,
+                    )
+                } {
+                    if let Ok(mut st) = lock.lock() {
+                        st.synced_modal_style = Some((style_id, light_glass, halo0_rgb, halo1_rgb));
                         st.last_ping_ok = Some(Instant::now());
                     }
                 } else {

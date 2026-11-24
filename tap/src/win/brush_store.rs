@@ -71,6 +71,7 @@ pub(super) struct UiThreadBrushStore {
     pub(super) element_shadow_dp: Option<ComRaw>,
     pub(super) visual_tree_helper: Option<ComRaw>,
     pub(super) element_comp_preview: Option<ComRaw>,
+    pub(super) grid_statics: Option<ComRaw>,
     pub(super) prewarmed: bool,
     pub(super) saved: HashMap<u64, SavedTargetBrushes>,
     pub(super) watches: HashMap<(u64, u8), PropWatchEntry>,
@@ -83,6 +84,8 @@ pub(super) struct UiThreadBrushStore {
     pub(super) menu_flyout_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
     pub(super) menu_flyout_modified_targets: HashMap<u64, TooltipTrackedEntry>,
     pub(super) shell_card_orig_corner_radius: HashMap<u64, SavedCornerRadius>,
+    pub(super) shell_card_orig_comp_visible: HashMap<u64, u8>,
+    pub(super) start_modal_applied_style: HashMap<u64, (u8, bool, u32, u32)>,
     pub(super) shell_card_modified_targets: HashMap<u64, TooltipTrackedEntry>,
 }
 
@@ -657,6 +660,7 @@ pub(super) unsafe extern "system" fn prop_changed_invoke(
                 _ => {}
             }
         }
+        TargetKind::StartMenuModalSurface => {}
         TargetKind::VirtualDesktopBarSurface => {
             let (target_bg, target_border) = cb.runtime.virtual_desktop_bar_target_colors();
             match cb.prop {
@@ -1486,6 +1490,16 @@ pub(super) fn purge_saved_brushes_for_current_thread(handles: &[u64]) {
             if !s.shell_card_orig_corner_radius.is_empty() {
                 for &h in handles {
                     s.shell_card_orig_corner_radius.remove(&h);
+                }
+            }
+            if !s.shell_card_orig_comp_visible.is_empty() {
+                for &h in handles {
+                    s.shell_card_orig_comp_visible.remove(&h);
+                }
+            }
+            if !s.start_modal_applied_style.is_empty() {
+                for &h in handles {
+                    s.start_modal_applied_style.remove(&h);
                 }
             }
             let brushes: Vec<SavedTargetBrushes> = if s.saved.is_empty() {

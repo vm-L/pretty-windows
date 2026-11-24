@@ -33,12 +33,13 @@ mod win {
         find_search_host_pid, find_shell_experience_host_pid, find_shell_host_pid,
         find_start_menu_pid, ShellFlyoutTapClient, TapClient,
     };
-    use crate::color::Rgb;
+    use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
     use crate::system::{
-        is_exclusive_fullscreen_or_presentation, is_transparency_enabled,
+        is_exclusive_fullscreen_or_presentation, is_transparency_enabled, resolve_unified_accent,
         set_active_taskbar_surface_style, should_suppress_osd_backdrop,
         should_suppress_tooltip_backdrop, window_band,
     };
+    use crate::ui::compute_halo_pair;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
     use windows::Win32::Foundation::{HWND, RECT};
@@ -85,8 +86,26 @@ mod win {
             self.tap.set_flyout_suppressed(0, false);
             if clear_colors {
                 self.tap.set_flyout_fallback_colors(0, None);
+                self.tap.set_modal_style(0, None);
             }
         }
+    }
+
+    const fn taskbar_style_wire_id(style: TaskbarStyle) -> u8 {
+        match style {
+            TaskbarStyle::Default => 0,
+            TaskbarStyle::Transparent => 1,
+            TaskbarStyle::Blur => 2,
+            TaskbarStyle::Acrylic => 3,
+            TaskbarStyle::LiquidGlass => 4,
+        }
+    }
+
+    fn start_modal_style_payload(style: TaskbarStyle, light_glass: bool) -> (u8, bool, u32, u32) {
+        let (_, base_dark) = resolve_unified_accent(NEUTRAL_BACKDROP_FALLBACK, light_glass);
+        let [c0, c1] = compute_halo_pair(base_dark, light_glass);
+        let pack = |c: Rgb| (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
+        (taskbar_style_wire_id(style), light_glass, pack(c0), pack(c1))
     }
 
     type ShellFlyoutWindowEnumerator = fn(u32) -> Vec<(HWND, RECT, u32, u32, bool)>;
@@ -1449,6 +1468,12 @@ mod win {
                 &mut self.start_menu_host,
                 find_visible_start_menu_windows,
             );
+            if self.start_menu_host.active {
+                self.start_menu_host.tap.set_modal_style(
+                    self.start_menu_host.cached_pid,
+                    Some(start_modal_style_payload(self.style, self.light_glass)),
+                );
+            }
             let mut search_cards = Self::sync_one_shell_flyout_host(
                 self.style,
                 &mut self.search_host,
@@ -1535,6 +1560,10 @@ mod win {
             self.start_menu_host
                 .tap
                 .set_flyout_fallback_colors(start_menu_pid, menu_colors);
+            self.start_menu_host.tap.set_modal_style(
+                start_menu_pid,
+                Some(start_modal_style_payload(self.style, self.light_glass)),
+            );
             self.search_host
                 .tap
                 .set_flyout_fallback_colors(search_host_pid, menu_colors);

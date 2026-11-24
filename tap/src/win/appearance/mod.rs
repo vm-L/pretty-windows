@@ -1,6 +1,7 @@
 mod alttab;
 mod flyouts;
 mod menus;
+mod modal_blur;
 mod shell_cards;
 
 pub(super) use alttab::{
@@ -26,7 +27,7 @@ use flyouts::{
     apply_virtual_desktop_bar_appearance,
 };
 use menus::{apply_menu_flyout_surface_appearance, apply_tooltip_presenter_appearance};
-use shell_cards::apply_shell_card_surface_appearance;
+use shell_cards::{apply_shell_card_surface_appearance, apply_start_menu_modal_surface_appearance};
 
 use super::super::tree_match::TargetKind;
 use std::ffi::c_void;
@@ -635,6 +636,9 @@ pub(super) unsafe fn apply_target_appearance(
         }
         TargetKind::ShellCardSurface | TargetKind::ShellCardSubSurface => {
             apply_shell_card_surface_appearance(rt, handle, insp_ptr, kind, desired_hide);
+        }
+        TargetKind::StartMenuModalSurface => {
+            apply_start_menu_modal_surface_appearance(rt, handle, insp_ptr, desired_hide);
         }
         TargetKind::VirtualDesktopBarSurface => {
             apply_virtual_desktop_bar_appearance(rt, handle, insp_ptr, kind, desired_hide);
