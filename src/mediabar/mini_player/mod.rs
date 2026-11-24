@@ -9,7 +9,7 @@ use super::layout::{compute_mini_player_window_origin, MiniPlayerHitZone, MiniPl
 use super::marquee::MarqueeState;
 use super::smtc::{MediaCover, SourceItem};
 use super::timeline::{current_filetime_100ns, MediaTimeline};
-use crate::color::{derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::color::{build_ambient_cover_bgra, derive_background_accent, enforce_ui_accent_deadzone, Rgb, NEUTRAL_BACKDROP_FALLBACK};
 use crate::system::{active_taskbar_surface_style, visible_transient_overlay_rects};
 use crate::ui::glass::{capture_blurred_desktop_backdrop_excluding, create_dc_render_target, create_round_cap_stroke, create_text_format, LayeredSurface, PopupNoiseCache};
 use crate::ui::{compute_halo_pair, ease_out_cubic, ease_retract, popup_glass_recipe, PopupAnimPhase, Spring1D, CLOSE_ANIM_DUR_S, OPEN_SPRING_DAMPING, OPEN_SPRING_STIFFNESS, POPUP_ANIM_INTERVAL_MS, POPUP_FLOW_INTERVAL_MS, POPUP_REOPEN_DEBOUNCE_MS, SILK_H, SILK_W};
@@ -25,12 +25,13 @@ use windows::Win32::Graphics::DirectWrite::{IDWriteFactory, IDWriteTextFormat, I
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, SW_SHOWNA, WM_APP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP};
+use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DestroyWindow, IsWindowVisible, KillTimer, LoadCursorW, PostMessageW, RegisterClassExW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HWND_TOPMOST, IDC_ARROW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOW, WM_APP, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP};
 
 pub const WM_APP_MINI_PLAYER_CLOSED: u32 = WM_APP + 7;
 pub const WM_APP_MINI_PLAYER_ACTION: u32 = WM_APP + 8;
 pub const WM_APP_MINI_PLAYER_SEEK: u32 = WM_APP + 9;
 pub const WM_APP_MINI_PLAYER_WHEEL: u32 = WM_APP + 10;
+pub const WM_APP_MINI_PLAYER_VOLUME: u32 = WM_APP + 12;
 
 pub const MINI_ACTION_PREV: usize = 1;
 pub const MINI_ACTION_PLAY_PAUSE: usize = 2;
@@ -42,7 +43,7 @@ pub const MINI_ACTION_TOGGLE_MUTE: usize = 6;
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const MINI_PLAYER_CLASS_NAME: PCWSTR = w!("MediaBarMiniPlayerWnd");
 const TIMER_MINI_TICK_ID: usize = 1;
-const VOL_BADGE_TTL: Duration = Duration::from_millis(1200);
+pub(super) const VOL_BADGE_TTL: Duration = Duration::from_millis(1200);
 const OPTIMISTIC_SEEK_TTL: Duration = Duration::from_millis(700);
 
 #[derive(Clone)]
@@ -65,6 +66,7 @@ struct CachedText {
 struct CachedArtBitmap {
     hash: u64,
     bitmap: ID2D1Bitmap,
+    ambient_bitmap: Option<ID2D1Bitmap>,
 }
 
 struct InitHwndGuard(Option<HWND>);
@@ -124,6 +126,7 @@ struct MiniPlayerInner {
     pressed_zone: MiniPlayerHitZone,
     tracking_leave: bool,
     dragging_seek_ratio: Option<f32>,
+    dragging_volume: bool,
     pending_seek_100ns: Option<i64>,
     optimistic_seek: Option<(i64, i64, Instant)>,
 
@@ -234,6 +237,7 @@ impl MiniPlayerPopup {
                 pressed_zone: MiniPlayerHitZone::None,
                 tracking_leave: false,
                 dragging_seek_ratio: None,
+                dragging_volume: false,
                 pending_seek_100ns: None,
                 optimistic_seek: None,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
@@ -377,17 +381,21 @@ impl MiniPlayerPopup {
     pub fn update_volume(&mut self, volume: f32, muted: bool, show_badge: bool) {
         let visible = self.is_visible();
         let should_render = if let Ok(mut s) = self.inner.try_borrow_mut() {
-            let changed =
-                (s.master_vol - volume).abs() > 0.002 || s.master_muted != muted || show_badge;
-            s.master_vol = volume.clamp(0.0, 1.0);
-            s.master_muted = muted;
-            if show_badge {
-                s.vol_badge_until = Some(Instant::now() + VOL_BADGE_TTL);
+            if s.dragging_volume {
+                false
+            } else {
+                let changed =
+                    (s.master_vol - volume).abs() > 0.002 || s.master_muted != muted || show_badge;
+                s.master_vol = volume.clamp(0.0, 1.0);
+                s.master_muted = muted;
+                if show_badge {
+                    s.vol_badge_until = Some(Instant::now() + VOL_BADGE_TTL);
+                }
+                if visible && (changed || show_badge) {
+                    s.sync_timer_rate();
+                }
+                changed && visible
             }
-            if visible && (changed || show_badge) {
-                s.sync_timer_rate();
-            }
-            changed && visible
         } else {
             false
         };
@@ -410,8 +418,7 @@ impl MiniPlayerPopup {
 
     pub fn update_live_source(&mut self, source: Option<SourceItem>) {
         let visible = self.is_visible();
-        let (reposition_needed, should_render) = if let Ok(mut s) = self.inner.try_borrow_mut() {
-            let prev_has_tl = s.has_timeline;
+        let should_render = if let Ok(mut s) = self.inner.try_borrow_mut() {
             let next_has_tl = source
                 .as_ref()
                 .and_then(|src| src.timeline)
@@ -429,50 +436,12 @@ impl MiniPlayerPopup {
             }
             s.source = source;
             s.has_timeline = next_has_tl;
-
-            if visible {
-                let need_reposition = prev_has_tl != next_has_tl;
-                if need_reposition {
-                    s.suppress_deactivate_close = true;
-                }
-                (need_reposition, true)
-            } else {
-                (false, false)
-            }
+            visible
         } else {
-            (false, false)
+            false
         };
 
-        if reposition_needed {
-            unsafe {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
-            }
-            let coords = if let Ok(mut s) = self.inner.try_borrow_mut() {
-                let coords = s.reposition_and_recapture();
-                let _ = s.render();
-                s.sync_timer_rate();
-                Some(coords)
-            } else {
-                None
-            };
-            if let Some((win_x, win_y, win_w, win_h)) = coords {
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        HWND_TOPMOST,
-                        win_x,
-                        win_y,
-                        win_w,
-                        win_h,
-                        SWP_NOACTIVATE,
-                    );
-                    let _ = ShowWindow(self.hwnd, SW_SHOWNA);
-                }
-            }
-            if let Ok(mut s) = self.inner.try_borrow_mut() {
-                s.suppress_deactivate_close = false;
-            }
-        } else if should_render && self.is_visible() {
+        if should_render && self.is_visible() {
             if let Ok(mut s) = self.inner.try_borrow_mut() {
                 let _ = s.render();
                 s.sync_timer_rate();
@@ -519,6 +488,7 @@ impl MiniPlayerPopup {
             s.hover_zone = MiniPlayerHitZone::None;
             s.pressed_zone = MiniPlayerHitZone::None;
             s.dragging_seek_ratio = None;
+            s.dragging_volume = false;
             s.pending_seek_100ns = None;
             s.optimistic_seek = None;
             s.has_timeline = s
@@ -714,6 +684,7 @@ impl MiniPlayerInner {
         self.pressed_zone = MiniPlayerHitZone::None;
         self.tracking_leave = false;
         self.dragging_seek_ratio = None;
+        self.dragging_volume = false;
         self.vol_badge_until = None;
         self.anim_phase = PopupAnimPhase::Open;
         self.open_spring = Spring1D::still(1.0);
@@ -733,7 +704,13 @@ impl MiniPlayerInner {
         let bars_active = self.bar_levels.iter().any(|&v| v > 0.002);
         let badge_active = self.vol_badge_until.is_some_and(|t| Instant::now() < t);
         let seek_active = self.optimistic_seek.is_some();
-        if is_animating || is_playing || marquee_active || bars_active || badge_active || seek_active
+        if is_animating
+            || is_playing
+            || marquee_active
+            || bars_active
+            || badge_active
+            || seek_active
+            || self.dragging_volume
         {
             POPUP_ANIM_INTERVAL_MS
         } else {
@@ -801,9 +778,9 @@ impl MiniPlayerInner {
             }
         }
         let s = (self.dpi.max(96) as f32) / 96.0;
-        let badge_fmt = create_text_format(&self.dwrite_factory, 10.5 * s, true, false, true)?;
-        let title_fmt = create_text_format(&self.dwrite_factory, 14.0 * s, true, false, false)?;
-        let artist_fmt = create_text_format(&self.dwrite_factory, 11.8 * s, false, false, false)?;
+        let badge_fmt = create_text_format(&self.dwrite_factory, 11.0 * s, true, false, true)?;
+        let title_fmt = create_text_format(&self.dwrite_factory, 16.0 * s, true, false, false)?;
+        let artist_fmt = create_text_format(&self.dwrite_factory, 12.5 * s, false, false, false)?;
         let time_l_fmt = create_text_format(&self.dwrite_factory, 10.2 * s, false, false, false)?;
         let time_r_fmt = create_text_format(&self.dwrite_factory, 10.2 * s, false, true, false)?;
         let cached = CachedFormats {
@@ -851,10 +828,10 @@ impl MiniPlayerInner {
         }
     }
 
-    fn ensure_art_bitmap(&mut self, cover: &MediaCover) -> Option<ID2D1Bitmap> {
+    fn ensure_art_bitmap(&mut self, cover: &MediaCover) -> Option<(ID2D1Bitmap, Option<ID2D1Bitmap>)> {
         if let Some(ref c) = self.cached_art {
             if c.hash == cover.hash {
-                return Some(c.bitmap.clone());
+                return Some((c.bitmap.clone(), c.ambient_bitmap.clone()));
             }
         }
         unsafe {
@@ -878,11 +855,31 @@ impl MiniPlayerInner {
                     &props,
                 )
                 .ok()?;
+
+            let ambient_bgra = build_ambient_cover_bgra(
+                &cover.thumb_pbgra,
+                cover.thumb_w as usize,
+                cover.thumb_h as usize,
+            );
+            let ambient_bitmap = self
+                .rt
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: cover.thumb_w,
+                        height: cover.thumb_h,
+                    },
+                    Some(ambient_bgra.as_ptr().cast()),
+                    cover.thumb_w * 4,
+                    &props,
+                )
+                .ok();
+
             self.cached_art = Some(CachedArtBitmap {
                 hash: cover.hash,
                 bitmap: bmp.clone(),
+                ambient_bitmap: ambient_bitmap.clone(),
             });
-            Some(bmp)
+            Some((bmp, ambient_bitmap))
         }
     }
 
@@ -965,6 +962,18 @@ impl MiniPlayerInner {
                 self.main_hwnd,
                 WM_APP_MINI_PLAYER_ACTION,
                 WPARAM(action),
+                LPARAM(0),
+            );
+        }
+    }
+
+    fn post_volume(&self, ratio: f32) {
+        let scaled = (ratio.clamp(0.0, 1.0) * 10000.0).round() as usize;
+        unsafe {
+            let _ = PostMessageW(
+                self.main_hwnd,
+                WM_APP_MINI_PLAYER_VOLUME,
+                WPARAM(scaled),
                 LPARAM(0),
             );
         }

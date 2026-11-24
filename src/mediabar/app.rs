@@ -7,7 +7,8 @@ use super::marquee::MarqueeState;
 use super::mini_player::{
     MiniPlayerPopup, MINI_ACTION_ACTIVATE, MINI_ACTION_NEXT, MINI_ACTION_OPEN_MENU,
     MINI_ACTION_PLAY_PAUSE, MINI_ACTION_PREV, MINI_ACTION_TOGGLE_MUTE, WM_APP_MINI_PLAYER_ACTION,
-    WM_APP_MINI_PLAYER_CLOSED, WM_APP_MINI_PLAYER_SEEK, WM_APP_MINI_PLAYER_WHEEL,
+    WM_APP_MINI_PLAYER_CLOSED, WM_APP_MINI_PLAYER_SEEK, WM_APP_MINI_PLAYER_VOLUME,
+    WM_APP_MINI_PLAYER_WHEEL,
 };
 use super::popup::{
     SourcePopup, SETTING_CLOSE, SETTING_RESET_POS, SETTING_TOGGLE_AUTO_COLOR, SETTING_TOGGLE_LOCK,
@@ -800,6 +801,28 @@ impl AppState {
             .update_volume(self.master_vol, self.master_muted, true);
     }
 
+    fn apply_mini_player_volume(&mut self, level: f32) {
+        let ratio = level.clamp(0.0, 1.0);
+        if self.master_vol_ctrl.is_none() {
+            self.master_vol_ctrl = MasterVolumeControl::open_default();
+        }
+        if let Some((actual_vol, actual_muted)) = self
+            .master_vol_ctrl
+            .as_mut()
+            .and_then(|ctrl| ctrl.set_volume_and_readback(ratio))
+        {
+            self.master_vol = actual_vol;
+            self.master_muted = actual_muted;
+        } else {
+            self.master_vol = ratio;
+            if self.master_muted && ratio > 0.0 {
+                self.master_muted = false;
+            }
+        }
+        self.mini_player
+            .update_volume(self.master_vol, self.master_muted, true);
+    }
+
     fn toggle_mini_player_mute(&mut self) {
         self.refresh_master_volume_state();
         let next_muted = !self.master_muted;
@@ -1350,6 +1373,13 @@ unsafe extern "system" fn main_wnd_proc(
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.apply_mini_player_wheel(wheel_delta);
                 }
+            }
+            LRESULT(0)
+        }
+        WM_APP_MINI_PLAYER_VOLUME => {
+            let level = (wparam.0 as f32 / 10000.0).clamp(0.0, 1.0);
+            if let Ok(mut state) = rc.try_borrow_mut() {
+                state.apply_mini_player_volume(level);
             }
             LRESULT(0)
         }

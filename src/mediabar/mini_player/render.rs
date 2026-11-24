@@ -14,8 +14,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D_POINT_2F};
-use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, ID2D1Brush, ID2D1Geometry, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT};
-use windows::Win32::Graphics::DirectWrite::IDWriteTextLayout;
+use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, ID2D1Brush, ID2D1Geometry, ID2D1SolidColorBrush, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_ELLIPSE, D2D1_EXTEND_MODE_CLAMP, D2D1_GAMMA_2_2, D2D1_LAYER_OPTIONS_NONE, D2D1_LAYER_PARAMETERS, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT};
+use windows::Win32::Graphics::DirectWrite::{IDWriteTextLayout, DWRITE_TEXT_METRICS};
 
 impl MiniPlayerInner {
     fn recreate_render_target(&mut self) -> windows::core::Result<()> {
@@ -81,7 +81,9 @@ impl MiniPlayerInner {
 
         let cover_arc: Option<Arc<MediaCover>> =
             self.source.as_ref().and_then(|src| src.cover.clone());
-        let art_bmp = cover_arc.as_ref().and_then(|c| self.ensure_art_bitmap(c));
+        let art_pair = cover_arc.as_ref().and_then(|c| self.ensure_art_bitmap(c));
+        let art_bmp = art_pair.as_ref().map(|(bmp, _)| bmp);
+        let ambient_art_bmp = art_pair.as_ref().and_then(|(_, amb)| amb.as_ref());
 
         let title_str = self
             .source
@@ -213,7 +215,103 @@ impl MiniPlayerInner {
                     &mut self.noise_cache,
                 );
 
-                // Soft album-tinted radial glow emanating from behind the artwork
+                // Soft blurred album-cover ambient atmosphere wash (Apple-Music-inspired Liquid Glass depth)
+                if self.auto_color {
+                    if let Some(amb_bmp) = ambient_art_bmp {
+                        let overscan = card_rect.width() * 0.06;
+                        let wash_rect = RectF::new(
+                            card_rect.left - overscan,
+                            card_rect.top - overscan,
+                            card_rect.right + overscan,
+                            card_rect.bottom + overscan,
+                        );
+                        self.rt.DrawBitmap(
+                            amb_bmp,
+                            Some(&d2d_rect(wash_rect)),
+                            if light { 0.20 } else { 0.28 },
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                    }
+                }
+
+                // Gentle protective bottom scrim for crisp title/control legibility across vibrant covers
+                let scrim_stops = if light {
+                    [
+                        D2D1_GRADIENT_STOP {
+                            position: 0.0,
+                            color: D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 0.0,
+                            },
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 0.50,
+                            color: D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 0.06,
+                            },
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 1.0,
+                            color: D2D1_COLOR_F {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 0.24,
+                            },
+                        },
+                    ]
+                } else {
+                    [
+                        D2D1_GRADIENT_STOP {
+                            position: 0.0,
+                            color: D2D1_COLOR_F {
+                                r: 0.03,
+                                g: 0.04,
+                                b: 0.055,
+                                a: 0.0,
+                            },
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 0.50,
+                            color: D2D1_COLOR_F {
+                                r: 0.03,
+                                g: 0.04,
+                                b: 0.055,
+                                a: 0.05,
+                            },
+                        },
+                        D2D1_GRADIENT_STOP {
+                            position: 1.0,
+                            color: D2D1_COLOR_F {
+                                r: 0.03,
+                                g: 0.04,
+                                b: 0.055,
+                                a: 0.28,
+                            },
+                        },
+                    ]
+                };
+                if let Some(scrim_brush) = self.create_linear_gradient(
+                    D2D_POINT_2F {
+                        x: card_rect.left,
+                        y: card_rect.top,
+                    },
+                    D2D_POINT_2F {
+                        x: card_rect.left,
+                        y: card_rect.bottom,
+                    },
+                    &scrim_stops,
+                ) {
+                    self.rt.FillRectangle(&d2d_rect(card_rect), &scrim_brush);
+                }
+
+                // Soft album-tinted radial glow emanating from behind the hero artwork
                 if self.source.is_some() {
                     let glow_cx = (layout.cover_rect.left + layout.cover_rect.right) * 0.5;
                     let glow_cy = (layout.cover_rect.top + layout.cover_rect.bottom) * 0.5
@@ -221,11 +319,11 @@ impl MiniPlayerInner {
                     let glow_stops = [
                         D2D1_GRADIENT_STOP {
                             position: 0.0,
-                            color: d2d_color_rgb(accent, if light { 0.14 } else { 0.22 }),
+                            color: d2d_color_rgb(accent, if light { 0.10 } else { 0.16 }),
                         },
                         D2D1_GRADIENT_STOP {
                             position: 0.55,
-                            color: d2d_color_rgb(accent, if light { 0.05 } else { 0.08 }),
+                            color: d2d_color_rgb(accent, if light { 0.04 } else { 0.06 }),
                         },
                         D2D1_GRADIENT_STOP {
                             position: 1.0,
@@ -243,8 +341,8 @@ impl MiniPlayerInner {
                                 y: glow_cy,
                             },
                             gradientOriginOffset: D2D_POINT_2F { x: 0.0, y: 0.0 },
-                            radiusX: card_rect.width() * 0.68,
-                            radiusY: card_rect.height() * 0.85,
+                            radiusX: card_rect.width() * 0.72,
+                            radiusY: card_rect.height() * 0.52,
                         };
                         if let Ok(glow_brush) =
                             self.rt.CreateRadialGradientBrush(&rad_props, None, &sc)
@@ -264,10 +362,10 @@ impl MiniPlayerInner {
                         content_alpha,
                         accent,
                         is_playing,
-                        art_bmp.as_ref(),
+                        art_bmp,
                         badge_str,
-                        title_layout.as_ref().map(|(tl, _)| tl),
-                        artist_layout.as_ref().map(|(al, _)| al),
+                        title_layout.as_ref().map(|(tl, w)| (tl, *w)),
+                        artist_layout.as_ref().map(|(al, w)| (al, *w)),
                         slider_ratio,
                         elapsed_secs,
                         total_secs,
@@ -292,6 +390,26 @@ impl MiniPlayerInner {
         Ok(())
     }
 
+    unsafe fn create_linear_gradient(
+        &self,
+        start: D2D_POINT_2F,
+        end: D2D_POINT_2F,
+        stops: &[D2D1_GRADIENT_STOP],
+    ) -> Option<ID2D1Brush> {
+        let sc = self
+            .rt
+            .CreateGradientStopCollection(stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)
+            .ok()?;
+        let props = D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+            startPoint: start,
+            endPoint: end,
+        };
+        self.rt
+            .CreateLinearGradientBrush(&props, None, &sc)
+            .ok()
+            .map(Into::into)
+    }
+
     #[allow(clippy::too_many_arguments)]
     unsafe fn draw_content(
         &self,
@@ -303,8 +421,8 @@ impl MiniPlayerInner {
         is_playing: bool,
         art_bmp: Option<&ID2D1Bitmap>,
         badge_str: &str,
-        title_layout: Option<&IDWriteTextLayout>,
-        artist_layout: Option<&IDWriteTextLayout>,
+        title_layout: Option<(&IDWriteTextLayout, f32)>,
+        artist_layout: Option<(&IDWriteTextLayout, f32)>,
         slider_ratio: f32,
         elapsed_secs: f64,
         total_secs: f64,
@@ -314,66 +432,179 @@ impl MiniPlayerInner {
         let light = self.light_glass;
         let shift = |r: RectF| RectF::new(r.left, r.top + dy, r.right, r.bottom + dy);
 
-        // Hover backdrop behind artwork + title when user hovers to jump to player
-        if self.hover_zone == MiniPlayerHitZone::CoverOrInfo && self.source.is_some() {
-            let hr = shift(layout.info_hit_rect);
-            let pad = 4.0 * s;
-            let pill = RectF::new(hr.left - pad, hr.top - pad, hr.right + pad, hr.bottom + pad);
-            let bg = if light {
+        // 1. Header row: frosted glass micro-pill source badge + top-right circular glass chip menu button
+        let badge_rect = shift(layout.source_badge_rect);
+        let badge_pad_x = 11.0 * s;
+        let max_badge_text_w = (badge_rect.width() - badge_pad_x * 2.0).max(12.0);
+        let badge_wide: Vec<u16> = badge_str.encode_utf16().collect();
+        let measured_badge = self
+            .dwrite_factory
+            .CreateTextLayout(
+                &badge_wide,
+                &formats.badge_fmt,
+                max_badge_text_w,
+                badge_rect.height().max(12.0),
+            )
+            .ok()
+            .and_then(|tl| {
+                let mut metrics = DWRITE_TEXT_METRICS::default();
+                tl.GetMetrics(&mut metrics)
+                    .ok()
+                    .map(|()| (tl, metrics.width.min(max_badge_text_w).max(0.0)))
+            });
+
+        let mut badge_text_col = primary_text_color(light);
+        badge_text_col.a *= 0.88 * alpha;
+
+        if let Some((badge_tl, text_w)) = measured_badge {
+            let pill_w = (text_w + badge_pad_x * 2.0).min(badge_rect.width());
+            let badge_cx = (badge_rect.left + badge_rect.right) * 0.5;
+            let pill_rect = RectF::new(
+                badge_cx - pill_w * 0.5,
+                badge_rect.top,
+                badge_cx + pill_w * 0.5,
+                badge_rect.bottom,
+            );
+            let pill_rr = D2D1_ROUNDED_RECT {
+                rect: d2d_rect(pill_rect),
+                radiusX: badge_rect.height() * 0.5,
+                radiusY: badge_rect.height() * 0.5,
+            };
+            let pill_bg = if light {
                 D2D1_COLOR_F {
                     r: 0.0,
                     g: 0.0,
                     b: 0.0,
-                    a: 0.045 * alpha,
+                    a: 0.055 * alpha,
                 }
             } else {
                 D2D1_COLOR_F {
                     r: 1.0,
                     g: 1.0,
                     b: 1.0,
-                    a: 0.055 * alpha,
+                    a: 0.08 * alpha,
                 }
             };
-            if let Ok(b) = self.rt.CreateSolidColorBrush(&bg, None) {
-                let rr = D2D1_ROUNDED_RECT {
-                    rect: d2d_rect(pill),
-                    radiusX: 11.0 * s,
-                    radiusY: 11.0 * s,
-                };
-                self.rt.FillRoundedRectangle(&rr, &b);
+            if let Ok(pb) = self.rt.CreateSolidColorBrush(&pill_bg, None) {
+                self.rt.FillRoundedRectangle(&pill_rr, &pb);
             }
+            let pill_rim = if light {
+                D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.09 * alpha,
+                }
+            } else {
+                D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.16 * alpha,
+                }
+            };
+            if let Ok(rb) = self.rt.CreateSolidColorBrush(&pill_rim, None) {
+                self.rt.DrawRoundedRectangle(&pill_rr, &rb, 0.85 * s, None);
+            }
+
+            if let Ok(tb) = self.rt.CreateSolidColorBrush(&badge_text_col, None) {
+                self.rt.DrawTextLayout(
+                    D2D_POINT_2F {
+                        x: pill_rect.left + ((pill_rect.width() - text_w) * 0.5).max(0.0),
+                        y: badge_rect.top,
+                    },
+                    &badge_tl,
+                    &tb,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                );
+            }
+        } else {
+            draw_text_in_rect(
+                &self.dwrite_factory,
+                &self.rt,
+                badge_str,
+                badge_rect,
+                &formats.badge_fmt,
+                badge_text_col,
+            );
         }
 
-        // 1. Large crisp album artwork (or default music note card)
+        // Top-right circular glass chip menu button
+        let more_rect = shift(layout.more_btn_rect);
+        let more_hovered = self.hover_zone == MiniPlayerHitZone::MoreMenuButton;
+        let more_pressed = self.pressed_zone == MiniPlayerHitZone::MoreMenuButton;
+        let more_rr = D2D1_ROUNDED_RECT {
+            rect: d2d_rect(more_rect),
+            radiusX: more_rect.width() * 0.5,
+            radiusY: more_rect.width() * 0.5,
+        };
+        let chip_bg = if light {
+            let a = if more_pressed {
+                0.14
+            } else if more_hovered {
+                0.09
+            } else {
+                0.045
+            };
+            D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: a * alpha,
+            }
+        } else {
+            let a = if more_pressed {
+                0.20
+            } else if more_hovered {
+                0.14
+            } else {
+                0.06
+            };
+            D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: a * alpha,
+            }
+        };
+        if let Ok(cb) = self.rt.CreateSolidColorBrush(&chip_bg, None) {
+            self.rt.FillRoundedRectangle(&more_rr, &cb);
+        }
+        let chip_rim = if light {
+            D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: (if more_hovered { 0.14 } else { 0.08 }) * alpha,
+            }
+        } else {
+            D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: (if more_hovered { 0.24 } else { 0.14 }) * alpha,
+            }
+        };
+        if let Ok(cr) = self.rt.CreateSolidColorBrush(&chip_rim, None) {
+            self.rt.DrawRoundedRectangle(&more_rr, &cr, 0.85 * s, None);
+        }
+        let mut util_col = if more_hovered {
+            primary_text_color(light)
+        } else {
+            muted_text_color(light)
+        };
+        util_col.a *= (if more_pressed { 0.72 } else { 1.0 }) * alpha;
+        if let Ok(ub) = self.rt.CreateSolidColorBrush(&util_col, None) {
+            self.draw_menu_icon(more_rect, s * if more_pressed { 0.90 } else { 0.95 }, &ub);
+        }
+
+        // 2. Hero centered crisp album artwork (clean border without drop shadow or hover whitening)
         let cover_rect = shift(layout.cover_rect);
         let cover_rr = D2D1_ROUNDED_RECT {
             rect: d2d_rect(cover_rect),
             radiusX: layout.cover_radius,
             radiusY: layout.cover_radius,
         };
-        // Subtle elevation shadow under cover tile
-        let art_shadow = RectF::new(
-            cover_rect.left,
-            cover_rect.top + 2.5 * s,
-            cover_rect.right,
-            cover_rect.bottom + 3.5 * s,
-        );
-        if let Ok(sb) = self.rt.CreateSolidColorBrush(
-            &D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: (if light { 0.14 } else { 0.30 }) * alpha,
-            },
-            None,
-        ) {
-            let sh_rr = D2D1_ROUNDED_RECT {
-                rect: d2d_rect(art_shadow),
-                radiusX: layout.cover_radius,
-                radiusY: layout.cover_radius,
-            };
-            self.rt.FillRoundedRectangle(&sh_rr, &sb);
-        }
 
         if let Some(bmp) = art_bmp {
             if let Ok(geo) = self.d2d_factory.CreateRoundedRectangleGeometry(&cover_rr) {
@@ -418,99 +649,109 @@ impl MiniPlayerInner {
             if let Ok(tb) = self.rt.CreateSolidColorBrush(&tile_bg, None) {
                 self.rt.FillRoundedRectangle(&cover_rr, &tb);
             }
-            let note_col = d2d_color_rgb(accent, 0.85 * alpha);
+            let note_col = d2d_color_rgb(accent, 0.88 * alpha);
             if let Ok(nb) = self.rt.CreateSolidColorBrush(&note_col, None) {
                 let cx = (cover_rect.left + cover_rect.right) * 0.5;
                 let cy = (cover_rect.top + cover_rect.bottom) * 0.5;
-                draw_music_note_icon(&self.rt, cx, cy, 2.2 * s, &nb);
+                draw_music_note_icon(&self.rt, cx, cy, 6.2 * s, &nb);
             }
         }
 
-        let cover_rim = if light {
-            D2D1_COLOR_F {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.12 * alpha,
-            }
-        } else {
-            D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.20 * alpha,
-            }
-        };
-        if let Ok(rb) = self.rt.CreateSolidColorBrush(&cover_rim, None) {
-            self.rt.DrawRoundedRectangle(&cover_rr, &rb, 1.0 * s, None);
-        }
-
-        // 2. Source badge (status dot + app name)
-        let badge_rect = shift(layout.source_badge_rect);
-        let dot_r = 2.8 * s;
-        let dot_cx = badge_rect.left + dot_r + 0.5 * s;
-        let dot_cy = (badge_rect.top + badge_rect.bottom) * 0.5;
-        let dot_col = if is_playing {
-            d2d_color_rgb(accent, 0.95 * alpha)
-        } else {
-            let mut m = muted_text_color(light);
-            m.a *= 0.72 * alpha;
-            m
-        };
-        if let Ok(db) = self.rt.CreateSolidColorBrush(&dot_col, None) {
-            self.rt.FillEllipse(
-                &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F {
-                        x: dot_cx,
-                        y: dot_cy,
+        // Top-lit vertical gradient glass bevel rim around album cover
+        let cover_rim_stops = if light {
+            [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.58 * alpha,
                     },
-                    radiusX: dot_r,
-                    radiusY: dot_r,
                 },
-                &db,
-            );
-        }
-        let mut badge_text_col = muted_text_color(light);
-        badge_text_col.a *= 0.92 * alpha;
-        let badge_text_rect = RectF::new(
-            dot_cx + dot_r + 5.0 * s,
-            badge_rect.top,
-            badge_rect.right,
-            badge_rect.bottom,
-        );
-        draw_text_in_rect(
-            &self.dwrite_factory,
-            &self.rt,
-            badge_str,
-            badge_text_rect,
-            &formats.badge_fmt,
-            badge_text_col,
-        );
-
-        // 3. Compact live mini-spectrum in header
-        let spec_alpha = (if self.source.is_some() { 0.90 } else { 0.30 }) * alpha;
-        let spec_col = d2d_color_rgb(accent, spec_alpha);
-        if let Ok(sb) = self.rt.CreateSolidColorBrush(&spec_col, None) {
-            for r in &layout.mini_spectrum_rects {
-                let sr = shift(*r);
-                let rad = sr.width() * 0.5;
-                let rr = D2D1_ROUNDED_RECT {
-                    rect: d2d_rect(sr),
-                    radiusX: rad,
-                    radiusY: rad,
-                };
-                self.rt.FillRoundedRectangle(&rr, &sb);
+                D2D1_GRADIENT_STOP {
+                    position: 0.38,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.18 * alpha,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.10 * alpha,
+                    },
+                },
+            ]
+        } else {
+            [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.42 * alpha,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.38,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.14 * alpha,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 0.06 * alpha,
+                    },
+                },
+            ]
+        };
+        if let Some(rim_brush) = self.create_linear_gradient(
+            D2D_POINT_2F {
+                x: cover_rect.left,
+                y: cover_rect.top,
+            },
+            D2D_POINT_2F {
+                x: cover_rect.left,
+                y: cover_rect.bottom,
+            },
+            &cover_rim_stops,
+        ) {
+            self.rt
+                .DrawRoundedRectangle(&cover_rr, &rim_brush, 1.1 * s, None);
+        } else {
+            let fallback_rim = D2D1_COLOR_F {
+                r: if light { 0.0 } else { 1.0 },
+                g: if light { 0.0 } else { 1.0 },
+                b: if light { 0.0 } else { 1.0 },
+                a: 0.18 * alpha,
+            };
+            if let Ok(rb) = self.rt.CreateSolidColorBrush(&fallback_rim, None) {
+                self.rt.DrawRoundedRectangle(&cover_rr, &rb, 1.0 * s, None);
             }
         }
 
-        // 4. Title & Artist (marquee-aware)
+        // 3. Centered Title & Artist (crisp typographic hierarchy, marquee when overflowing)
         let mut title_col = primary_text_color(light);
         title_col.a *= if self.source.is_some() {
             alpha
         } else {
             0.60 * alpha
         };
-        if let Some(tl) = title_layout {
+        if let Some((tl, tw)) = title_layout {
             let t_rect = if artist_layout.is_none() {
                 let mid = (layout.title_rect.top + layout.artist_rect.bottom) * 0.5;
                 let h = layout.title_rect.height();
@@ -523,13 +764,14 @@ impl MiniPlayerInner {
             } else {
                 shift(layout.title_rect)
             };
-            self.draw_marquee_text(tl, t_rect, title_col, &self.title_marquee, s);
+            self.draw_marquee_text(tl, tw, t_rect, title_col, &self.title_marquee, s);
         }
-        if let Some(al) = artist_layout {
+        if let Some((al, aw)) = artist_layout {
             let mut artist_col = muted_text_color(light);
-            artist_col.a *= alpha;
+            artist_col.a *= 0.90 * alpha;
             self.draw_marquee_text(
                 al,
+                aw,
                 shift(layout.artist_rect),
                 artist_col,
                 &self.artist_marquee,
@@ -537,9 +779,9 @@ impl MiniPlayerInner {
             );
         }
 
-        // 6. Interactive timeline slider + elapsed / total timestamps
+        // 4. Progress bar (when SMTC provides valid timeline) or feathered ambient hairline divider
+        let track = shift(layout.progress_track_rect);
         if layout.has_timeline {
-            let track = shift(layout.progress_track_rect);
             let active = self.dragging_seek_ratio.is_some()
                 || (can_seek
                     && (self.hover_zone == MiniPlayerHitZone::ProgressSlider
@@ -579,24 +821,162 @@ impl MiniPlayerInner {
                 &formats.time_r_fmt,
                 time_col,
             );
-        }
-
-        // 6. Bottom control bar: Menu | Prev | Play/Pause (accent circle) | Next | Mute
-        let more_rect = shift(layout.more_btn_rect);
-        let more_hovered = self.hover_zone == MiniPlayerHitZone::MoreMenuButton;
-        let more_pressed = self.pressed_zone == MiniPlayerHitZone::MoreMenuButton;
-        self.draw_icon_button_bg(more_rect, 7.0 * s, more_hovered, more_pressed, alpha);
-        let mut util_col = if more_hovered {
-            primary_text_color(light)
         } else {
-            muted_text_color(light)
-        };
-        util_col.a *= (if more_pressed { 0.72 } else { 1.0 }) * alpha;
-        if let Ok(ub) = self.rt.CreateSolidColorBrush(&util_col, None) {
-            self.draw_menu_icon(more_rect, s * if more_pressed { 0.92 } else { 1.0 }, &ub);
+            let div_y = (layout.progress_track_rect.top + layout.elapsed_rect.bottom) * 0.5 + dy;
+            let div_left = track.left + 10.0 * s;
+            let div_right = track.right - 10.0 * s;
+            let p0 = D2D_POINT_2F {
+                x: div_left,
+                y: div_y,
+            };
+            let p1 = D2D_POINT_2F {
+                x: div_right,
+                y: div_y,
+            };
+            let bloom_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: d2d_color_rgb(accent, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.5,
+                    color: d2d_color_rgb(accent, (if light { 0.11 } else { 0.16 }) * alpha),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: d2d_color_rgb(accent, 0.0),
+                },
+            ];
+            if let Some(bloom_brush) = self.create_linear_gradient(p0, p1, &bloom_stops) {
+                self.rt.DrawLine(p0, p1, &bloom_brush, 3.0 * s, None);
+            }
+            let (base_c, edge_a, mid_a) = if light {
+                (0.0_f32, 0.07 * alpha, 0.16 * alpha)
+            } else {
+                (1.0_f32, 0.12 * alpha, 0.24 * alpha)
+            };
+            let hair_stops = [
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: D2D1_COLOR_F {
+                        r: base_c,
+                        g: base_c,
+                        b: base_c,
+                        a: 0.0,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.22,
+                    color: D2D1_COLOR_F {
+                        r: base_c,
+                        g: base_c,
+                        b: base_c,
+                        a: edge_a,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.5,
+                    color: D2D1_COLOR_F {
+                        r: base_c,
+                        g: base_c,
+                        b: base_c,
+                        a: mid_a,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.78,
+                    color: D2D1_COLOR_F {
+                        r: base_c,
+                        g: base_c,
+                        b: base_c,
+                        a: edge_a,
+                    },
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: D2D1_COLOR_F {
+                        r: base_c,
+                        g: base_c,
+                        b: base_c,
+                        a: 0.0,
+                    },
+                },
+            ];
+            if let Some(hair_brush) = self.create_linear_gradient(p0, p1, &hair_stops) {
+                self.rt.DrawLine(p0, p1, &hair_brush, 1.1 * s, None);
+            }
         }
 
-        // Prev / Next buttons
+        // 5a. Bottom-left 6 sculpted spectrum bars (calm organic resting wave when paused, live FFT when playing)
+        let row_cy = (layout.play_btn_rect.top + layout.play_btn_rect.bottom) * 0.5 + dy;
+        let live_peak = self.bar_levels.iter().copied().fold(0.0_f32, f32::max);
+        let spec_alpha = if self.source.is_none() {
+            0.28
+        } else if live_peak < 0.02 {
+            0.56
+        } else {
+            0.94
+        } * alpha;
+        let top_col = D2D1_COLOR_F {
+            r: (f32::from(accent.r) / 255.0 * 1.14).min(1.0),
+            g: (f32::from(accent.g) / 255.0 * 1.14).min(1.0),
+            b: (f32::from(accent.b) / 255.0 * 1.14).min(1.0),
+            a: spec_alpha,
+        };
+        let bot_col = D2D1_COLOR_F {
+            r: (f32::from(accent.r) / 255.0 * 0.82).min(1.0),
+            g: (f32::from(accent.g) / 255.0 * 0.82).min(1.0),
+            b: (f32::from(accent.b) / 255.0 * 0.82).min(1.0),
+            a: spec_alpha * 0.76,
+        };
+        let spec_stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: top_col,
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: bot_col,
+            },
+        ];
+        if let Some(brush) = self.create_linear_gradient(
+            D2D_POINT_2F {
+                x: layout.card_rect.left,
+                y: row_cy - 11.0 * s,
+            },
+            D2D_POINT_2F {
+                x: layout.card_rect.left,
+                y: row_cy + 11.0 * s,
+            },
+            &spec_stops,
+        ) {
+            for r in &layout.mini_spectrum_rects {
+                let sr = shift(*r);
+                let rad = sr.width() * 0.5;
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: d2d_rect(sr),
+                    radiusX: rad,
+                    radiusY: rad,
+                };
+                self.rt.FillRoundedRectangle(&rr, &brush);
+            }
+        } else if let Ok(sb) = self
+            .rt
+            .CreateSolidColorBrush(&d2d_color_rgb(accent, spec_alpha), None)
+        {
+            for r in &layout.mini_spectrum_rects {
+                let sr = shift(*r);
+                let rad = sr.width() * 0.5;
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: d2d_rect(sr),
+                    radiusX: rad,
+                    radiusY: rad,
+                };
+                self.rt.FillRoundedRectangle(&rr, &sb);
+            }
+        }
+
+        // 5b. Bottom-center playback transport: Prev | Jewel Play/Pause | Next
         for (zone, base_rect) in [
             (MiniPlayerHitZone::PrevButton, layout.prev_btn_rect),
             (MiniPlayerHitZone::NextButton, layout.next_btn_rect),
@@ -604,7 +984,7 @@ impl MiniPlayerInner {
             let rect = shift(base_rect);
             let hovered = self.hover_zone == zone;
             let pressed = self.pressed_zone == zone;
-            self.draw_icon_button_bg(rect, 8.0 * s, hovered, pressed, alpha);
+            self.draw_icon_button_bg(rect, rect.width() * 0.5, hovered, pressed, alpha);
             let mut fg = primary_text_color(light);
             fg.a *= (if pressed { 0.72 } else { 0.94 }) * alpha;
             if let Ok(b) = self.rt.CreateSolidColorBrush(&fg, None) {
@@ -623,60 +1003,131 @@ impl MiniPlayerInner {
             }
         }
 
-        // Primary circular Play/Pause button tinted with theme-calibrated accent
+        // Jewel circular Play/Pause button: outer ambient glow + vertical gradient + top specular rim
         let play_rect = shift(layout.play_btn_rect);
         let play_hovered = self.hover_zone == MiniPlayerHitZone::PlayPauseButton;
         let play_pressed = self.pressed_zone == MiniPlayerHitZone::PlayPauseButton;
         let play_cx = (play_rect.left + play_rect.right) * 0.5;
         let play_cy = (play_rect.top + play_rect.bottom) * 0.5;
         let play_r = (play_rect.width() * 0.5) * if play_pressed { 0.94 } else { 1.0 };
-        let accent_c = d2d_color_rgb(accent, (if play_hovered { 0.98 } else { 0.90 }) * alpha);
-        let fill_col = if play_hovered {
-            D2D1_COLOR_F {
-                r: (accent_c.r * 1.08 + 0.04).min(1.0),
-                g: (accent_c.g * 1.08 + 0.04).min(1.0),
-                b: (accent_c.b * 1.08 + 0.04).min(1.0),
-                a: accent_c.a,
-            }
-        } else {
-            accent_c
-        };
-        if let Ok(pb) = self.rt.CreateSolidColorBrush(&fill_col, None) {
+
+        let outer_halo = d2d_color_rgb(accent, (if play_hovered { 0.28 } else { 0.20 }) * alpha);
+        if let Ok(oh) = self.rt.CreateSolidColorBrush(&outer_halo, None) {
             self.rt.FillEllipse(
                 &D2D1_ELLIPSE {
                     point: D2D_POINT_2F {
                         x: play_cx,
                         y: play_cy,
                     },
-                    radiusX: play_r,
-                    radiusY: play_r,
+                    radiusX: play_r + 4.5 * s,
+                    radiusY: play_r + 4.5 * s,
                 },
-                &pb,
+                &oh,
             );
         }
-        // Subtle specular top rim on the circular accent button
-        let btn_rim = D2D1_COLOR_F {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: (if light { 0.34 } else { 0.28 }) * alpha,
+
+        let base_a = (if play_hovered { 0.98 } else { 0.92 }) * alpha;
+        let hover_lift = if play_hovered { 0.05 } else { 0.0 };
+        let play_top = D2D1_COLOR_F {
+            r: (f32::from(accent.r) / 255.0 * 1.14 + 0.04 + hover_lift).min(1.0),
+            g: (f32::from(accent.g) / 255.0 * 1.14 + 0.04 + hover_lift).min(1.0),
+            b: (f32::from(accent.b) / 255.0 * 1.14 + 0.04 + hover_lift).min(1.0),
+            a: base_a,
         };
-        if let Ok(rb) = self.rt.CreateSolidColorBrush(&btn_rim, None) {
-            self.rt.DrawEllipse(
-                &D2D1_ELLIPSE {
-                    point: D2D_POINT_2F {
-                        x: play_cx,
-                        y: play_cy,
-                    },
-                    radiusX: play_r - 0.5 * s,
-                    radiusY: play_r - 0.5 * s,
-                },
-                &rb,
-                1.0 * s,
-                None,
-            );
+        let play_bot = D2D1_COLOR_F {
+            r: (f32::from(accent.r) / 255.0 * 0.86 + hover_lift).min(1.0),
+            g: (f32::from(accent.g) / 255.0 * 0.86 + hover_lift).min(1.0),
+            b: (f32::from(accent.b) / 255.0 * 0.86 + hover_lift).min(1.0),
+            a: base_a,
+        };
+        let play_stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: play_top,
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: play_bot,
+            },
+        ];
+        let play_ell = D2D1_ELLIPSE {
+            point: D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy,
+            },
+            radiusX: play_r,
+            radiusY: play_r,
+        };
+        if let Some(play_brush) = self.create_linear_gradient(
+            D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy - play_r,
+            },
+            D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy + play_r,
+            },
+            &play_stops,
+        ) {
+            self.rt.FillEllipse(&play_ell, &play_brush);
+        } else if let Ok(pb) = self
+            .rt
+            .CreateSolidColorBrush(&d2d_color_rgb(accent, base_a), None)
+        {
+            self.rt.FillEllipse(&play_ell, &pb);
         }
-        // Choose crisp dark or white glyph depending on accent luminance for high contrast
+
+        let play_rim_stops = [
+            D2D1_GRADIENT_STOP {
+                position: 0.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.54 * alpha,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 0.45,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.16 * alpha,
+                },
+            },
+            D2D1_GRADIENT_STOP {
+                position: 1.0,
+                color: D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.04 * alpha,
+                },
+            },
+        ];
+        let play_rim_ell = D2D1_ELLIPSE {
+            point: D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy,
+            },
+            radiusX: play_r - 0.55 * s,
+            radiusY: play_r - 0.55 * s,
+        };
+        if let Some(rim_brush) = self.create_linear_gradient(
+            D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy - play_r,
+            },
+            D2D_POINT_2F {
+                x: play_cx,
+                y: play_cy + play_r,
+            },
+            &play_rim_stops,
+        ) {
+            self.rt.DrawEllipse(&play_rim_ell, &rim_brush, 1.1 * s, None);
+        }
+
         let accent_luma = rgb_luma(accent);
         let glyph_col = if accent_luma > 0.62 {
             D2D1_COLOR_F {
@@ -702,11 +1153,11 @@ impl MiniPlayerInner {
             }
         }
 
-        // Mute button + ephemeral volume % feedback when scrolling wheel over the popup
+        // 5c. Bottom-right system volume: clickable mute speaker button + interactive slider
         let mute_rect = shift(layout.mute_btn_rect);
         let mute_hovered = self.hover_zone == MiniPlayerHitZone::MuteButton;
         let mute_pressed = self.pressed_zone == MiniPlayerHitZone::MuteButton;
-        self.draw_icon_button_bg(mute_rect, 7.0 * s, mute_hovered, mute_pressed, alpha);
+        self.draw_icon_button_bg(mute_rect, mute_rect.width() * 0.5, mute_hovered, mute_pressed, alpha);
         let mut spk_fg = if mute_hovered {
             primary_text_color(light)
         } else {
@@ -739,7 +1190,7 @@ impl MiniPlayerInner {
         ) {
             let cx = (mute_rect.left + mute_rect.right) * 0.5;
             let cy = (mute_rect.top + mute_rect.bottom) * 0.5;
-            let u = (mute_rect.width() / 24.0) * if mute_pressed { 0.90 } else { 1.0 };
+            let u = (mute_rect.width() / 22.0) * if mute_pressed { 0.90 } else { 1.0 };
             draw_speaker_glyph(
                 &self.d2d_factory,
                 &self.rt,
@@ -755,19 +1206,33 @@ impl MiniPlayerInner {
             );
         }
 
-        if self.vol_badge_until.is_some_and(|t| Instant::now() < t) {
+        let vol_track = shift(layout.vol_track_rect);
+        let vol_active = self.dragging_volume
+            || self.hover_zone == MiniPlayerHitZone::VolumeSlider
+            || self.pressed_zone == MiniPlayerHitZone::VolumeSlider;
+        draw_glass_slider(
+            &self.rt,
+            vol_track,
+            self.master_vol,
+            self.master_muted,
+            vol_active,
+            light,
+            accent,
+            s * 0.80,
+        );
+
+        if self.dragging_volume || self.vol_badge_until.is_some_and(|t| Instant::now() < t) {
             let pct_str = format_volume_pct(self.master_vol);
-            let badge_w = 34.0 * s;
-            let badge_h = 16.0 * s;
-            let badge_cy = (mute_rect.top + mute_rect.bottom) * 0.5;
+            let badge_w = 36.0 * s;
+            let badge_h = 14.0 * s;
             let pct_rect = RectF::new(
-                mute_rect.left - badge_w - 2.0 * s,
-                badge_cy - badge_h * 0.5,
-                mute_rect.left - 2.0 * s,
-                badge_cy + badge_h * 0.5,
+                vol_track.right - badge_w,
+                vol_track.top - badge_h - 7.0 * s,
+                vol_track.right + 4.0 * s,
+                vol_track.top - 7.0 * s,
             );
             let mut pct_col = primary_text_color(light);
-            pct_col.a *= 0.88 * alpha;
+            pct_col.a *= 0.90 * alpha;
             draw_text_in_rect(
                 &self.dwrite_factory,
                 &self.rt,
@@ -843,6 +1308,7 @@ impl MiniPlayerInner {
     unsafe fn draw_marquee_text(
         &self,
         text_layout: &IDWriteTextLayout,
+        text_width: f32,
         rect: RectF,
         color: D2D1_COLOR_F,
         marquee: &MarqueeState,
@@ -853,11 +1319,12 @@ impl MiniPlayerInner {
         };
 
         if !marquee.is_overflowing() {
+            let draw_x = rect.left + ((rect.width() - text_width) * 0.5).max(0.0);
             self.rt
                 .PushAxisAlignedClip(&d2d_rect(rect), D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             self.rt.DrawTextLayout(
                 D2D_POINT_2F {
-                    x: rect.left,
+                    x: draw_x,
                     y: rect.top,
                 },
                 text_layout,

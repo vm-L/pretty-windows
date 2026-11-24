@@ -1,4 +1,4 @@
-use super::{MiniPlayerInner, MINI_ACTION_ACTIVATE, MINI_ACTION_NEXT, MINI_ACTION_OPEN_MENU, MINI_ACTION_PLAY_PAUSE, MINI_ACTION_PREV, MINI_ACTION_TOGGLE_MUTE, TIMER_MINI_TICK_ID, WM_APP_MINI_PLAYER_CLOSED, WM_APP_MINI_PLAYER_WHEEL, WM_MOUSELEAVE_MSG};
+use super::{MiniPlayerInner, MINI_ACTION_ACTIVATE, MINI_ACTION_NEXT, MINI_ACTION_OPEN_MENU, MINI_ACTION_PLAY_PAUSE, MINI_ACTION_PREV, MINI_ACTION_TOGGLE_MUTE, TIMER_MINI_TICK_ID, VOL_BADGE_TTL, WM_APP_MINI_PLAYER_CLOSED, WM_APP_MINI_PLAYER_WHEEL, WM_MOUSELEAVE_MSG};
 use super::super::layout::MiniPlayerHitZone;
 use super::super::volume::slider_ratio_from_x;
 use crate::ui::PopupAnimPhase;
@@ -20,7 +20,9 @@ pub(super) unsafe fn begin_close_mini_player(hwnd: HWND, rc: &Rc<RefCell<MiniPla
             return;
         }
         let had = state.dragging_seek_ratio.take().is_some()
+            || state.dragging_volume
             || state.pressed_zone != MiniPlayerHitZone::None;
+        state.dragging_volume = false;
         state.pressed_zone = MiniPlayerHitZone::None;
         had
     } else {
@@ -148,9 +150,11 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
         WM_CAPTURECHANGED => {
             if let Ok(mut state) = rc.try_borrow_mut() {
                 if state.dragging_seek_ratio.is_some()
+                    || state.dragging_volume
                     || state.pressed_zone != MiniPlayerHitZone::None
                 {
                     state.dragging_seek_ratio = None;
+                    state.dragging_volume = false;
                     state.pressed_zone = MiniPlayerHitZone::None;
                     let _ = state.render();
                 }
@@ -188,6 +192,25 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
                     return LRESULT(0);
                 }
 
+                if state.dragging_volume {
+                    let r = slider_ratio_from_x(
+                        layout.vol_track_rect.left,
+                        layout.vol_track_rect.right,
+                        x,
+                    );
+                    if (state.master_vol - r).abs() > 0.001 || (state.master_muted && r > 0.0) {
+                        state.master_vol = r;
+                        if r > 0.0 {
+                            state.master_muted = false;
+                        }
+                        state.vol_badge_until = Some(Instant::now() + VOL_BADGE_TTL);
+                        state.sync_timer_rate();
+                        state.post_volume(r);
+                        let _ = state.render();
+                    }
+                    return LRESULT(0);
+                }
+
                 let next_zone = layout.hit_test(x, y, state.can_seek());
                 if state.hover_zone != next_zone {
                     state.hover_zone = next_zone;
@@ -200,6 +223,7 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
             if let Ok(mut state) = rc.try_borrow_mut() {
                 state.tracking_leave = false;
                 if state.dragging_seek_ratio.is_none()
+                    && !state.dragging_volume
                     && state.hover_zone != MiniPlayerHitZone::None
                 {
                     state.hover_zone = MiniPlayerHitZone::None;
@@ -226,6 +250,21 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
                     );
                     state.dragging_seek_ratio = Some(r);
                     true
+                } else if zone == MiniPlayerHitZone::VolumeSlider {
+                    let r = slider_ratio_from_x(
+                        layout.vol_track_rect.left,
+                        layout.vol_track_rect.right,
+                        x,
+                    );
+                    state.dragging_volume = true;
+                    state.master_vol = r;
+                    if r > 0.0 {
+                        state.master_muted = false;
+                    }
+                    state.vol_badge_until = Some(Instant::now() + VOL_BADGE_TTL);
+                    state.sync_timer_rate();
+                    state.post_volume(r);
+                    true
                 } else {
                     zone != MiniPlayerHitZone::None
                 }
@@ -243,7 +282,7 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
         WM_LBUTTONUP => {
             let x = ((lparam.0 & 0xFFFF) as i16) as f32;
             let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
-            let (need_release, seek_ratio, action, need_close) =
+            let (need_release, seek_ratio, vol_ratio, action, need_close) =
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     if state.anim_phase == PopupAnimPhase::Closing {
                         return LRESULT(0);
@@ -258,7 +297,23 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
                         state.dragging_seek_ratio = None;
                         state.pressed_zone = MiniPlayerHitZone::None;
                         state.hover_zone = layout.hit_test(x, y, state.can_seek());
-                        (true, Some(final_r), None, false)
+                        (true, Some(final_r), None, None, false)
+                    } else if state.dragging_volume {
+                        let final_r = slider_ratio_from_x(
+                            layout.vol_track_rect.left,
+                            layout.vol_track_rect.right,
+                            x,
+                        );
+                        state.dragging_volume = false;
+                        state.pressed_zone = MiniPlayerHitZone::None;
+                        state.hover_zone = layout.hit_test(x, y, state.can_seek());
+                        state.master_vol = final_r;
+                        if final_r > 0.0 {
+                            state.master_muted = false;
+                        }
+                        state.vol_badge_until = Some(Instant::now() + VOL_BADGE_TTL);
+                        state.sync_timer_rate();
+                        (true, None, Some(final_r), None, false)
                     } else {
                         let pressed = state.pressed_zone;
                         let had_capture = pressed != MiniPlayerHitZone::None;
@@ -281,14 +336,14 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
                                 MiniPlayerHitZone::MoreMenuButton => {
                                     (Some(MINI_ACTION_OPEN_MENU), false)
                                 }
-                                MiniPlayerHitZone::ProgressSlider | MiniPlayerHitZone::None => {
-                                    (None, false)
-                                }
+                                MiniPlayerHitZone::ProgressSlider
+                                | MiniPlayerHitZone::VolumeSlider
+                                | MiniPlayerHitZone::None => (None, false),
                             }
                         } else {
                             (None, false)
                         };
-                        (had_capture, None, action, close)
+                        (had_capture, None, None, action, close)
                     }
                 } else {
                     return LRESULT(0);
@@ -300,6 +355,9 @@ pub(super) unsafe extern "system" fn mini_player_wnd_proc(
             if let Ok(mut state) = rc.try_borrow_mut() {
                 if let Some(final_r) = seek_ratio {
                     state.commit_seek_ratio(final_r);
+                }
+                if let Some(final_vol) = vol_ratio {
+                    state.post_volume(final_vol);
                 }
                 if let Some(act) = action {
                     state.post_action(act);

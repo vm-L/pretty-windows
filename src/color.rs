@@ -411,6 +411,27 @@ pub fn gaussian_blur_bgra(bgra: &[u8], width: usize, height: usize, radius: usiz
     src
 }
 
+/// Builds a heavily blurred, vibrancy-boosted, opaque BGRA8 cover atmosphere buffer
+/// suitable for soft low-opacity glass background washes (preserving neutral grayscale covers).
+pub fn build_ambient_cover_bgra(bgra: &[u8], width: usize, height: usize) -> Vec<u8> {
+    let mut out = gaussian_blur_bgra(bgra, width, height, 11);
+    for px in out.chunks_exact_mut(4) {
+        let (h, s, l) = rgb_to_hsl(Rgb::new(px[2], px[1], px[0]));
+        let s_out = if s < 0.08 {
+            s
+        } else {
+            (s * 1.28).clamp(0.0, 0.90)
+        };
+        let l_out = l.clamp(0.18, 0.78);
+        let rgb = hsl_to_rgb(h, s_out, l_out);
+        px[0] = rgb.b;
+        px[1] = rgb.g;
+        px[2] = rgb.r;
+        px[3] = 255;
+    }
+    out
+}
+
 fn box_blur_h(src: &[u8], dst: &mut [u8], width: usize, height: usize, radius: usize) {
     let win = (radius * 2 + 1) as f32;
     let inv_win = 1.0 / win;
@@ -967,5 +988,38 @@ mod tests {
         assert_eq!(accent, adjust_accent_for_theme(fb, false));
         assert_eq!(extract_backdrop_base_rgb(&tiny, usize::MAX / 2, 4), None);
         assert_eq!(gaussian_blur_bgra(&tiny, usize::MAX / 2, 4, 2), tiny);
+    }
+
+    #[test]
+    fn ambient_cover_wash_preserves_neutral_gray_and_boosts_opaque_color() {
+        let w = 8usize;
+        let h = 8usize;
+        let mut gray_bgra = vec![0u8; w * h * 4];
+        for px in gray_bgra.chunks_exact_mut(4) {
+            px[0] = 120;
+            px[1] = 120;
+            px[2] = 120;
+            px[3] = 255;
+        }
+        let gray_out = build_ambient_cover_bgra(&gray_bgra, w, h);
+        assert_eq!(gray_out.len(), gray_bgra.len());
+        for px in gray_out.chunks_exact(4) {
+            assert_eq!(px[3], 255);
+            assert!(px[0].abs_diff(px[1]) <= 1 && px[1].abs_diff(px[2]) <= 1);
+        }
+
+        let mut warm_bgra = vec![0u8; w * h * 4];
+        for (idx, px) in warm_bgra.chunks_exact_mut(4).enumerate() {
+            px[0] = if idx % 2 == 0 { 45 } else { 70 };
+            px[1] = 65;
+            px[2] = 195;
+            px[3] = 255;
+        }
+        let warm_out = build_ambient_cover_bgra(&warm_bgra, w, h);
+        assert_eq!(warm_out.len(), warm_bgra.len());
+        for px in warm_out.chunks_exact(4) {
+            assert_eq!(px[3], 255);
+            assert!(px[2] > px[0]);
+        }
     }
 }

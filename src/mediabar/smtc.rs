@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{IsWindow, PostMessageW};
 pub const WM_APP_SMTC_UPDATED: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 
 const THUMB_SIZE: u32 = 64;
-const ART_SIZE: u32 = 192;
+const ART_SIZE: u32 = 384;
 const MAX_COVER_SOURCE_DIM: u32 = 8192;
 const MAX_COVER_SOURCE_PIXELS: u64 = 32_000_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

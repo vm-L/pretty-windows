@@ -261,7 +261,10 @@ pub fn hit_test_mode(
 /// Logical width of the floating Liquid Glass mini-player card in DIPs.
 #[allow(dead_code)]
 pub const MINI_PLAYER_WIDTH_DIP: f32 = 316.0;
-/// Number of compact visualizer bars rendered in the mini-player header.
+/// Logical height of the floating Liquid Glass mini-player card in DIPs.
+#[allow(dead_code)]
+pub const MINI_PLAYER_HEIGHT_DIP: f32 = 432.0;
+/// Number of bottom-left live equalizer bars rendered in the mini-player popup.
 #[allow(dead_code)]
 pub const MINI_SPECTRUM_BARS: usize = 6;
 
@@ -277,6 +280,7 @@ pub enum MiniPlayerHitZone {
     PlayPauseButton,
     NextButton,
     MuteButton,
+    VolumeSlider,
 }
 
 /// Physical-pixel layout for the floating Liquid Glass mini-player card.
@@ -305,6 +309,8 @@ pub struct MiniPlayerLayout {
     pub play_btn_rect: RectF,
     pub next_btn_rect: RectF,
     pub mute_btn_rect: RectF,
+    pub vol_track_rect: RectF,
+    pub vol_slider_hit_rect: RectF,
 }
 
 impl MiniPlayerLayout {
@@ -314,7 +320,7 @@ impl MiniPlayerLayout {
         let s = (dpi.max(96) as f32) / 96.0;
         let pad_shadow = crate::ui::SHADOW_PAD_DIP * s;
         let card_w = (MINI_PLAYER_WIDTH_DIP * s).round();
-        let card_h = ((if has_timeline { 174.0 } else { 136.0 }) * s).round();
+        let card_h = (MINI_PLAYER_HEIGHT_DIP * s).round();
 
         let win_w = (card_w + pad_shadow * 2.0).round() as i32;
         let win_h = (card_h + pad_shadow * 2.0).round() as i32;
@@ -327,113 +333,82 @@ impl MiniPlayerLayout {
         );
         let card_radius = crate::ui::PANEL_RADIUS_DIP * s;
 
-        let inner_x = 14.0 * s;
-        let inner_top = 14.0 * s;
-        let cover_size = 72.0 * s;
-        let cover_rect = RectF::new(
-            card_rect.left + inner_x,
-            card_rect.top + inner_top,
-            card_rect.left + inner_x + cover_size,
-            card_rect.top + inner_top + cover_size,
-        );
-        let cover_radius = 10.0 * s;
-
+        let inner_x = 16.0 * s;
+        let left_edge = card_rect.left + inner_x;
         let right_edge = card_rect.right - inner_x;
-        let text_left = cover_rect.right + 12.0 * s;
+        let card_cx = (card_rect.left + card_rect.right) * 0.5;
 
-        // Top meta row: source badge + right-aligned compact live spectrum
-        let spec_bar_w = 2.6 * s;
-        let spec_gap = 2.2 * s;
-        let spec_total_w =
-            spec_bar_w * (MINI_SPECTRUM_BARS as f32) + spec_gap * ((MINI_SPECTRUM_BARS - 1) as f32);
-        let spec_right = right_edge;
-        let spec_left = spec_right - spec_total_w;
-        let spec_mid_y = cover_rect.top + 10.0 * s;
-        let spec_min_h = 3.0 * s;
-        let spec_max_h = 13.0 * s;
-        let mut mini_spectrum_rects = [RectF::new(0.0, 0.0, 0.0, 0.0); MINI_SPECTRUM_BARS];
-        for (i, rect) in mini_spectrum_rects.iter_mut().enumerate() {
-            // Sample evenly across the 10-band FFT spectrum
-            let src_idx = (i * (NUM_BARS - 1)) / (MINI_SPECTRUM_BARS - 1);
-            let level = bar_levels[src_idx].clamp(0.0, 1.0);
-            let bh = spec_min_h + level * (spec_max_h - spec_min_h);
-            let x = spec_left + (i as f32) * (spec_bar_w + spec_gap);
-            *rect = RectF::new(x, spec_mid_y - bh * 0.5, x + spec_bar_w, spec_mid_y + bh * 0.5);
-        }
-
+        // 1. Header row: top-center source micro-pill + top-right circular glass menu button
+        let more_size = 28.0 * s;
+        let more_btn_rect = RectF::new(
+            right_edge - more_size,
+            card_rect.top + 11.0 * s,
+            right_edge,
+            card_rect.top + 11.0 * s + more_size,
+        );
+        let badge_inset = more_size + 6.0 * s;
         let source_badge_rect = RectF::new(
-            text_left,
-            cover_rect.top + 1.0 * s,
-            (spec_left - 8.0 * s).max(text_left + 32.0 * s),
-            cover_rect.top + 19.0 * s,
+            left_edge + badge_inset,
+            card_rect.top + 14.0 * s,
+            right_edge - badge_inset,
+            card_rect.top + 36.0 * s,
         );
 
-        let title_rect = RectF::new(
-            text_left,
-            cover_rect.top + 25.0 * s,
-            right_edge,
-            cover_rect.top + 47.0 * s,
+        // 2. Large centered 1:1 hero album artwork
+        let cover_size = 228.0 * s;
+        let cover_top = card_rect.top + 48.0 * s;
+        let cover_rect = RectF::new(
+            card_cx - cover_size * 0.5,
+            cover_top,
+            card_cx + cover_size * 0.5,
+            cover_top + cover_size,
         );
-        let artist_rect = RectF::new(
-            text_left,
-            cover_rect.top + 49.0 * s,
-            right_edge,
-            cover_rect.top + 68.0 * s,
-        );
+        let cover_radius = 14.0 * s;
 
+        // 3. Centered title & artist rows
+        let title_top = cover_rect.bottom + 14.0 * s;
+        let title_rect = RectF::new(left_edge, title_top, right_edge, title_top + 24.0 * s);
+        let artist_top = title_rect.bottom + 1.0 * s;
+        let artist_rect = RectF::new(left_edge, artist_top, right_edge, artist_top + 19.0 * s);
         let info_hit_rect = RectF::new(
-            cover_rect.left,
+            left_edge,
             cover_rect.top,
             right_edge,
-            cover_rect.bottom,
+            artist_rect.bottom,
         );
 
-        // Middle timeline row (when a finite duration is available)
-        let (progress_track_rect, progress_hit_rect, elapsed_rect, duration_rect, controls_top) =
-            if has_timeline {
-                let track_top = cover_rect.bottom + 14.0 * s;
-                let track_h = 4.5 * s;
-                let track_rect = RectF::new(
-                    card_rect.left + inner_x,
-                    track_top,
-                    right_edge,
-                    track_top + track_h,
-                );
-                let hit_rect = RectF::new(
-                    track_rect.left - 4.0 * s,
-                    track_rect.top - 8.0 * s,
-                    track_rect.right + 4.0 * s,
-                    track_rect.bottom + 8.0 * s,
-                );
-                let time_top = track_rect.bottom + 4.0 * s;
-                let time_h = 14.0 * s;
-                let time_w = 58.0 * s;
-                let el_rect = RectF::new(
-                    track_rect.left,
-                    time_top,
-                    track_rect.left + time_w,
-                    time_top + time_h,
-                );
-                let dur_rect = RectF::new(
-                    track_rect.right - time_w,
-                    time_top,
-                    track_rect.right,
-                    time_top + time_h,
-                );
-                (track_rect, hit_rect, el_rect, dur_rect, el_rect.bottom + 6.0 * s)
-            } else {
-                let empty = RectF::new(0.0, 0.0, 0.0, 0.0);
-                (empty, empty, empty, empty, cover_rect.bottom + 10.0 * s)
-            };
+        // 4. Progress bar / feathered ambient divider row (fixed coordinates for stable card height)
+        let track_top = artist_rect.bottom + 12.0 * s;
+        let track_h = 4.5 * s;
+        let progress_track_rect = RectF::new(left_edge, track_top, right_edge, track_top + track_h);
+        let progress_hit_rect = RectF::new(
+            progress_track_rect.left - 4.0 * s,
+            progress_track_rect.top - 8.0 * s,
+            progress_track_rect.right + 4.0 * s,
+            progress_track_rect.bottom + 8.0 * s,
+        );
+        let time_top = progress_track_rect.bottom + 4.0 * s;
+        let time_h = 14.0 * s;
+        let time_w = 58.0 * s;
+        let elapsed_rect = RectF::new(
+            progress_track_rect.left,
+            time_top,
+            progress_track_rect.left + time_w,
+            time_top + time_h,
+        );
+        let duration_rect = RectF::new(
+            progress_track_rect.right - time_w,
+            time_top,
+            progress_track_rect.right,
+            time_top + time_h,
+        );
 
-        // Bottom transport & utility controls row
-        let play_size = 36.0 * s;
-        let skip_size = 30.0 * s;
-        let side_size = 28.0 * s;
-        let row_cy = (controls_top + play_size * 0.5).min(card_rect.bottom - 12.0 * s - play_size * 0.5);
-        let card_cx = (card_rect.left + card_rect.right) * 0.5;
-        let skip_gap = 12.0 * s;
+        // 5. Bottom control row: left 6 sculpted spectrum bars | center playback | right mute + system volume slider
+        let row_cy = card_rect.top + 398.0 * s;
 
+        let play_size = 40.0 * s;
+        let skip_size = 26.0 * s;
+        let skip_gap = 6.0 * s;
         let play_btn_rect = RectF::new(
             card_cx - play_size * 0.5,
             row_cy - play_size * 0.5,
@@ -453,17 +428,53 @@ impl MiniPlayerLayout {
             row_cy + skip_size * 0.5,
         );
 
-        let more_btn_rect = RectF::new(
-            card_rect.left + inner_x,
-            row_cy - side_size * 0.5,
-            card_rect.left + inner_x + side_size,
-            row_cy + side_size * 0.5,
+        // Bottom-left 6 sculpted equalizer bars: smooth resting wave when paused, crossfading to live FFT
+        const BAND_PAIRS: [(usize, usize); MINI_SPECTRUM_BARS] =
+            [(0, 1), (1, 2), (3, 4), (5, 6), (7, 8), (8, 9)];
+        const REST_WAVE: [f32; MINI_SPECTRUM_BARS] = [0.16, 0.38, 0.62, 0.46, 0.28, 0.14];
+        let spec_bar_w = 5.0 * s;
+        let spec_gap = 5.4 * s;
+        let spec_left = left_edge + 2.0 * s;
+        let spec_min_h = 4.5 * s;
+        let spec_max_h = 22.0 * s;
+        let live_peak = bar_levels.iter().copied().fold(0.0_f32, f32::max);
+        let live_mix = (live_peak / 0.08).clamp(0.0, 1.0);
+        let mut mini_spectrum_rects = [RectF::new(0.0, 0.0, 0.0, 0.0); MINI_SPECTRUM_BARS];
+        for (i, rect) in mini_spectrum_rects.iter_mut().enumerate() {
+            let (a, b) = BAND_PAIRS[i];
+            let band_live = (0.5 * (bar_levels[a] + bar_levels[b])).clamp(0.0, 1.0);
+            let level = REST_WAVE[i] * (1.0 - live_mix) + band_live * live_mix;
+            let bh = spec_min_h + level * (spec_max_h - spec_min_h);
+            let x = spec_left + (i as f32) * (spec_bar_w + spec_gap);
+            *rect = RectF::new(x, row_cy - bh * 0.5, x + spec_bar_w, row_cy + bh * 0.5);
+        }
+
+        // Bottom-right system volume: mute icon button + compact draggable slider
+        let mute_size = 22.0 * s;
+        let vol_track_w = 51.0 * s;
+        let vol_track_h = 4.0 * s;
+        let vol_knob_inset = 4.0 * s;
+        let mute_gap = 5.0 * s;
+        let vol_track_right = right_edge - vol_knob_inset;
+        let vol_track_left = vol_track_right - vol_track_w;
+        let vol_track_rect = RectF::new(
+            vol_track_left,
+            row_cy - vol_track_h * 0.5,
+            vol_track_right,
+            row_cy + vol_track_h * 0.5,
         );
+        let vol_slider_hit_rect = RectF::new(
+            vol_track_left - 3.0 * s,
+            row_cy - 14.0 * s,
+            vol_track_right + 6.0 * s,
+            row_cy + 14.0 * s,
+        );
+        let mute_right = vol_track_left - mute_gap;
         let mute_btn_rect = RectF::new(
-            right_edge - side_size,
-            row_cy - side_size * 0.5,
-            right_edge,
-            row_cy + side_size * 0.5,
+            mute_right - mute_size,
+            row_cy - mute_size * 0.5,
+            mute_right,
+            row_cy + mute_size * 0.5,
         );
 
         Self {
@@ -489,6 +500,8 @@ impl MiniPlayerLayout {
             play_btn_rect,
             next_btn_rect,
             mute_btn_rect,
+            vol_track_rect,
+            vol_slider_hit_rect,
         }
     }
 
@@ -500,6 +513,9 @@ impl MiniPlayerLayout {
         }
         if self.has_timeline && can_seek && self.progress_hit_rect.contains(x, y) {
             return MiniPlayerHitZone::ProgressSlider;
+        }
+        if self.vol_slider_hit_rect.contains(x, y) {
+            return MiniPlayerHitZone::VolumeSlider;
         }
         if self.play_btn_rect.contains(x, y) {
             return MiniPlayerHitZone::PlayPauseButton;
@@ -665,19 +681,38 @@ mod tests {
         let with_tl = MiniPlayerLayout::compute(96, true, &levels);
         let no_tl = MiniPlayerLayout::compute(96, false, &levels);
 
-        assert!(with_tl.win_h > no_tl.win_h);
-        assert!(with_tl.cover_rect.right < with_tl.title_rect.left);
-        assert!(with_tl.source_badge_rect.right < with_tl.mini_spectrum_rects[0].left);
+        // Fixed card dimensions prevent jumpiness when timeline availability changes
+        assert_eq!(with_tl.win_w, no_tl.win_w);
+        assert_eq!(with_tl.win_h, no_tl.win_h);
+
+        // Header row: centered source badge + non-overlapping top-right menu button
+        assert!(with_tl.source_badge_rect.right < with_tl.more_btn_rect.left);
+        assert!(with_tl.more_btn_rect.bottom < with_tl.cover_rect.top);
+
+        // Large 1:1 square centered cover art
+        assert!((with_tl.cover_rect.width() - with_tl.cover_rect.height()).abs() < 1e-3);
+        let card_cx = (with_tl.card_rect.left + with_tl.card_rect.right) * 0.5;
+        let cover_cx = (with_tl.cover_rect.left + with_tl.cover_rect.right) * 0.5;
+        assert!((cover_cx - card_cx).abs() < 1e-3);
+
+        // Vertical ordering: cover -> title -> artist -> progress bar -> timestamps -> bottom controls
+        assert!(with_tl.cover_rect.bottom < with_tl.title_rect.top);
+        assert!(with_tl.title_rect.bottom < with_tl.artist_rect.top);
+        assert!(with_tl.artist_rect.bottom < with_tl.progress_hit_rect.top);
+        assert!(with_tl.progress_track_rect.bottom < with_tl.elapsed_rect.top);
+        assert!(with_tl.elapsed_rect.bottom < with_tl.play_btn_rect.top);
+
+        // Bottom row horizontal separation: left 10 bars | center prev/play/next | right mute + volume slider
+        assert!(with_tl.mini_spectrum_rects[0].left >= with_tl.card_rect.left);
         assert!(
             with_tl.mini_spectrum_rects[MINI_SPECTRUM_BARS - 1].right
-                <= with_tl.title_rect.right + 1e-3
+                < with_tl.prev_btn_rect.left
         );
-        assert!(with_tl.cover_rect.bottom < with_tl.progress_track_rect.top);
-        assert!(with_tl.elapsed_rect.bottom < with_tl.play_btn_rect.top);
-        assert!(with_tl.more_btn_rect.right < with_tl.prev_btn_rect.left);
         assert!(with_tl.prev_btn_rect.right < with_tl.play_btn_rect.left);
         assert!(with_tl.play_btn_rect.right < with_tl.next_btn_rect.left);
         assert!(with_tl.next_btn_rect.right < with_tl.mute_btn_rect.left);
+        assert!(with_tl.mute_btn_rect.right < with_tl.vol_slider_hit_rect.left);
+        assert!(with_tl.vol_track_rect.right < with_tl.card_rect.right);
         assert!(with_tl.play_btn_rect.bottom < with_tl.card_rect.bottom);
 
         let more_cx = (with_tl.more_btn_rect.left + with_tl.more_btn_rect.right) * 0.5;
@@ -697,6 +732,17 @@ mod tests {
             with_tl.hit_test(prog_cx, prog_cy, false),
             MiniPlayerHitZone::None
         );
+        assert_eq!(
+            no_tl.hit_test(prog_cx, prog_cy, true),
+            MiniPlayerHitZone::None
+        );
+
+        let prev_cx = (with_tl.prev_btn_rect.left + with_tl.prev_btn_rect.right) * 0.5;
+        let prev_cy = (with_tl.prev_btn_rect.top + with_tl.prev_btn_rect.bottom) * 0.5;
+        assert_eq!(
+            with_tl.hit_test(prev_cx, prev_cy, true),
+            MiniPlayerHitZone::PrevButton
+        );
 
         let play_cx = (with_tl.play_btn_rect.left + with_tl.play_btn_rect.right) * 0.5;
         let play_cy = (with_tl.play_btn_rect.top + with_tl.play_btn_rect.bottom) * 0.5;
@@ -705,12 +751,47 @@ mod tests {
             MiniPlayerHitZone::PlayPauseButton
         );
 
-        let cov_cx = (with_tl.cover_rect.left + with_tl.cover_rect.right) * 0.5;
+        let next_cx = (with_tl.next_btn_rect.left + with_tl.next_btn_rect.right) * 0.5;
+        let next_cy = (with_tl.next_btn_rect.top + with_tl.next_btn_rect.bottom) * 0.5;
+        assert_eq!(
+            with_tl.hit_test(next_cx, next_cy, true),
+            MiniPlayerHitZone::NextButton
+        );
+
+        let mute_cx = (with_tl.mute_btn_rect.left + with_tl.mute_btn_rect.right) * 0.5;
+        let mute_cy = (with_tl.mute_btn_rect.top + with_tl.mute_btn_rect.bottom) * 0.5;
+        assert_eq!(
+            with_tl.hit_test(mute_cx, mute_cy, true),
+            MiniPlayerHitZone::MuteButton
+        );
+
+        let vol_cx = (with_tl.vol_track_rect.left + with_tl.vol_track_rect.right) * 0.5;
+        let vol_cy = (with_tl.vol_track_rect.top + with_tl.vol_track_rect.bottom) * 0.5;
+        assert_eq!(
+            with_tl.hit_test(vol_cx, vol_cy, true),
+            MiniPlayerHitZone::VolumeSlider
+        );
+        // Generous vertical tolerance above volume track still hits VolumeSlider
+        assert_eq!(
+            with_tl.hit_test(vol_cx, with_tl.vol_track_rect.top - 8.0, true),
+            MiniPlayerHitZone::VolumeSlider
+        );
+
         let cov_cy = (with_tl.cover_rect.top + with_tl.cover_rect.bottom) * 0.5;
         assert_eq!(
-            with_tl.hit_test(cov_cx, cov_cy, true),
+            with_tl.hit_test(cover_cx, cov_cy, true),
             MiniPlayerHitZone::CoverOrInfo
         );
+        let title_cy = (with_tl.title_rect.top + with_tl.title_rect.bottom) * 0.5;
+        assert_eq!(
+            with_tl.hit_test(card_cx, title_cy, true),
+            MiniPlayerHitZone::CoverOrInfo
+        );
+
+        // Silent / paused state renders a sculpted non-flat resting wave
+        let silent = MiniPlayerLayout::compute(96, false, &[0.0; NUM_BARS]);
+        assert!(silent.mini_spectrum_rects[2].height() > silent.mini_spectrum_rects[0].height());
+        assert!(silent.mini_spectrum_rects[2].height() > silent.mini_spectrum_rects[5].height());
     }
 
     #[test]
