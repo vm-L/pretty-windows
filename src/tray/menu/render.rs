@@ -1,6 +1,7 @@
 use super::TrayMenuInner;
-use super::super::layout::{animated_tray_card_rect, TrayMenuHover, TrayMenuItem};
+use super::super::layout::{animated_tray_card_rect, TrayMenuHover, TrayMenuItem, TraySubmenuKind};
 use crate::color::Rgb;
+use crate::deskbox::DeskBoxTrayAction;
 use crate::ui::glass::{create_dc_render_target, d2d_rect, danger_text_color, draw_divider, draw_geometry_rim, draw_glass_interior, draw_row_highlight, draw_text_in_rect, identity_matrix, primary_text_color};
 use crate::ui::{ease_out_cubic, ease_retract, popup_glass_recipe, rgb_luma, row_stagger_dy, window_master_alpha, GlassSurfaceStyle, PopupAnimPhase, RectF, PANEL_RADIUS_DIP};
 use std::mem::ManuallyDrop;
@@ -302,8 +303,8 @@ impl TrayMenuInner {
                             PopupAnimPhase::Opening => {
                                 if self.open_down {
                                     -row_stagger_dy(
-                                        4usize.saturating_sub(idx),
-                                        5,
+                                        5usize.saturating_sub(idx),
+                                        6,
                                         self.open_elapsed,
                                         self.open_spring.pos,
                                         s,
@@ -311,7 +312,7 @@ impl TrayMenuInner {
                                 } else {
                                     row_stagger_dy(
                                         idx,
-                                        5,
+                                        6,
                                         self.open_elapsed,
                                         self.open_spring.pos,
                                         s,
@@ -337,21 +338,33 @@ impl TrayMenuInner {
                         let selected = match item {
                             TrayMenuItem::MediaBar => self.mediabar_visible,
                             TrayMenuItem::MonitorBar => self.monitorbar_visible,
-                            TrayMenuItem::TaskbarStyle => self.submenu_open,
+                            TrayMenuItem::DeskBox => self.deskbox_state.enabled,
+                            TrayMenuItem::TaskbarStyle => {
+                                self.active_submenu == Some(TraySubmenuKind::TaskbarStyle)
+                            }
                             TrayMenuItem::Autostart => self.autostart,
                             TrayMenuItem::Exit => false,
+                        };
+                        let has_sub = matches!(item, TrayMenuItem::DeskBox | TrayMenuItem::TaskbarStyle);
+                        let sub_open_here = match item {
+                            TrayMenuItem::DeskBox => {
+                                self.active_submenu == Some(TraySubmenuKind::DeskBox)
+                            }
+                            TrayMenuItem::TaskbarStyle => {
+                                self.active_submenu == Some(TraySubmenuKind::TaskbarStyle)
+                            }
+                            _ => false,
                         };
                         draw_row_highlight(
                             &self.rt,
                             rect,
-                            hovered,
+                            hovered || (sub_open_here && item == TrayMenuItem::DeskBox && !selected),
                             selected && item != TrayMenuItem::TaskbarStyle,
                             accent,
                             s,
                             self.light_glass,
                         );
-                        if item == TrayMenuItem::TaskbarStyle && selected && !hovered {
-                            // Subtle neutral highlight while submenu is open without selecting toggle state
+                        if item == TrayMenuItem::TaskbarStyle && sub_open_here && !hovered {
                             draw_row_highlight(
                                 &self.rt,
                                 rect,
@@ -367,6 +380,7 @@ impl TrayMenuInner {
                             TrayMenuItem::Exit => danger_text_color(self.light_glass),
                             TrayMenuItem::MediaBar
                             | TrayMenuItem::MonitorBar
+                            | TrayMenuItem::DeskBox
                             | TrayMenuItem::TaskbarStyle
                             | TrayMenuItem::Autostart => {
                                 let mut c = primary_text_color(self.light_glass);
@@ -389,15 +403,12 @@ impl TrayMenuInner {
                         let label = match item {
                             TrayMenuItem::MediaBar => "媒体控制",
                             TrayMenuItem::MonitorBar => "系统监控",
+                            TrayMenuItem::DeskBox => "桌面收纳",
                             TrayMenuItem::TaskbarStyle => "美化风格",
                             TrayMenuItem::Autostart => "开机自启",
                             TrayMenuItem::Exit => "退出",
                         };
-                        let right_pad = if item == TrayMenuItem::TaskbarStyle {
-                            22.0 * s
-                        } else {
-                            10.0 * s
-                        };
+                        let right_pad = if has_sub { 22.0 * s } else { 10.0 * s };
                         let label_rect = RectF::new(
                             rect.left + 34.0 * s,
                             rect.top,
@@ -413,9 +424,9 @@ impl TrayMenuInner {
                             fg,
                         );
 
-                        if item == TrayMenuItem::TaskbarStyle {
+                        if has_sub {
                             let mut chev_col = fg;
-                            chev_col.a *= if self.submenu_open || hovered { 0.95 } else { 0.65 };
+                            chev_col.a *= if sub_open_here || hovered { 0.95 } else { 0.65 };
                             if let Ok(cb) = self.rt.CreateSolidColorBrush(&chev_col, None) {
                                 let mid_y = (rect.top + rect.bottom) * 0.5;
                                 let tip_x = rect.right - 9.5 * s;
@@ -586,48 +597,141 @@ impl TrayMenuInner {
                             0.0
                         };
 
-                        for (style, mut rect) in layout.sub_rows() {
-                            rect.left += slide_dx;
-                            rect.right += slide_dx;
-                            rect.top += sub_dy;
-                            rect.bottom += sub_dy;
+                        match self.active_submenu {
+                            Some(TraySubmenuKind::DeskBox) => {
+                                let db_rows = layout.sub_deskbox_rows();
+                                for (idx, (action, mut rect)) in db_rows.into_iter().enumerate() {
+                                    rect.left += slide_dx;
+                                    rect.right += slide_dx;
+                                    rect.top += sub_dy;
+                                    rect.bottom += sub_dy;
 
-                            let hovered = self.hover == Some(TrayMenuHover::SubTaskbarStyle(style));
-                            let selected = self.taskbar_style == style;
-                            draw_row_highlight(
-                                &self.rt,
-                                rect,
-                                hovered,
-                                selected,
-                                accent,
-                                s,
-                                self.light_glass,
-                            );
+                                    let hovered =
+                                        self.hover == Some(TrayMenuHover::SubDeskBox(action));
+                                    let selected = match action {
+                                        DeskBoxTrayAction::ToggleEnabled => {
+                                            self.deskbox_state.enabled
+                                        }
+                                        DeskBoxTrayAction::ToggleHideDesktopIcons => {
+                                            self.deskbox_state.hide_desktop_icons
+                                        }
+                                        DeskBoxTrayAction::AutoFitAll
+                                        | DeskBoxTrayAction::LockAll
+                                        | DeskBoxTrayAction::UnlockAll => false,
+                                        DeskBoxTrayAction::SetDefaultView(mode) => {
+                                            self.deskbox_state.default_view_mode == mode
+                                        }
+                                    };
+                                    draw_row_highlight(
+                                        &self.rt,
+                                        rect,
+                                        hovered,
+                                        selected,
+                                        accent,
+                                        s,
+                                        self.light_glass,
+                                    );
 
-                            let mut fg = primary_text_color(self.light_glass);
-                            if !selected && !hovered {
-                                fg.a *= 0.90;
+                                    let mut fg = primary_text_color(self.light_glass);
+                                    if !selected && !hovered {
+                                        fg.a *= 0.90;
+                                    }
+                                    let icon_cx = rect.left + 19.0 * s;
+                                    let icon_cy = (rect.top + rect.bottom) * 0.5;
+                                    if let Ok(icon_brush) = self.rt.CreateSolidColorBrush(&fg, None)
+                                    {
+                                        self.draw_deskbox_action_icon(
+                                            action,
+                                            icon_cx,
+                                            icon_cy,
+                                            s,
+                                            &icon_brush,
+                                        );
+                                    }
+
+                                    let label = match action {
+                                        DeskBoxTrayAction::ToggleEnabled => "启用桌面收纳",
+                                        DeskBoxTrayAction::ToggleHideDesktopIcons => {
+                                            "隐藏系统桌面图标"
+                                        }
+                                        DeskBoxTrayAction::AutoFitAll => "自适应尺寸",
+                                        DeskBoxTrayAction::LockAll => "锁定全部",
+                                        DeskBoxTrayAction::UnlockAll => "解锁全部",
+                                        DeskBoxTrayAction::SetDefaultView(mode) => mode.label(),
+                                    };
+                                    let label_rect = RectF::new(
+                                        rect.left + 34.0 * s,
+                                        rect.top,
+                                        rect.right - 10.0 * s,
+                                        rect.bottom,
+                                    );
+                                    draw_text_in_rect(
+                                        &self.dwrite_factory,
+                                        &self.rt,
+                                        label,
+                                        label_rect,
+                                        &title_fmt,
+                                        fg,
+                                    );
+                                    if idx == 1 || idx == 4 {
+                                        draw_divider(&self.rt, rect, s, self.light_glass);
+                                    }
+                                }
                             }
-                            let icon_cx = rect.left + 19.0 * s;
-                            let icon_cy = (rect.top + rect.bottom) * 0.5;
-                            if let Ok(icon_brush) = self.rt.CreateSolidColorBrush(&fg, None) {
-                                self.draw_style_icon(style, icon_cx, icon_cy, s, &icon_brush);
-                            }
+                            Some(TraySubmenuKind::TaskbarStyle) => {
+                                for (style, mut rect) in layout.sub_rows() {
+                                    rect.left += slide_dx;
+                                    rect.right += slide_dx;
+                                    rect.top += sub_dy;
+                                    rect.bottom += sub_dy;
 
-                            let label_rect = RectF::new(
-                                rect.left + 34.0 * s,
-                                rect.top,
-                                rect.right - 10.0 * s,
-                                rect.bottom,
-                            );
-                            draw_text_in_rect(
-                                &self.dwrite_factory,
-                                &self.rt,
-                                style.label(),
-                                label_rect,
-                                &title_fmt,
-                                fg,
-                            );
+                                    let hovered =
+                                        self.hover == Some(TrayMenuHover::SubTaskbarStyle(style));
+                                    let selected = self.taskbar_style == style;
+                                    draw_row_highlight(
+                                        &self.rt,
+                                        rect,
+                                        hovered,
+                                        selected,
+                                        accent,
+                                        s,
+                                        self.light_glass,
+                                    );
+
+                                    let mut fg = primary_text_color(self.light_glass);
+                                    if !selected && !hovered {
+                                        fg.a *= 0.90;
+                                    }
+                                    let icon_cx = rect.left + 19.0 * s;
+                                    let icon_cy = (rect.top + rect.bottom) * 0.5;
+                                    if let Ok(icon_brush) = self.rt.CreateSolidColorBrush(&fg, None)
+                                    {
+                                        self.draw_style_icon(
+                                            style,
+                                            icon_cx,
+                                            icon_cy,
+                                            s,
+                                            &icon_brush,
+                                        );
+                                    }
+
+                                    let label_rect = RectF::new(
+                                        rect.left + 34.0 * s,
+                                        rect.top,
+                                        rect.right - 10.0 * s,
+                                        rect.bottom,
+                                    );
+                                    draw_text_in_rect(
+                                        &self.dwrite_factory,
+                                        &self.rt,
+                                        style.label(),
+                                        label_rect,
+                                        &title_fmt,
+                                        fg,
+                                    );
+                                }
+                            }
+                            None => {}
                         }
 
                         self.rt.PopLayer();

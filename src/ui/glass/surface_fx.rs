@@ -1,5 +1,8 @@
 use super::d2d_rect;
-use crate::ui::{generate_acrylic_noise_bgra, sample_liquid_silk_field, PopupGlassRecipe, RectF, SILK_H, SILK_UPDATE_INTERVAL_MS, SILK_W};
+use crate::ui::{
+    fill_liquid_silk_bgra, generate_acrylic_noise_bgra, PopupGlassRecipe, RectF, SILK_H,
+    SILK_UPDATE_INTERVAL_MS, SILK_W,
+};
 use std::time::{Duration, Instant};
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_U};
 use windows::Win32::Graphics::Direct2D::{ID2D1Bitmap, ID2D1BitmapBrush, ID2D1DCRenderTarget, ID2D1Geometry, D2D1_BITMAP_BRUSH_PROPERTIES, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_BITMAP_PROPERTIES, D2D1_EXTEND_MODE_CLAMP, D2D1_EXTEND_MODE_WRAP, D2D1_GAMMA_2_2, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT};
@@ -37,26 +40,17 @@ pub fn update_silk_bitmap(
         silk_buf.resize(expected_len, 0);
     }
 
-    let scale_len = (220.0 * s).max(1.0);
-    let phase = (flow_phase % 10_000.0) as f32;
-    let w = win_w.max(1) as f32;
-    let h = win_h.max(1) as f32;
-
-    for gy in 0..SILK_H {
-        let py = (((gy as f32) + 0.5) / (SILK_H as f32)) * h;
-        let y = (origin_bottom - py) / scale_len;
-        for gx in 0..SILK_W {
-            let px = (((gx as f32) + 0.5) / (SILK_W as f32)) * w;
-            let x = (px - origin_left) / scale_len;
-            let (r, g, b, a) =
-                sample_liquid_silk_field(x, y, phase, halo_colors, light_glass);
-            let idx = ((gy * SILK_W + gx) * 4) as usize;
-            silk_buf[idx] = (b * a * 255.0).round().clamp(0.0, 255.0) as u8;
-            silk_buf[idx + 1] = (g * a * 255.0).round().clamp(0.0, 255.0) as u8;
-            silk_buf[idx + 2] = (r * a * 255.0).round().clamp(0.0, 255.0) as u8;
-            silk_buf[idx + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
-    }
+    fill_liquid_silk_bgra(
+        silk_buf,
+        win_w,
+        win_h,
+        origin_left,
+        origin_bottom,
+        s,
+        flow_phase,
+        halo_colors,
+        light_glass,
+    );
 
     unsafe {
         if let Some(ref bmp) = *silk_bmp {

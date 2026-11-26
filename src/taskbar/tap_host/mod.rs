@@ -316,9 +316,7 @@ mod shell_flyout;
 #[cfg(windows)]
 pub use explorer::TapClient;
 #[cfg(windows)]
-pub use inject::{
-    find_search_host_pid, find_shell_experience_host_pid, find_shell_host_pid, find_start_menu_pid,
-};
+pub use inject::find_shell_flyout_pids_in_session;
 #[cfg(windows)]
 pub use shell_flyout::ShellFlyoutTapClient;
 

@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 mod color;
+mod deskbox;
 mod mediabar;
 mod monitorbar;
 mod system;
@@ -18,6 +19,7 @@ fn main() {
     use windows::Win32::System::LibraryLoader::{
         SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
     };
+    use windows::Win32::System::Ole::{OleInitialize, OleUninitialize};
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::Win32::UI::HiDpi::{
         SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -36,9 +38,17 @@ fn main() {
             return;
         }
 
-        let com_ok = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let ole_ok = OleInitialize(None).is_ok();
+        let com_ok = if ole_ok {
+            false
+        } else {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok()
+        };
         let _ = tray::run();
-        if com_ok {
+        ui::glass::CompositionEngine::shutdown_thread_dispatcher_queue();
+        if ole_ok {
+            OleUninitialize();
+        } else if com_ok {
             CoUninitialize();
         }
         let _ = CloseHandle(mutex);

@@ -726,6 +726,12 @@ impl MiniPlayerInner {
 
     fn sync_timer_rate(&mut self) {
         let want = self.desired_timer_interval_ms();
+        if matches!(
+            self.anim_phase,
+            PopupAnimPhase::Opening | PopupAnimPhase::Closing
+        ) {
+            crate::ui::notify_interactive_anim_frame();
+        }
         if self.timer_interval_ms != want {
             unsafe {
                 if want == 0 {

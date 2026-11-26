@@ -1,9 +1,11 @@
 mod backdrop;
+mod composition;
 mod contour;
 mod controls;
 mod surface_fx;
 
 pub use backdrop::*;
+pub use composition::CompositionEngine;
 pub use contour::*;
 pub use controls::*;
 pub use surface_fx::*;
@@ -30,6 +32,8 @@ pub struct LayeredSurface {
     bits: *mut u8,
     width: i32,
     height: i32,
+    cap_width: i32,
+    cap_height: i32,
 }
 
 impl LayeredSurface {
@@ -48,6 +52,8 @@ impl LayeredSurface {
                 bits: null_mut(),
                 width: 0,
                 height: 0,
+                cap_width: 0,
+                cap_height: 0,
             })
         }
     }
@@ -55,7 +61,15 @@ impl LayeredSurface {
     pub fn ensure_size(&mut self, width: i32, height: i32) -> windows::core::Result<()> {
         let w = width.max(1);
         let h = height.max(1);
-        if self.width == w && self.height == h && !self.bitmap.is_invalid() {
+        // Reuse an existing top-down DIB whenever width matches and allocated height fits `h`
+        // (up to 8x capped headroom), eliminating `CreateDIBSection` churn when collapsed boxes retract.
+        if !self.bitmap.is_invalid()
+            && w == self.cap_width
+            && h <= self.cap_height
+            && self.cap_height <= h.max(256).saturating_mul(8)
+        {
+            self.width = w;
+            self.height = h;
             return Ok(());
         }
 
@@ -82,6 +96,8 @@ impl LayeredSurface {
             self.bits = bits.cast::<u8>();
             self.width = w;
             self.height = h;
+            self.cap_width = w;
+            self.cap_height = h;
         }
         Ok(())
     }
@@ -147,7 +163,7 @@ impl LayeredSurface {
         }
     }
 
-    fn release_bitmap(&mut self) {
+    pub fn release_bitmap(&mut self) {
         unsafe {
             if !self.old_obj.is_invalid() {
                 let _ = SelectObject(self.mem_dc, self.old_obj);
@@ -158,6 +174,10 @@ impl LayeredSurface {
                 self.bitmap = HBITMAP::default();
             }
             self.bits = null_mut();
+            self.width = 0;
+            self.height = 0;
+            self.cap_width = 0;
+            self.cap_height = 0;
         }
     }
 }

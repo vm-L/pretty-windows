@@ -8,11 +8,7 @@ use windows::Win32::Foundation::{BOOL, CLASS_E_CLASSNOTAVAILABLE, E_NOINTERFACE,
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::System::LibraryLoader::{GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN};
 use windows::Win32::System::Threading::{GetCurrentThreadId, SetEvent, WaitForSingleObject, INFINITE};
-use super::appearance::apply_target_appearance;
-use super::brush_store::{
-    purge_saved_brushes_for_current_thread, resolve_weak_inspectable,
-    resolve_weak_raw_inspectable,
-};
+use super::brush_store::detach_handles_for_current_thread;
 use super::pipe::{run_pipe_server_loop, run_reverse_pipe_client_loop};
 use super::raw_com::*;
 use super::{
@@ -343,48 +339,28 @@ unsafe extern "system" fn watcher_on_visual_tree_change(
                     }
                 }
             }
-            for (eh, nk) in downgraded_handles {
-                if let Ok(g) = rt.state.lock() {
-                    if let Some(t) = g.targets.get(&eh) {
-                        let hide_now = g.desired_hide && !g.shutdown;
-                        let weak_raw = t.weak_ref_raw;
-                        let op = t.orig_opacity;
-                        let vis = t.orig_visibility;
-                        if weak_raw != 0 {
-                            add_ref_raw_com_addr(weak_raw);
-                        }
-                        let weak_com = ComRaw(weak_raw as *mut c_void);
-                        drop(g);
-                        if let Some(insp) = resolve_weak_inspectable(&weak_com) {
-                            apply_target_appearance(
-                                rt,
-                                eh,
-                                insp.as_ptr(),
-                                nk,
-                                hide_now,
-                                op,
-                                vis,
-                            );
-                        }
+            let need_async_reapply = !downgraded_handles.is_empty() || !dropped_targets.is_empty();
+            if !dropped_targets.is_empty() {
+                let mut orphaned = Vec::new();
+                if let Ok(mut g) = rt.state.lock() {
+                    if g.shutdown {
+                        orphaned = dropped_targets;
+                    } else {
+                        g.pending_restores.extend(dropped_targets);
+                    }
+                } else {
+                    orphaned = dropped_targets;
+                }
+                if !orphaned.is_empty() {
+                    let git = create_git().ok();
+                    for (_, old) in orphaned {
+                        release_target_resources(old, git.as_ref());
                     }
                 }
             }
-            if !dropped_targets.is_empty() {
-                let git = create_git().ok();
-                for (eh, old) in dropped_targets {
-                    if let Some(insp) = resolve_weak_raw_inspectable(old.weak_ref_raw) {
-                        apply_target_appearance(
-                            rt,
-                            eh,
-                            insp.as_ptr(),
-                            old.kind,
-                            false,
-                            old.orig_opacity,
-                            old.orig_visibility,
-                        );
-                    }
-                    release_target_resources(old, git.as_ref());
-                }
+            if need_async_reapply && !rt.is_shutdown() {
+                // Defer visual-tree/property mutations out of `OnVisualTreeChange` onto the UI thread.
+                rt.dispatch_apply_for_thread(cur_tid);
             }
         }
         if let Some(kind) = matched_kind {
@@ -412,7 +388,10 @@ unsafe extern "system" fn watcher_on_visual_tree_change(
             Vec::new()
         };
         if !removed.is_empty() {
-            purge_saved_brushes_for_current_thread(&removed);
+            // Only detach removed InstanceHandles from `handle_to_identity`: WinUI/XAML caches
+            // dismissed flyouts/menus/tooltips/cards in memory, so live modified COM objects remain
+            // tracked by weak reference and will be cleanly restored on CMD_RESTORE / CMD_SHUTDOWN.
+            detach_handles_for_current_thread(&removed);
             let mut evicted = Vec::new();
             let mut removed_alt_tab = false;
             let mut removed_hover_flyout = false;
@@ -1013,33 +992,22 @@ fn run_advisor_thread(rt: Arc<TapRuntime>, vts_cookie: u32) {
 
         drop(vts_com);
 
-        let (leftover, leftover_tooltip_dispatchers, leftover_menu_dispatchers): (
-            Vec<TrackedTarget>,
-            Vec<OwnedDispatcher>,
-            Vec<OwnedDispatcher>,
-        ) = if let Ok(mut g) = rt.state.lock() {
-            g.shutdown = true;
-            (
-                g.targets.drain().map(|(_, t)| t).collect(),
-                g.tooltip_dispatchers
-                    .drain(..)
-                    .map(|(_, disp)| disp)
-                    .collect(),
-                g.menu_flyout_dispatchers
-                    .drain(..)
-                    .map(|(_, disp)| disp)
-                    .collect(),
-            )
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
+        let (leftover, leftover_ui_dispatchers): (Vec<TrackedTarget>, Vec<OwnedDispatcher>) =
+            if let Ok(mut g) = rt.state.lock() {
+                g.shutdown = true;
+                let mut targets: Vec<TrackedTarget> = g.targets.drain().map(|(_, t)| t).collect();
+                targets.extend(g.pending_restores.drain(..).map(|(_, t)| t));
+                (
+                    targets,
+                    g.ui_dispatchers.drain(..).map(|(_, disp)| disp).collect(),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
         for t in leftover {
             release_target_resources(t, git.as_ref());
         }
-        for disp in leftover_tooltip_dispatchers {
-            release_owned_dispatcher(disp, git.as_ref());
-        }
-        for disp in leftover_menu_dispatchers {
+        for disp in leftover_ui_dispatchers {
             release_owned_dispatcher(disp, git.as_ref());
         }
 

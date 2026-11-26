@@ -333,34 +333,30 @@ unsafe fn restore_tooltip_pair(
         }
         let cp_com = qi_interface(cp_ptr, &IID_ICONTENTPRESENTER4);
         if !cp_com.is_null() {
-            if let Some(sb_bg) = cp_saved.background {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    presenter_key,
-                    cp_ptr,
-                    cp_com.as_ptr(),
-                    BrushPropKind::ContentPresenterBackground,
-                    target_bg,
-                    false,
-                    Some(sb_bg),
-                    DIAG_TOOLTIP_APPLIED,
-                    true,
-                );
-            }
-            if let Some(sb_bb) = cp_saved.border_brush {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    presenter_key,
-                    cp_ptr,
-                    cp_com.as_ptr(),
-                    BrushPropKind::ContentPresenterBorderBrush,
-                    target_border,
-                    false,
-                    Some(sb_bb),
-                    DIAG_TOOLTIP_APPLIED,
-                    true,
-                );
-            }
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                presenter_key,
+                cp_ptr,
+                cp_com.as_ptr(),
+                BrushPropKind::ContentPresenterBackground,
+                target_bg,
+                false,
+                cp_saved.background,
+                DIAG_TOOLTIP_APPLIED,
+                true,
+            );
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                presenter_key,
+                cp_ptr,
+                cp_com.as_ptr(),
+                BrushPropKind::ContentPresenterBorderBrush,
+                target_border,
+                false,
+                cp_saved.border_brush,
+                DIAG_TOOLTIP_APPLIED,
+                true,
+            );
             sync_tooltip_presenter_corner_radius_fallback(
                 presenter_key,
                 cp_com.as_ptr(),
@@ -716,34 +712,30 @@ unsafe fn restore_menu_flyout_pair(
         }
         let border_com = qi_interface(surf_ptr, &IID_IBORDER);
         if !border_com.is_null() {
-            if let Some(sb_bg) = surf_saved.background {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    surface_key,
-                    surf_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBackground,
-                    target_bg,
-                    false,
-                    Some(sb_bg),
-                    DIAG_MENU_FLYOUT_APPLIED,
-                    true,
-                );
-            }
-            if let Some(sb_bb) = surf_saved.border_brush {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    surface_key,
-                    surf_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBrush,
-                    target_border,
-                    false,
-                    Some(sb_bb),
-                    DIAG_MENU_FLYOUT_APPLIED,
-                    true,
-                );
-            }
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                surface_key,
+                surf_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBackground,
+                target_bg,
+                false,
+                surf_saved.background,
+                DIAG_MENU_FLYOUT_APPLIED,
+                true,
+            );
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                surface_key,
+                surf_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBrush,
+                target_border,
+                false,
+                surf_saved.border_brush,
+                DIAG_MENU_FLYOUT_APPLIED,
+                true,
+            );
             sync_menu_flyout_border_corner_radius_fallback(
                 surface_key,
                 border_com.as_ptr(),
@@ -752,35 +744,31 @@ unsafe fn restore_menu_flyout_pair(
         } else {
             let panel_com = qi_interface(surf_ptr, &IID_IPANEL);
             if !panel_com.is_null() {
-                if let Some(sb_bg) = surf_saved.background {
-                    sync_overflow_brush_prop(
-                        rt,
-                        surface_key,
-                        surf_ptr,
-                        panel_com.as_ptr(),
-                        BrushPropKind::PanelBackground,
-                        target_bg,
-                        false,
-                        Some(sb_bg),
-                        DIAG_MENU_FLYOUT_APPLIED,
-                    );
-                }
+                sync_overflow_brush_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    panel_com.as_ptr(),
+                    BrushPropKind::PanelBackground,
+                    target_bg,
+                    false,
+                    surf_saved.background,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                );
             }
             let grid2_com = qi_interface(surf_ptr, &IID_IGRID2);
             if !grid2_com.is_null() {
-                if let Some(sb_bb) = surf_saved.border_brush {
-                    sync_overflow_brush_prop(
-                        rt,
-                        surface_key,
-                        surf_ptr,
-                        grid2_com.as_ptr(),
-                        BrushPropKind::GridBorderBrush,
-                        target_border,
-                        false,
-                        Some(sb_bb),
-                        DIAG_MENU_FLYOUT_APPLIED,
-                    );
-                }
+                sync_overflow_brush_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    grid2_com.as_ptr(),
+                    BrushPropKind::GridBorderBrush,
+                    target_border,
+                    false,
+                    surf_saved.border_brush,
+                    DIAG_MENU_FLYOUT_APPLIED,
+                );
             }
         }
     }

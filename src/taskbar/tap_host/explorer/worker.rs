@@ -85,7 +85,7 @@ pub(super) fn run_tap_worker(shared: Arc<(Mutex<TapWorkerShared>, Condvar, Condv
         if stop_worker {
             let pid = attached_pid.unwrap_or(target_pid);
             if pid != 0 && (attached_pid.is_some() || send_command(pid, CMD_PING, 30)) {
-                let _ = send_command(pid, CMD_RESTORE, 250);
+                let _ = send_command(pid, CMD_RESTORE, 400);
             }
             if let Ok(mut st) = lock.lock() {
                 st.detach_pid(None, true);

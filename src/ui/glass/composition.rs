@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::mem::size_of;
 use windows::core::{implement, Interface, Result, GUID, HSTRING, PCWSTR};
 use windows::Foundation::{IPropertyValue, PropertyValue};
@@ -144,35 +145,66 @@ impl IGraphicsEffectD2D1Interop_Impl for SaturationEffect_Impl {
     }
 }
 
-pub(super) struct CompositionEngine {
-    _dq_controller: Option<DispatcherQueueController>,
-    pub(super) compositor: Compositor,
+thread_local! {
+    /// Per-UI-thread `DispatcherQueueController` shared across all `CompositionEngine` instances
+    /// (taskbar + deskbox) so recreating one engine never tears down the thread's `DispatcherQueue`
+    /// while another module's `Compositor` / `DesktopWindowTarget` is still live.
+    static THREAD_DQ_CONTROLLER: RefCell<Option<DispatcherQueueController>> =
+        const { RefCell::new(None) };
+}
+
+fn ensure_thread_dispatcher_queue() -> bool {
+    if DispatcherQueue::GetForCurrentThread().is_ok() {
+        return true;
+    }
+    let opts = DispatcherQueueOptions {
+        dwSize: size_of::<DispatcherQueueOptions>() as u32,
+        threadType: DQTYPE_THREAD_CURRENT,
+        apartmentType: DQTAT_COM_NONE,
+    };
+    let Ok(controller) = (unsafe { CreateDispatcherQueueController(opts) }) else {
+        return false;
+    };
+    let _ = THREAD_DQ_CONTROLLER.try_with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            *guard = Some(controller);
+        }
+    });
+    true
+}
+
+/// Shared WinRT `Windows.UI.Composition` real-time desktop backdrop blur engine.
+pub struct CompositionEngine {
     desktop_interop: ICompositorDesktopInterop,
+    pub compositor: Compositor,
 }
 
 impl CompositionEngine {
-    pub(super) fn try_new() -> Option<Self> {
-        let dq_controller = if DispatcherQueue::GetForCurrentThread().is_ok() {
-            None
-        } else {
-            let opts = DispatcherQueueOptions {
-                dwSize: size_of::<DispatcherQueueOptions>() as u32,
-                threadType: DQTYPE_THREAD_CURRENT,
-                apartmentType: DQTAT_COM_NONE,
-            };
-            Some(unsafe { CreateDispatcherQueueController(opts).ok()? })
-        };
+    /// Releases the thread-local WinRT `DispatcherQueueController` before `OleUninitialize` /
+    /// `CoUninitialize` so COM/WinRT objects are never released during late CRT/TLS teardown.
+    pub fn shutdown_thread_dispatcher_queue() {
+        let _ = THREAD_DQ_CONTROLLER.try_with(|slot| {
+            if let Ok(mut guard) = slot.try_borrow_mut() {
+                drop(guard.take());
+            }
+        });
+    }
 
+    /// Initializes a per-thread `Compositor` and `DispatcherQueue` (when needed) for live HostBackdrop effects.
+    pub fn try_new() -> Option<Self> {
+        if !ensure_thread_dispatcher_queue() {
+            return None;
+        }
         let compositor = Compositor::new().ok()?;
         let desktop_interop: ICompositorDesktopInterop = compositor.cast().ok()?;
         Some(Self {
-            _dq_controller: dq_controller,
-            compositor,
             desktop_interop,
+            compositor,
         })
     }
 
-    pub(super) fn create_target_and_visual(&self, hwnd: HWND) -> Option<(DesktopWindowTarget, SpriteVisual)> {
+    /// Creates a composition target and root `SpriteVisual` bound to `hwnd`.
+    pub fn create_target_and_visual(&self, hwnd: HWND) -> Option<(DesktopWindowTarget, SpriteVisual)> {
         let target = unsafe {
             self.desktop_interop
                 .CreateDesktopWindowTarget(hwnd, false)
@@ -183,7 +215,8 @@ impl CompositionEngine {
         Some((target, visual))
     }
 
-    pub(super) fn build_backdrop_brush(
+    /// Builds a `GaussianBlur` + `Saturation` `CompositionEffectBrush` driven by `CreateHostBackdropBrush`.
+    pub fn build_backdrop_brush(
         &self,
         sigma_px: f32,
         saturation: f32,

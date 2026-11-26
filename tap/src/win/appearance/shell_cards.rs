@@ -529,67 +529,59 @@ unsafe fn restore_shell_card_target(
         }
         let border_com = qi_interface(surf_ptr, &IID_IBORDER);
         if !border_com.is_null() {
-            if let Some(sb_bg) = surf_saved.background {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    surface_key,
-                    surf_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBackground,
-                    target_bg,
-                    false,
-                    Some(sb_bg),
-                    DIAG_SHELL_CARD_APPLIED,
-                    true,
-                );
-            }
-            if let Some(sb_bb) = surf_saved.border_brush {
-                let _ = sync_overflow_brush_prop_with_mode(
-                    rt,
-                    surface_key,
-                    surf_ptr,
-                    border_com.as_ptr(),
-                    BrushPropKind::BorderBrush,
-                    target_border,
-                    false,
-                    Some(sb_bb),
-                    DIAG_SHELL_CARD_APPLIED,
-                    true,
-                );
-            }
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                surface_key,
+                surf_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBackground,
+                target_bg,
+                false,
+                surf_saved.background,
+                DIAG_SHELL_CARD_APPLIED,
+                true,
+            );
+            let _ = sync_overflow_brush_prop_with_mode(
+                rt,
+                surface_key,
+                surf_ptr,
+                border_com.as_ptr(),
+                BrushPropKind::BorderBrush,
+                target_border,
+                false,
+                surf_saved.border_brush,
+                DIAG_SHELL_CARD_APPLIED,
+                true,
+            );
             sync_shell_card_border_corner_radius(surface_key, border_com.as_ptr(), false);
         } else {
             let panel_com = qi_interface(surf_ptr, &IID_IPANEL);
             if !panel_com.is_null() {
-                if let Some(sb_bg) = surf_saved.background {
-                    sync_overflow_brush_prop(
-                        rt,
-                        surface_key,
-                        surf_ptr,
-                        panel_com.as_ptr(),
-                        BrushPropKind::PanelBackground,
-                        target_bg,
-                        false,
-                        Some(sb_bg),
-                        DIAG_SHELL_CARD_APPLIED,
-                    );
-                }
+                sync_overflow_brush_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    panel_com.as_ptr(),
+                    BrushPropKind::PanelBackground,
+                    target_bg,
+                    false,
+                    surf_saved.background,
+                    DIAG_SHELL_CARD_APPLIED,
+                );
             }
             let grid2_com = qi_interface(surf_ptr, &IID_IGRID2);
             if !grid2_com.is_null() {
-                if let Some(sb_bb) = surf_saved.border_brush {
-                    sync_overflow_brush_prop(
-                        rt,
-                        surface_key,
-                        surf_ptr,
-                        grid2_com.as_ptr(),
-                        BrushPropKind::GridBorderBrush,
-                        target_border,
-                        false,
-                        Some(sb_bb),
-                        DIAG_SHELL_CARD_APPLIED,
-                    );
-                }
+                sync_overflow_brush_prop(
+                    rt,
+                    surface_key,
+                    surf_ptr,
+                    grid2_com.as_ptr(),
+                    BrushPropKind::GridBorderBrush,
+                    target_border,
+                    false,
+                    surf_saved.border_brush,
+                    DIAG_SHELL_CARD_APPLIED,
+                );
             }
         }
         remove_named_overlays_in_parent_panel(surf_ptr, START_MENU_OVERLAY_NAME);
@@ -797,10 +789,6 @@ pub(super) unsafe fn apply_start_menu_modal_surface_appearance(
         if native_border.is_null() || !has_zero_visual_children(insp_ptr) {
             return;
         }
-        track_shell_card_modified_target(surface_key, insp_ptr);
-        if !record_and_hide_shell_card_visual(surface_key, insp_ptr) {
-            return;
-        }
         let Some((modal_host, is_new)) = ensure_start_modal_overlay_host(insp_ptr) else {
             return;
         };
@@ -827,21 +815,30 @@ pub(super) unsafe fn apply_start_menu_modal_surface_appearance(
             || prev_spec != Some(style_spec)
             || !has_element_child_visual(modal_host.as_ptr());
 
-        if need_restyle
-            && attach_start_modal_glass_visual(
+        if need_restyle {
+            if !attach_start_modal_glass_visual(
                 modal_host.as_ptr(),
                 corner_radius,
                 style_spec.0,
                 style_spec.1,
                 style_spec.2,
                 style_spec.3,
-            )
-        {
+            ) {
+                remove_named_overlays_in_parent_panel(insp_ptr, START_MODAL_OVERLAY_NAME);
+                restore_shell_card_visual(surface_key, insp_ptr);
+                return;
+            }
             UI_BRUSH_STORE.with(|cell| {
                 if let Ok(mut s) = cell.try_borrow_mut() {
                     s.start_modal_applied_style.insert(surface_key, style_spec);
                 }
             });
+        }
+
+        track_shell_card_modified_target(surface_key, insp_ptr);
+        if !record_and_hide_shell_card_visual(surface_key, insp_ptr) {
+            remove_named_overlays_in_parent_panel(insp_ptr, START_MODAL_OVERLAY_NAME);
+            return;
         }
 
         rt.diag_flags

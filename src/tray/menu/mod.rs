@@ -4,8 +4,12 @@ mod wndproc;
 
 use wndproc::tray_menu_wnd_proc;
 
-use super::layout::{adjust_tray_anchor_for_work_area, animated_tray_card_rect, compute_tray_cascading_placement, TrayMenuHover, TrayMenuLayout};
+use super::layout::{
+    adjust_tray_anchor_for_work_area, animated_tray_card_rect, compute_tray_cascading_placement,
+    TrayMenuHover, TrayMenuLayout, TraySubmenuKind,
+};
 use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
+use crate::deskbox::BoxViewMode;
 use crate::system::{resolve_unified_accent, visible_transient_overlay_rects};
 use crate::taskbar::TaskbarStyle;
 use crate::ui::glass::{capture_blurred_desktop_backdrop_excluding, create_dc_render_target, create_round_cap_stroke, create_text_format, update_silk_bitmap, LayeredSurface, PopupNoiseCache};
@@ -28,6 +32,14 @@ pub const WM_APP_TRAY_EXIT: u32 = WM_APP + 23;
 pub const WM_APP_TRAY_MENU_CLOSED: u32 = WM_APP + 24;
 pub const WM_APP_TRAY_SET_TASKBAR_STYLE: u32 = WM_APP + 26;
 pub const WM_APP_TRAY_TOGGLE_MONITORBAR: u32 = WM_APP + 27;
+pub const WM_APP_TRAY_DESKBOX_ACTION: u32 = WM_APP + 30;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DeskBoxMenuState {
+    pub enabled: bool,
+    pub hide_desktop_icons: bool,
+    pub default_view_mode: BoxViewMode,
+}
 
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const TRAY_MENU_CLASS_NAME: PCWSTR = w!("PrettyWindowsTrayMenuWnd");
@@ -71,6 +83,7 @@ struct TrayMenuInner {
     backdrop_rgb: Rgb,
     mediabar_visible: bool,
     monitorbar_visible: bool,
+    deskbox_state: DeskBoxMenuState,
     taskbar_style: TaskbarStyle,
     autostart: bool,
     hover: Option<TrayMenuHover>,
@@ -81,7 +94,7 @@ struct TrayMenuInner {
     win_h: i32,
     sub_open_left: bool,
     open_down: bool,
-    submenu_open: bool,
+    active_submenu: Option<TraySubmenuKind>,
     sub_width_spring: Spring1D,
     sub_fade_elapsed: f32,
     silk_buf: Vec<u8>,
@@ -168,6 +181,7 @@ impl TrayMenu {
                 backdrop_rgb: NEUTRAL_BACKDROP_FALLBACK,
                 mediabar_visible: true,
                 monitorbar_visible: true,
+                deskbox_state: DeskBoxMenuState::default(),
                 taskbar_style: TaskbarStyle::default(),
                 autostart: false,
                 hover: None,
@@ -178,7 +192,7 @@ impl TrayMenu {
                 win_h: 1,
                 sub_open_left: false,
                 open_down: false,
-                submenu_open: false,
+                active_submenu: None,
                 sub_width_spring: Spring1D::still(0.0),
                 sub_fade_elapsed: 0.0,
                 silk_buf: vec![0u8; (SILK_W * SILK_H * 4) as usize],
@@ -266,6 +280,7 @@ impl TrayMenu {
         &mut self,
         mediabar_visible: bool,
         monitorbar_visible: bool,
+        deskbox_state: DeskBoxMenuState,
         taskbar_style: TaskbarStyle,
         autostart: bool,
     ) {
@@ -273,6 +288,7 @@ impl TrayMenu {
         let should_render = if let Ok(mut s) = self.inner.try_borrow_mut() {
             s.mediabar_visible = mediabar_visible;
             s.monitorbar_visible = monitorbar_visible;
+            s.deskbox_state = deskbox_state;
             s.taskbar_style = taskbar_style;
             s.autostart = autostart;
             if visible {
@@ -323,6 +339,7 @@ impl TrayMenu {
         _fallback_accent: Rgb,
         mediabar_visible: bool,
         monitorbar_visible: bool,
+        deskbox_state: DeskBoxMenuState,
         taskbar_style: TaskbarStyle,
         autostart: bool,
     ) {
@@ -333,10 +350,11 @@ impl TrayMenu {
             s.backdrop_rgb = NEUTRAL_BACKDROP_FALLBACK;
             s.mediabar_visible = mediabar_visible;
             s.monitorbar_visible = monitorbar_visible;
+            s.deskbox_state = deskbox_state;
             s.taskbar_style = taskbar_style;
             s.autostart = autostart;
             s.hover = None;
-            s.submenu_open = false;
+            s.active_submenu = None;
             s.sub_width_spring = Spring1D::still(0.0);
             s.sub_fade_elapsed = 0.0;
 
@@ -515,17 +533,17 @@ impl TrayMenuInner {
         self.close_progress = 0.0;
         self.shown_at = None;
         self.shell_focus_reclaimed = false;
-        self.submenu_open = false;
+        self.active_submenu = None;
         self.sub_width_spring = Spring1D::still(0.0);
         self.sub_fade_elapsed = 0.0;
         self.hover = None;
     }
 
     fn submenu_animating(&self) -> bool {
-        if !self.submenu_open {
+        let Some(kind) = self.active_submenu else {
             return false;
-        }
-        let target_w = self.current_layout().sub_rect.width();
+        };
+        let target_w = self.current_layout().sub_rect_for(kind).width();
         let s = (self.dpi.max(96) as f32) / 96.0;
         !self.sub_width_spring.is_settled(target_w, 0.35 * s, 4.0 * s)
             || self.sub_fade_elapsed < 0.14
@@ -550,6 +568,9 @@ impl TrayMenuInner {
                 0
             }
         };
+        if desired == POPUP_ANIM_INTERVAL_MS {
+            crate::ui::notify_interactive_anim_frame();
+        }
         if self.timer_interval_ms != desired {
             unsafe {
                 if desired == 0 {
@@ -565,23 +586,25 @@ impl TrayMenuInner {
         }
     }
 
-    pub(super) fn open_submenu(&mut self) -> bool {
-        if self.submenu_open || self.anim_phase == PopupAnimPhase::Closing {
+    pub(super) fn open_submenu(&mut self, kind: TraySubmenuKind) -> bool {
+        if self.active_submenu == Some(kind) || self.anim_phase == PopupAnimPhase::Closing {
             return false;
         }
         let s = (self.dpi.max(96) as f32) / 96.0;
-        self.submenu_open = true;
-        self.sub_width_spring = Spring1D::new(0.0, 260.0 * s);
+        if self.active_submenu.is_none() {
+            self.sub_width_spring = Spring1D::new(0.0, 260.0 * s);
+        }
+        self.active_submenu = Some(kind);
         self.sub_fade_elapsed = 0.0;
         self.sync_timer_rate();
         true
     }
 
     pub(super) fn close_submenu(&mut self) -> bool {
-        if !self.submenu_open {
+        if self.active_submenu.is_none() {
             return false;
         }
-        self.submenu_open = false;
+        self.active_submenu = None;
         self.sub_width_spring = Spring1D::still(0.0);
         self.sub_fade_elapsed = 0.0;
         self.sync_timer_rate();
@@ -613,8 +636,8 @@ impl TrayMenuInner {
     }
 
     pub(super) fn advance_animations(&mut self, dt: f32) -> bool {
-        if self.submenu_open {
-            let target_w = self.current_layout().sub_rect.width();
+        if let Some(kind) = self.active_submenu {
+            let target_w = self.current_layout().sub_rect_for(kind).width();
             self.sub_fade_elapsed += dt;
             self.sub_width_spring
                 .step(target_w, SUB_WIDTH_STIFFNESS, SUB_WIDTH_DAMPING, dt);
@@ -703,10 +726,8 @@ impl TrayMenuInner {
     }
 
     pub(super) fn current_animated_sub_rect(&self, layout: &TrayMenuLayout, anim_primary: RectF, s: f32) -> Option<RectF> {
-        if !self.submenu_open {
-            return None;
-        }
-        let target_sub = layout.sub_rect;
+        let kind = self.active_submenu?;
+        let target_sub = layout.sub_rect_for(kind);
         let v_sub = animated_tray_card_rect(
             target_sub,
             self.win_h as f32,

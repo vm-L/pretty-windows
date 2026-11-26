@@ -41,11 +41,28 @@ pub(in super::super) unsafe fn sync_hover_flyout_bg_shapes(
             .is_some_and(|n| matches!(n, "BackgroundFill" | "BackgroundStroke" | "ScreenEdgeStroke"))
         {
             let key = com_identity_key(node_com.as_ptr());
-            let cached_orig = UI_BRUSH_STORE.with(|cell| {
-                cell.try_borrow()
-                    .ok()
-                    .and_then(|s| s.hover_flyout_shapes.get(&key).map(|(_, op, vis)| (*op, *vis)))
+            let cached_entry = UI_BRUSH_STORE.with(|cell| {
+                cell.try_borrow().ok().and_then(|s| {
+                    s.hover_flyout_shapes
+                        .get(&key)
+                        .map(|(w, op, vis)| (w.clone_ref(), *op, *vis))
+                })
             });
+            let cached_orig = match cached_entry {
+                Some((w, op, vis)) if weak_matches_live_object(&w, node_com.as_ptr()) => {
+                    Some((op, vis))
+                }
+                Some(_) => {
+                    let displaced = UI_BRUSH_STORE.with(|cell| {
+                        cell.try_borrow_mut()
+                            .ok()
+                            .and_then(|mut s| s.hover_flyout_shapes.remove(&key))
+                    });
+                    drop(displaced);
+                    None
+                }
+                None => None,
+            };
             let (orig_opacity, orig_visibility) = if let Some(pair) = cached_orig {
                 pair
             } else {
@@ -76,32 +93,49 @@ pub(in super::super) unsafe fn sync_hover_flyout_bg_shapes(
                         .is_ok()
                             && !weak_ref.is_null()
                         {
+                            let need_prune = UI_BRUSH_STORE.with(|cell| {
+                                cell.try_borrow().ok().is_some_and(|s| {
+                                    !s.hover_flyout_shapes.contains_key(&key)
+                                        && s.hover_flyout_shapes.len() >= 64
+                                })
+                            });
+                            if need_prune {
+                                let candidates: Vec<(u64, ComRaw)> = UI_BRUSH_STORE.with(|cell| {
+                                    cell.try_borrow()
+                                        .ok()
+                                        .map(|s| {
+                                            s.hover_flyout_shapes
+                                                .iter()
+                                                .map(|(&k, (w, _, _))| (k, w.clone_ref()))
+                                                .collect()
+                                        })
+                                        .unwrap_or_default()
+                                });
+                                let dead: Vec<u64> = candidates
+                                    .into_iter()
+                                    .filter_map(|(ck, w)| {
+                                        resolve_weak_inspectable(&w).is_none().then_some(ck)
+                                    })
+                                    .collect();
+                                if !dead.is_empty() {
+                                    let removed: Vec<(ComRaw, f64, i32)> =
+                                        UI_BRUSH_STORE.with(|cell| {
+                                            let Ok(mut s) = cell.try_borrow_mut() else {
+                                                return Vec::new();
+                                            };
+                                            dead.iter()
+                                                .filter_map(|dk| s.hover_flyout_shapes.remove(dk))
+                                                .collect()
+                                        });
+                                    drop(removed);
+                                }
+                            }
                             let displaced = UI_BRUSH_STORE.with(|cell| {
                                 if let Ok(mut s) = cell.try_borrow_mut() {
-                                    if !s.hover_flyout_shapes.contains_key(&key) {
-                                        if s.hover_flyout_shapes.len() >= 64 {
-                                            let dead: Vec<u64> = s
-                                                .hover_flyout_shapes
-                                                .iter()
-                                                .filter_map(|(&k, (w, _, _))| {
-                                                    let wr = w.as_ptr().cast::<RawIWeakReference>();
-                                                    let mut resolved = ComRaw::null();
-                                                    let alive = ((*(*wr).lp_vtbl).resolve)(
-                                                        w.as_ptr(),
-                                                        &IID_IINSPECTABLE,
-                                                        &mut resolved.0,
-                                                    )
-                                                    .is_ok()
-                                                        && !resolved.is_null();
-                                                    (!alive).then_some(k)
-                                                })
-                                                .collect();
-                                            for dk in dead {
-                                                s.hover_flyout_shapes.remove(&dk);
-                                            }
-                                        }
-                                        s.hover_flyout_shapes
-                                            .insert(key, (weak_ref, orig_op, orig_vis));
+                                    if let std::collections::hash_map::Entry::Vacant(e) =
+                                        s.hover_flyout_shapes.entry(key)
+                                    {
+                                        e.insert((weak_ref, orig_op, orig_vis));
                                         return None;
                                     }
                                 }
@@ -180,20 +214,24 @@ pub(in super::super) unsafe fn restore_all_hover_flyout_shapes_for_current_threa
 
 pub(super) unsafe fn apply_hover_flyout_border_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     desired_hide: bool,
 ) {
+    let key = com_identity_key(insp_ptr);
     let border_com = qi_interface(insp_ptr, &IID_IBORDER);
     let saved = if desired_hide {
+        track_general_modified_target(key, TargetKind::HoverFlyoutBorder, insp_ptr);
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        remove_general_modified_target(key);
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
     if !border_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBackground,
@@ -204,7 +242,7 @@ pub(super) unsafe fn apply_hover_flyout_border_appearance(
         );
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBrush,
@@ -216,7 +254,7 @@ pub(super) unsafe fn apply_hover_flyout_border_appearance(
     }
     sync_element_shadow_prop(
         rt,
-        handle,
+        key,
         insp_ptr,
         desired_hide,
         saved.shadow,
@@ -229,14 +267,14 @@ pub(super) unsafe fn apply_hover_flyout_border_appearance(
                 .fetch_or(DIAG_HOVER_FLYOUT_APPLIED, Ordering::Relaxed);
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::HoverFlyoutBorder,
                 BrushPropKind::BorderBackground,
                 insp_ptr,
             );
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::HoverFlyoutBorder,
                 BrushPropKind::BorderBrush,
                 insp_ptr,
@@ -244,7 +282,7 @@ pub(super) unsafe fn apply_hover_flyout_border_appearance(
         }
         ensure_prop_watch_registered(
             rt,
-            handle,
+            key,
             TargetKind::HoverFlyoutBorder,
             BrushPropKind::ElementShadow,
             insp_ptr,
@@ -254,22 +292,26 @@ pub(super) unsafe fn apply_hover_flyout_border_appearance(
 
 pub(super) unsafe fn apply_osd_panel_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     desired_hide: bool,
 ) {
+    let key = com_identity_key(insp_ptr);
     let panel_com = qi_interface(insp_ptr, &IID_IPANEL);
     let grid2_com = qi_interface(insp_ptr, &IID_IGRID2);
     let saved = if desired_hide {
+        track_general_modified_target(key, TargetKind::OsdPanel, insp_ptr);
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        remove_general_modified_target(key);
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
     let (target_bg, target_border) = rt.osd_target_colors();
     if !panel_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             panel_com.as_ptr(),
             BrushPropKind::PanelBackground,
@@ -282,7 +324,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
     if !grid2_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             grid2_com.as_ptr(),
             BrushPropKind::GridBorderBrush,
@@ -294,7 +336,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
     }
     sync_element_shadow_prop(
         rt,
-        handle,
+        key,
         insp_ptr,
         desired_hide,
         saved.shadow,
@@ -305,7 +347,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
         if !panel_com.is_null() {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::OsdPanel,
                 BrushPropKind::PanelBackground,
                 insp_ptr,
@@ -314,7 +356,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
         if !grid2_com.is_null() {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::OsdPanel,
                 BrushPropKind::GridBorderBrush,
                 insp_ptr,
@@ -322,7 +364,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
         }
         ensure_prop_watch_registered(
             rt,
-            handle,
+            key,
             TargetKind::OsdPanel,
             BrushPropKind::ElementShadow,
             insp_ptr,
@@ -333,7 +375,7 @@ pub(super) unsafe fn apply_osd_panel_appearance(
 
 pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     kind: TargetKind,
     desired_hide: bool,
@@ -341,18 +383,22 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
     if insp_ptr.is_null() {
         return;
     }
+    let key = com_identity_key(insp_ptr);
     let (target_bg, target_border) = rt.virtual_desktop_bar_target_colors();
     let saved = if desired_hide {
+        track_general_modified_target(key, kind, insp_ptr);
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        remove_general_modified_target(key);
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
 
     let border_com = qi_interface(insp_ptr, &IID_IBORDER);
     if !border_com.is_null() {
         let _ = sync_overflow_brush_prop_with_mode(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBackground,
@@ -364,7 +410,7 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
         );
         let _ = sync_overflow_brush_prop_with_mode(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBrush,
@@ -377,14 +423,14 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 kind,
                 BrushPropKind::BorderBackground,
                 insp_ptr,
             );
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 kind,
                 BrushPropKind::BorderBrush,
                 insp_ptr,
@@ -397,7 +443,7 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
     if !panel_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             panel_com.as_ptr(),
             BrushPropKind::PanelBackground,
@@ -409,7 +455,7 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 kind,
                 BrushPropKind::PanelBackground,
                 insp_ptr,
@@ -420,7 +466,7 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
     if !grid2_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             grid2_com.as_ptr(),
             BrushPropKind::GridBorderBrush,
@@ -432,7 +478,7 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 kind,
                 BrushPropKind::GridBorderBrush,
                 insp_ptr,
@@ -443,25 +489,29 @@ pub(super) unsafe fn apply_virtual_desktop_bar_appearance(
 
 pub(super) unsafe fn apply_input_switcher_panel_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     desired_hide: bool,
 ) {
     if insp_ptr.is_null() {
         return;
     }
+    let key = com_identity_key(insp_ptr);
     let (target_bg, target_border) = rt.input_switcher_target_colors();
     let saved = if desired_hide {
+        track_general_modified_target(key, TargetKind::InputSwitcherPanel, insp_ptr);
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        remove_general_modified_target(key);
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
 
     let border_com = qi_interface(insp_ptr, &IID_IBORDER);
     if !border_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBackground,
@@ -472,7 +522,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
         );
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBrush,
@@ -484,14 +534,14 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::InputSwitcherPanel,
                 BrushPropKind::BorderBackground,
                 insp_ptr,
             );
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::InputSwitcherPanel,
                 BrushPropKind::BorderBrush,
                 insp_ptr,
@@ -502,7 +552,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
         if !panel_com.is_null() {
             sync_overflow_brush_prop(
                 rt,
-                handle,
+                key,
                 insp_ptr,
                 panel_com.as_ptr(),
                 BrushPropKind::PanelBackground,
@@ -514,7 +564,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
             if desired_hide {
                 ensure_prop_watch_registered(
                     rt,
-                    handle,
+                    key,
                     TargetKind::InputSwitcherPanel,
                     BrushPropKind::PanelBackground,
                     insp_ptr,
@@ -525,7 +575,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
         if !grid2_com.is_null() {
             sync_overflow_brush_prop(
                 rt,
-                handle,
+                key,
                 insp_ptr,
                 grid2_com.as_ptr(),
                 BrushPropKind::GridBorderBrush,
@@ -537,7 +587,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
             if desired_hide {
                 ensure_prop_watch_registered(
                     rt,
-                    handle,
+                    key,
                     TargetKind::InputSwitcherPanel,
                     BrushPropKind::GridBorderBrush,
                     insp_ptr,
@@ -548,7 +598,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
 
     sync_element_shadow_prop(
         rt,
-        handle,
+        key,
         insp_ptr,
         desired_hide,
         saved.shadow,
@@ -558,7 +608,7 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
     if desired_hide {
         ensure_prop_watch_registered(
             rt,
-            handle,
+            key,
             TargetKind::InputSwitcherPanel,
             BrushPropKind::ElementShadow,
             insp_ptr,
@@ -568,23 +618,27 @@ pub(super) unsafe fn apply_input_switcher_panel_appearance(
 
 pub(super) unsafe fn apply_input_switcher_sub_panel_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     desired_hide: bool,
 ) {
     if insp_ptr.is_null() {
         return;
     }
+    let key = com_identity_key(insp_ptr);
     let saved = if desired_hide {
+        track_general_modified_target(key, TargetKind::InputSwitcherSubPanel, insp_ptr);
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        remove_general_modified_target(key);
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
     let border_com = qi_interface(insp_ptr, &IID_IBORDER);
     if !border_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             border_com.as_ptr(),
             BrushPropKind::BorderBackground,
@@ -596,7 +650,7 @@ pub(super) unsafe fn apply_input_switcher_sub_panel_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::InputSwitcherSubPanel,
                 BrushPropKind::BorderBackground,
                 insp_ptr,
@@ -608,7 +662,7 @@ pub(super) unsafe fn apply_input_switcher_sub_panel_appearance(
     if !panel_com.is_null() {
         sync_overflow_brush_prop(
             rt,
-            handle,
+            key,
             insp_ptr,
             panel_com.as_ptr(),
             BrushPropKind::PanelBackground,
@@ -620,7 +674,7 @@ pub(super) unsafe fn apply_input_switcher_sub_panel_appearance(
         if desired_hide {
             ensure_prop_watch_registered(
                 rt,
-                handle,
+                key,
                 TargetKind::InputSwitcherSubPanel,
                 BrushPropKind::PanelBackground,
                 insp_ptr,

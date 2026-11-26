@@ -1,5 +1,6 @@
 use super::TrayMenuInner;
 use super::super::layout::TrayMenuItem;
+use crate::deskbox::{BoxViewMode, DeskBoxTrayAction};
 use crate::taskbar::TaskbarStyle;
 use crate::ui::glass::draw_music_note_icon;
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D_POINT_2F, D2D_RECT_F, D2D_SIZE_F};
@@ -48,6 +49,22 @@ impl TrayMenuInner {
                 ];
                 for seg in pts.windows(2) {
                     self.rt.DrawLine(seg[0], seg[1], brush, 1.35 * s, stroke);
+                }
+            }
+            TrayMenuItem::DeskBox => {
+                // Clean 2x2 rounded bento grid representing desktop organizer boxes
+                for (dx, dy) in [(-2.6, -2.6), (2.6, -2.6), (-2.6, 2.6), (2.6, 2.6)] {
+                    let tile = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: cx + (dx - 1.9) * s,
+                            top: cy + (dy - 1.9) * s,
+                            right: cx + (dx + 1.9) * s,
+                            bottom: cy + (dy + 1.9) * s,
+                        },
+                        radiusX: 1.0 * s,
+                        radiusY: 1.0 * s,
+                    };
+                    self.rt.DrawRoundedRectangle(&tile, brush, 1.2 * s, stroke);
                 }
             }
             TrayMenuItem::TaskbarStyle => {
@@ -368,6 +385,277 @@ impl TrayMenuInner {
                     },
                     brush,
                 );
+            }
+        }
+    }
+
+    pub(super) unsafe fn draw_deskbox_action_icon(
+        &self,
+        action: DeskBoxTrayAction,
+        cx: f32,
+        cy: f32,
+        s: f32,
+        brush: &ID2D1SolidColorBrush,
+    ) {
+        let stroke = self.round_stroke.as_ref();
+        match action {
+            DeskBoxTrayAction::ToggleEnabled => {
+                let frame = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cx - 4.8 * s,
+                        top: cy - 4.4 * s,
+                        right: cx + 4.8 * s,
+                        bottom: cy + 4.4 * s,
+                    },
+                    radiusX: 1.8 * s,
+                    radiusY: 1.8 * s,
+                };
+                self.rt.DrawRoundedRectangle(&frame, brush, 1.25 * s, stroke);
+                self.rt.DrawLine(
+                    D2D_POINT_2F {
+                        x: cx - 2.3 * s,
+                        y: cy + 0.2 * s,
+                    },
+                    D2D_POINT_2F {
+                        x: cx - 0.5 * s,
+                        y: cy + 2.0 * s,
+                    },
+                    brush,
+                    1.3 * s,
+                    stroke,
+                );
+                self.rt.DrawLine(
+                    D2D_POINT_2F {
+                        x: cx - 0.5 * s,
+                        y: cy + 2.0 * s,
+                    },
+                    D2D_POINT_2F {
+                        x: cx + 2.6 * s,
+                        y: cy - 1.6 * s,
+                    },
+                    brush,
+                    1.3 * s,
+                    stroke,
+                );
+            }
+            DeskBoxTrayAction::ToggleHideDesktopIcons => {
+                for (dx, dy) in [(-2.4, -2.4), (2.4, -2.4), (-2.4, 2.4), (2.4, 2.4)] {
+                    let sq = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: cx + (dx - 1.3) * s,
+                            top: cy + (dy - 1.3) * s,
+                            right: cx + (dx + 1.3) * s,
+                            bottom: cy + (dy + 1.3) * s,
+                        },
+                        radiusX: 0.6 * s,
+                        radiusY: 0.6 * s,
+                    };
+                    self.rt.FillRoundedRectangle(&sq, brush);
+                }
+                self.rt.DrawLine(
+                    D2D_POINT_2F {
+                        x: cx - 5.0 * s,
+                        y: cy - 4.2 * s,
+                    },
+                    D2D_POINT_2F {
+                        x: cx + 5.0 * s,
+                        y: cy + 4.2 * s,
+                    },
+                    brush,
+                    1.35 * s,
+                    stroke,
+                );
+            }
+            DeskBoxTrayAction::AutoFitAll => {
+                // Four corner brackets representing auto-fit frame sizing
+                let d = 4.6 * s;
+                let arm = 2.6 * s;
+                for (sx, sy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let x0 = cx + sx * d;
+                    let y0 = cy + sy * d;
+                    self.rt.DrawLine(
+                        D2D_POINT_2F { x: x0, y: y0 },
+                        D2D_POINT_2F {
+                            x: x0 - sx * arm,
+                            y: y0,
+                        },
+                        brush,
+                        1.3 * s,
+                        stroke,
+                    );
+                    self.rt.DrawLine(
+                        D2D_POINT_2F { x: x0, y: y0 },
+                        D2D_POINT_2F {
+                            x: x0,
+                            y: y0 - sy * arm,
+                        },
+                        brush,
+                        1.3 * s,
+                        stroke,
+                    );
+                }
+            }
+            DeskBoxTrayAction::LockAll | DeskBoxTrayAction::UnlockAll => {
+                // Identical centered lock body + keyhole dot for both actions; only the shackle
+                // state differs (closed arch vs. same-radius arch swung open around its right pivot).
+                let closed = matches!(action, DeskBoxTrayAction::LockAll);
+                let body = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: cx - 3.9 * s,
+                        top: cy - 0.3 * s,
+                        right: cx + 3.9 * s,
+                        bottom: cy + 5.0 * s,
+                    },
+                    radiusX: 1.4 * s,
+                    radiusY: 1.4 * s,
+                };
+                self.rt.DrawRoundedRectangle(&body, brush, 1.25 * s, stroke);
+                self.rt.FillEllipse(
+                    &windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                        point: D2D_POINT_2F {
+                            x: cx,
+                            y: cy + 2.35 * s,
+                        },
+                        radiusX: 1.0 * s,
+                        radiusY: 1.0 * s,
+                    },
+                    brush,
+                );
+                if let Ok(shackle) = self.d2d_factory.CreatePathGeometry() {
+                    if let Ok(sink) = shackle.Open() {
+                        let r = 2.15 * s;
+                        let body_top = cy - 0.3 * s;
+                        let arch_y = cy - 2.85 * s;
+                        if closed {
+                            sink.BeginFigure(
+                                D2D_POINT_2F {
+                                    x: cx - r,
+                                    y: body_top,
+                                },
+                                D2D1_FIGURE_BEGIN_HOLLOW,
+                            );
+                            sink.AddLine(D2D_POINT_2F {
+                                x: cx - r,
+                                y: arch_y,
+                            });
+                            sink.AddArc(&D2D1_ARC_SEGMENT {
+                                point: D2D_POINT_2F {
+                                    x: cx + r,
+                                    y: arch_y,
+                                },
+                                size: D2D_SIZE_F {
+                                    width: r,
+                                    height: r,
+                                },
+                                rotationAngle: 0.0,
+                                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                arcSize: windows::Win32::Graphics::Direct2D::D2D1_ARC_SIZE_SMALL,
+                            });
+                            sink.AddLine(D2D_POINT_2F {
+                                x: cx + r,
+                                y: body_top,
+                            });
+                        } else {
+                            let pivot_x = cx + r;
+                            let outer_x = pivot_x + r * 2.0;
+                            sink.BeginFigure(
+                                D2D_POINT_2F {
+                                    x: pivot_x,
+                                    y: body_top,
+                                },
+                                D2D1_FIGURE_BEGIN_HOLLOW,
+                            );
+                            sink.AddLine(D2D_POINT_2F {
+                                x: pivot_x,
+                                y: arch_y,
+                            });
+                            sink.AddArc(&D2D1_ARC_SEGMENT {
+                                point: D2D_POINT_2F {
+                                    x: outer_x,
+                                    y: arch_y,
+                                },
+                                size: D2D_SIZE_F {
+                                    width: r,
+                                    height: r,
+                                },
+                                rotationAngle: 0.0,
+                                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                                arcSize: windows::Win32::Graphics::Direct2D::D2D1_ARC_SIZE_SMALL,
+                            });
+                            sink.AddLine(D2D_POINT_2F {
+                                x: outer_x,
+                                y: cy - 1.5 * s,
+                            });
+                        }
+                        sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                        let _ = sink.Close();
+                        self.rt.DrawGeometry(&shackle, brush, 1.25 * s, stroke);
+                    }
+                }
+            }
+            DeskBoxTrayAction::SetDefaultView(BoxViewMode::LargeIcons) => {
+                for (dx, dy) in [(-2.6, -2.6), (2.6, -2.6), (-2.6, 2.6), (2.6, 2.6)] {
+                    let sq = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: cx + (dx - 1.9) * s,
+                            top: cy + (dy - 1.9) * s,
+                            right: cx + (dx + 1.9) * s,
+                            bottom: cy + (dy + 1.9) * s,
+                        },
+                        radiusX: 0.9 * s,
+                        radiusY: 0.9 * s,
+                    };
+                    self.rt.DrawRoundedRectangle(&sq, brush, 1.2 * s, stroke);
+                }
+            }
+            DeskBoxTrayAction::SetDefaultView(BoxViewMode::MediumIcons) => {
+                for (dx, dy) in [(-2.6, -2.6), (2.6, -2.6), (-2.6, 2.6), (2.6, 2.6)] {
+                    let sq = D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: cx + (dx - 1.45) * s,
+                            top: cy + (dy - 1.45) * s,
+                            right: cx + (dx + 1.45) * s,
+                            bottom: cy + (dy + 1.45) * s,
+                        },
+                        radiusX: 0.7 * s,
+                        radiusY: 0.7 * s,
+                    };
+                    self.rt.FillRoundedRectangle(&sq, brush);
+                }
+            }
+            DeskBoxTrayAction::SetDefaultView(BoxViewMode::SmallIcons) => {
+                for dy in [-3.2, 0.0, 3.2] {
+                    for dx in [-3.2, 0.0, 3.2] {
+                        let dot = D2D1_ROUNDED_RECT {
+                            rect: D2D_RECT_F {
+                                left: cx + (dx - 0.95) * s,
+                                top: cy + (dy - 0.95) * s,
+                                right: cx + (dx + 0.95) * s,
+                                bottom: cy + (dy + 0.95) * s,
+                            },
+                            radiusX: 0.5 * s,
+                            radiusY: 0.5 * s,
+                        };
+                        self.rt.FillRoundedRectangle(&dot, brush);
+                    }
+                }
+            }
+            DeskBoxTrayAction::SetDefaultView(BoxViewMode::CompactList) => {
+                for dy in [-3.1, 0.0, 3.1] {
+                    self.rt.DrawLine(
+                        D2D_POINT_2F {
+                            x: cx - 4.6 * s,
+                            y: cy + dy * s,
+                        },
+                        D2D_POINT_2F {
+                            x: cx + 4.6 * s,
+                            y: cy + dy * s,
+                        },
+                        brush,
+                        1.35 * s,
+                        stroke,
+                    );
+                }
             }
         }
     }

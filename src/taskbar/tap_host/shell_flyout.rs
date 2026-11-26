@@ -1178,7 +1178,7 @@ fn run_shell_flyout_worker(shared: Arc<(Mutex<ShellFlyoutWorkerShared>, OwnedEve
         if stop_worker {
             if let ShellFlyoutPipeState::Connected { pipe, .. } = pipe_state {
                 unsafe {
-                    let _ = pipe_send_simple(pipe, io_event, CMD_RESTORE, 120);
+                    let _ = pipe_send_simple(pipe, io_event, CMD_RESTORE, 300);
                 }
             }
             close_pipe_state(&mut pipe_state, lock, None);
@@ -1215,7 +1215,7 @@ fn run_shell_flyout_worker(shared: Arc<(Mutex<ShellFlyoutWorkerShared>, OwnedEve
             {
                 if synced_hide != Some(false) {
                     unsafe {
-                        let _ = pipe_send_simple(pipe, io_event, CMD_RESTORE, 150);
+                        let _ = pipe_send_simple(pipe, io_event, CMD_RESTORE, 300);
                     }
                 }
             }

@@ -692,6 +692,9 @@ impl MonitorPopupInner {
                 0
             }
         };
+        if desired == POPUP_ANIM_INTERVAL_MS {
+            crate::ui::notify_interactive_anim_frame();
+        }
         if desired != self.timer_interval_ms {
             let prev = self.timer_interval_ms;
             self.timer_interval_ms = desired;

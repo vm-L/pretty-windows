@@ -126,6 +126,25 @@ pub unsafe fn draw_divider(
     }
 }
 
+/// Measures the unconstrained single-line width (physical px) of `text` using DirectWrite.
+pub unsafe fn measure_text_width(
+    dwrite_factory: &IDWriteFactory,
+    text: &str,
+    fmt: &IDWriteTextFormat,
+    height_px: f32,
+) -> Option<f32> {
+    if text.is_empty() {
+        return Some(0.0);
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let layout = dwrite_factory
+        .CreateTextLayout(&wide, fmt, 4096.0, height_px.max(12.0))
+        .ok()?;
+    let mut metrics = DWRITE_TEXT_METRICS::default();
+    layout.GetMetrics(&mut metrics).ok()?;
+    Some(metrics.widthIncludingTrailingWhitespace.max(metrics.width).max(0.0))
+}
+
 /// Draws single-line clipped DirectWrite text inside `rect` and returns the measured width (clamped to `rect.width()`).
 pub unsafe fn draw_text_in_rect_measured(
     dwrite_factory: &IDWriteFactory,

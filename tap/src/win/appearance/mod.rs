@@ -44,6 +44,7 @@ unsafe fn read_orig_shadow(
     unset_val: Option<&ComRaw>,
     current_shadow: &ComRaw,
 ) -> Option<SavedBrush> {
+    let effective_cur = (!current_shadow.is_null()).then(|| current_shadow.clone_ref());
     if let (Some(dp_com), Some(unset_com)) = (dp, unset_val) {
         let dep_com = qi_interface(insp_ptr, &IID_IDEPENDENCYOBJECT);
         if !dep_com.is_null() {
@@ -58,16 +59,16 @@ unsafe fn read_orig_shadow(
                 && !local_val.is_null()
             {
                 if com_same_identity(local_val.as_ptr(), unset_com.as_ptr()) {
-                    return Some(SavedBrush::Unset);
+                    return Some(SavedBrush::Unset(effective_cur));
                 }
                 return Some(SavedBrush::Local(local_val));
             }
         }
     }
-    if !current_shadow.is_null() {
-        Some(SavedBrush::Local(current_shadow.clone_ref()))
+    if let Some(cur) = effective_cur {
+        Some(SavedBrush::Local(cur))
     } else {
-        Some(SavedBrush::Unset)
+        Some(SavedBrush::Unset(None))
     }
 }
 
@@ -122,17 +123,35 @@ pub(super) unsafe fn sync_element_shadow_prop(
             Some(SavedBrush::Local(orig)) => {
                 let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), orig.as_ptr());
             }
-            Some(SavedBrush::Unset) => {
+            Some(SavedBrush::Unset(orig_cur)) => {
                 let dp = BrushPropKind::ElementShadow.dependency_property();
-                if !clear_dp_value(insp_ptr, dp.as_ref()) {
+                let cleared = clear_dp_value(insp_ptr, dp.as_ref());
+                if let Some(orig) = orig_cur {
+                    let mut after = ComRaw::null();
+                    let restored_ok = cleared
+                        && ((*(*ui10).lp_vtbl).get_shadow)(ui10_com.as_ptr(), &mut after.0).is_ok()
+                        && !after.is_null();
+                    if !restored_ok {
+                        let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), orig.as_ptr());
+                    }
+                } else if !cleared {
                     let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), null_mut());
                 }
             }
             None => {
                 if !prefer_local_on_non_null {
-                    let dp = BrushPropKind::ElementShadow.dependency_property();
-                    if !clear_dp_value(insp_ptr, dp.as_ref()) {
-                        let _ = ((*(*ui10).lp_vtbl).put_shadow)(ui10_com.as_ptr(), null_mut());
+                    // Only clear a local null override if the element currently lacks a shadow;
+                    // never strip an intact native ThemeShadow that TAP never saved/modified.
+                    let mut cur_shadow = ComRaw::null();
+                    let is_nulled = ((*(*ui10).lp_vtbl).get_shadow)(
+                        ui10_com.as_ptr(),
+                        &mut cur_shadow.0,
+                    )
+                    .is_ok()
+                        && cur_shadow.is_null();
+                    if is_nulled {
+                        let dp = BrushPropKind::ElementShadow.dependency_property();
+                        let _ = clear_dp_value(insp_ptr, dp.as_ref());
                     }
                 }
             }
@@ -164,8 +183,12 @@ pub(super) unsafe fn sync_overflow_brush_prop_with_mode(
         let Some(tb) = cached_solid_brush(target_color) else {
             return false;
         };
-        let captured = if !has_saved_brush_slot(handle, prop.brush_slot()) {
-            if prefer_local_on_non_null && !cur.is_null() {
+        let is_genuine_native = !cur.is_null()
+            && !is_transparent_solid_brush(cur.as_ptr())
+            && !is_cached_tap_brush(cur.as_ptr());
+        let had_saved = has_saved_brush_slot(handle, prop.brush_slot());
+        let captured = if !had_saved {
+            if prefer_local_on_non_null && is_genuine_native {
                 Some(SavedBrush::Local(cur.clone_ref()))
             } else {
                 let dp = prop.dependency_property();
@@ -179,6 +202,7 @@ pub(super) unsafe fn sync_overflow_brush_prop_with_mode(
         } else {
             None
         };
+        let updated_native = (had_saved && is_genuine_native).then(|| cur.clone_ref());
         let put_ok = {
             let _sync_guard = PropSyncGuard::enter();
             prop.put(iface, tb.as_ptr()).is_ok()
@@ -186,6 +210,8 @@ pub(super) unsafe fn sync_overflow_brush_prop_with_mode(
         if put_ok {
             if let Some(orig) = captured {
                 save_brush_slot_if_absent(handle, prop.brush_slot(), orig);
+            } else if let Some(latest) = updated_native {
+                update_saved_brush_with_latest_native(handle, prop.brush_slot(), latest);
             }
             rt.diag_flags.fetch_or(applied_flag, Ordering::Relaxed);
             return true;
@@ -198,22 +224,35 @@ pub(super) unsafe fn sync_overflow_brush_prop_with_mode(
                 let _ = prop.put(iface, orig.as_ptr());
                 true
             }
-            Some(SavedBrush::Unset) => {
+            Some(SavedBrush::Unset(orig_cur)) => {
                 let dp = prop.dependency_property();
-                if !clear_dp_value(insp_ptr, dp.as_ref()) {
+                let cleared = clear_dp_value(insp_ptr, dp.as_ref());
+                if let Some(orig) = orig_cur {
+                    // Respect any genuine live theme/style brush restored by `ClearValue` so a
+                    // Light/Dark or accent switch while TAP was active is not overwritten with a
+                    // stale pre-switch brush. Fall back to `orig` only if `ClearValue` failed or
+                    // left a null/transparent/TAP brush.
+                    let restored_ok = if cleared {
+                        let (hr_after, after) = prop.get(iface);
+                        hr_after.is_ok()
+                            && !after.is_null()
+                            && !is_transparent_solid_brush(after.as_ptr())
+                            && !is_cached_tap_brush(after.as_ptr())
+                    } else {
+                        false
+                    };
+                    if !restored_ok {
+                        let _ = prop.put(iface, orig.as_ptr());
+                    }
+                } else if !cleared {
                     let _ = prop.put(iface, null_mut());
                 }
                 true
             }
             None => {
-                if prefer_local_on_non_null {
-                    return false;
-                }
                 let (hr_get, cur) = prop.get(iface);
-                if hr_get.is_ok()
-                    && (is_transparent_solid_brush(cur.as_ptr())
-                        || is_solid_brush_with_color(cur.as_ptr(), target_color))
-                {
+                let is_our_brush = hr_get.is_ok() && is_cached_tap_brush(cur.as_ptr());
+                if is_our_brush {
                     let dp = prop.dependency_property();
                     if !clear_dp_value(insp_ptr, dp.as_ref()) {
                         let _ = prop.put(iface, null_mut());
@@ -263,12 +302,19 @@ pub(super) unsafe fn apply_shape_appearance(
     if insp_ptr.is_null() {
         return;
     }
+    let key = com_identity_key(insp_ptr);
+    let (eff_orig_opacity, eff_orig_visibility) = if desired_hide {
+        track_modified_shape(key, insp_ptr, orig_opacity, orig_visibility);
+        (orig_opacity, orig_visibility)
+    } else {
+        remove_modified_shape(key).unwrap_or((orig_opacity, orig_visibility))
+    };
     let ui_elem = qi_interface(insp_ptr, &IID_IUIELEMENT);
     if ui_elem.is_null() {
         return;
     }
     let ui = ui_elem.as_ptr().cast::<RawIUIElement>();
-    let target_op = if desired_hide { 0.0 } else { orig_opacity };
+    let target_op = if desired_hide { 0.0 } else { eff_orig_opacity };
     let mut current_val = -1.0f64;
     let hr_get = ((*(*ui).lp_vtbl).get_opacity)(ui_elem.as_ptr(), &mut current_val);
     if hr_get.is_err() || (current_val - target_op).abs() > 0.001 {
@@ -279,13 +325,50 @@ pub(super) unsafe fn apply_shape_appearance(
     let target_vis = if desired_hide {
         VISIBILITY_COLLAPSED
     } else {
-        orig_visibility
+        eff_orig_visibility
     };
     let mut current_vis = -1i32;
     let hr_gv = ((*(*ui).lp_vtbl).get_visibility)(ui_elem.as_ptr(), &mut current_vis);
     if hr_gv.is_err() || current_vis != target_vis {
         let hr_vis = ((*(*ui).lp_vtbl).put_visibility)(ui_elem.as_ptr(), target_vis);
         rt.last_put_visibility_hr.store(hr_vis.0, Ordering::Release);
+    }
+}
+
+pub(super) unsafe fn restore_all_general_targets_for_current_thread(rt: &Arc<TapRuntime>) {
+    let entries: Vec<(u64, TargetKind, ComRaw)> = UI_BRUSH_STORE.with(|cell| {
+        let Ok(mut s) = cell.try_borrow_mut() else {
+            return Vec::new();
+        };
+        s.general_modified_targets
+            .drain()
+            .map(|(k, (kind, weak_obj))| (k, kind, weak_obj))
+            .collect()
+    });
+    if entries.is_empty() {
+        return;
+    }
+    let mut keys = Vec::with_capacity(entries.len());
+    for (key, kind, weak_com) in entries {
+        keys.push(key);
+        if let Some(insp) = resolve_weak_inspectable(&weak_com) {
+            apply_target_appearance(rt, key, insp.as_ptr(), kind, false, 1.0, VISIBILITY_VISIBLE);
+        }
+    }
+    purge_saved_brushes_for_current_thread(&keys);
+}
+
+pub(super) unsafe fn restore_all_modified_shapes_for_current_thread(rt: &Arc<TapRuntime>) {
+    let entries: Vec<(ComRaw, f64, i32)> = UI_BRUSH_STORE.with(|cell| {
+        let Ok(mut s) = cell.try_borrow_mut() else {
+            return Vec::new();
+        };
+        s.modified_shapes.drain().map(|(_, entry)| entry).collect()
+    });
+    for (weak_com, orig_opacity, orig_visibility) in entries {
+        if let Some(insp) = resolve_weak_inspectable(&weak_com) {
+            apply_shape_appearance(rt, insp.as_ptr(), false, orig_opacity, orig_visibility);
+        }
     }
 }
 
@@ -570,6 +653,7 @@ pub(super) unsafe fn apply_target_appearance(
     if insp_ptr.is_null() {
         return;
     }
+    register_handle_identity(handle, com_identity_key(insp_ptr));
     match kind {
         TargetKind::ShapeElement => {
             apply_shape_appearance(rt, insp_ptr, desired_hide, orig_opacity, orig_visibility);
@@ -654,14 +738,18 @@ pub(super) unsafe fn apply_target_appearance(
             if panel_com.is_null() {
                 return;
             }
+            let key = com_identity_key(insp_ptr);
             let saved = if desired_hide {
+                track_general_modified_target(key, TargetKind::OverflowPanel, insp_ptr);
                 SavedTargetBrushes::default()
             } else {
-                take_saved_target_brushes(handle)
+                remove_general_modified_target(key);
+                unregister_watches_for_keys(&[key]);
+                take_saved_target_brushes(key)
             };
             sync_overflow_brush_prop(
                 rt,
-                handle,
+                key,
                 insp_ptr,
                 panel_com.as_ptr(),
                 BrushPropKind::PanelBackground,
@@ -673,7 +761,7 @@ pub(super) unsafe fn apply_target_appearance(
             if desired_hide {
                 ensure_prop_watch_registered(
                     rt,
-                    handle,
+                    key,
                     TargetKind::OverflowPanel,
                     BrushPropKind::PanelBackground,
                     insp_ptr,

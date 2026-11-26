@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORI
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use windows::Win32::System::Threading::{GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN};
-use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetTopWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowPos, GA_ROOT, GWL_EXSTYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT};
+use windows::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetDesktopWindow, GetForegroundWindow, GetShellWindow, GetTopWindow, GetWindow, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SetWindowPos, GA_ROOT, GWL_EXSTYLE, GWL_STYLE, GW_HWNDNEXT, GW_HWNDPREV, GW_OWNER, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, WS_CAPTION, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_THICKFRAME};
 
 /// Exempts a floating taskbar widget from Windows Aero Peek / Show Desktop fade.
 pub fn exclude_from_peek(hwnd: HWND) {
@@ -205,14 +205,33 @@ unsafe fn detect_fullscreen_on_monitor(anchor_hwnd: HWND) -> FullscreenActive {
         return FullscreenActive::None;
     }
 
-    let mut fg_rect = RECT::default();
-    if GetWindowRect(target, &mut fg_rect).is_err() {
+    // Ordinary maximized desktop windows (titled + resizable) can span `rcMonitor` when the
+    // Windows taskbar has auto-hide enabled; do not misclassify them as fullscreen.
+    let style = GetWindowLongW(target, GWL_STYLE) as u32;
+    let is_normal_maximized = IsZoomed(target).as_bool()
+        && (style & WS_CAPTION.0) == WS_CAPTION.0
+        && (style & WS_THICKFRAME.0) != 0;
+    if is_normal_maximized {
         return FullscreenActive::None;
     }
-    let covers_monitor = fg_rect.left <= mi.rcMonitor.left
-        && fg_rect.top <= mi.rcMonitor.top
-        && fg_rect.right >= mi.rcMonitor.right
-        && fg_rect.bottom >= mi.rcMonitor.bottom;
+
+    let mut fg_rect = RECT::default();
+    let got_dwm = DwmGetWindowAttribute(
+        target,
+        DWMWA_EXTENDED_FRAME_BOUNDS,
+        (&mut fg_rect as *mut RECT).cast(),
+        size_of::<RECT>() as u32,
+    )
+    .is_ok();
+    if !got_dwm && GetWindowRect(target, &mut fg_rect).is_err() {
+        return FullscreenActive::None;
+    }
+    // Allow ±1px rounding tolerance for borderless fullscreen games on fractional DPI scales
+    // (125%/150%/175%); ordinary maximized windows above a visible taskbar remain ~40-48px shorter.
+    let covers_monitor = fg_rect.left <= mi.rcMonitor.left + 1
+        && fg_rect.top <= mi.rcMonitor.top + 1
+        && fg_rect.right >= mi.rcMonitor.right - 1
+        && fg_rect.bottom >= mi.rcMonitor.bottom - 1;
     if covers_monitor {
         FullscreenActive::Window(target)
     } else {
@@ -232,6 +251,12 @@ pub fn is_exclusive_fullscreen_or_presentation() -> bool {
             state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE
         })
     }
+}
+
+/// Returns `true` when an exclusive fullscreen, presentation-mode, or borderless fullscreen
+/// (fullscreen-windowed) foreground window covers `anchor_hwnd`'s monitor.
+pub fn is_fullscreen_active_on_monitor(anchor_hwnd: HWND) -> bool {
+    unsafe { !matches!(detect_fullscreen_on_monitor(anchor_hwnd), FullscreenActive::None) }
 }
 
 /// Detects whether a genuine fullscreen/presentation window is currently occluding `taskbar_hwnd`.

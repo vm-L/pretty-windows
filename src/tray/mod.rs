@@ -10,10 +10,15 @@ pub use win::run;
 mod win {
     use super::layout::TrayClickFilter;
     use super::menu::{
-        TrayMenu, WM_APP_TRAY_EXIT, WM_APP_TRAY_MENU_CLOSED, WM_APP_TRAY_SET_TASKBAR_STYLE,
-        WM_APP_TRAY_TOGGLE_AUTOSTART, WM_APP_TRAY_TOGGLE_MEDIABAR, WM_APP_TRAY_TOGGLE_MONITORBAR,
+        DeskBoxMenuState, TrayMenu, WM_APP_TRAY_DESKBOX_ACTION, WM_APP_TRAY_EXIT,
+        WM_APP_TRAY_MENU_CLOSED, WM_APP_TRAY_SET_TASKBAR_STYLE, WM_APP_TRAY_TOGGLE_AUTOSTART,
+        WM_APP_TRAY_TOGGLE_MEDIABAR, WM_APP_TRAY_TOGGLE_MONITORBAR,
     };
     use crate::color::Rgb;
+    use crate::deskbox::{
+        pick_folder_for_new_portal, DeskBoxController, DeskBoxTrayAction,
+        HOST_CMD_NEW_FOLDER_PORTAL, WM_APP_DESKBOX_HOST_CMD, WM_APP_DESKBOX_ZORDER_SYNC,
+    };
     use crate::mediabar::config::{portable_config_path, Config};
     use crate::mediabar::MediaBarInstance;
     use crate::monitorbar::config::{
@@ -26,7 +31,7 @@ mod win {
         set_autostart_enabled, system_accent_color, OverflowEventHook,
     };
     use crate::taskbar::{TaskbarController, TaskbarStyle};
-    use crate::ui::POPUP_FLOW_INTERVAL_MS;
+    use crate::ui::{GlassSurfaceStyle, POPUP_FLOW_INTERVAL_MS};
     use std::cell::RefCell;
     use std::mem::size_of;
     use std::path::PathBuf;
@@ -88,12 +93,14 @@ mod win {
         mediabar: Option<MediaBarInstance>,
         monitorbar_config_path: PathBuf,
         monitorbar: Option<MonitorBarInstance>,
+        deskbox: DeskBoxController,
         taskbar: TaskbarController,
         taskbar_timer_ms: u32,
         overflow_hook: OverflowEventHook,
         menu: TrayMenu,
         started_at: Instant,
         click_filter: TrayClickFilter,
+        folder_picker_open: bool,
         cleaned_up: bool,
     }
 
@@ -108,6 +115,7 @@ mod win {
             }
             self.mediabar.take();
             self.monitorbar.take();
+            self.deskbox.shutdown_and_restore();
             crate::monitorbar::brightness::restore_software_gamma_on_exit();
             self.menu.hide();
             self.taskbar.restore_default_and_shutdown();
@@ -132,8 +140,6 @@ mod win {
                 let accent = system_accent_color();
                 let dpi = current_shell_dpi(hwnd);
                 let menu = TrayMenu::new(hwnd, d2d_factory.clone(), dwrite_factory.clone())?;
-                let (tray_icon, tray_icon_owned) = load_app_icon(tray_icon_size_for_dpi(dpi), false);
-                let _ = register_tray_icon(hwnd, tray_icon);
 
                 let config_path = portable_config_path();
                 let cfg = Config::load_from_path(&config_path);
@@ -164,6 +170,15 @@ mod win {
                 };
 
                 let mut taskbar = TaskbarController::new(d2d_factory.clone(), light_taskbar, accent);
+                let deskbox = DeskBoxController::new(
+                    hwnd,
+                    d2d_factory.clone(),
+                    dwrite_factory.clone(),
+                    GlassSurfaceStyle::from(taskbar.style()),
+                    light_taskbar,
+                )?;
+                let (tray_icon, tray_icon_owned) = load_app_icon(tray_icon_size_for_dpi(dpi), false);
+                let _ = register_tray_icon(hwnd, tray_icon);
                 taskbar.set_overlay_notify_target(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 let mut overflow_hook = OverflowEventHook::new(hwnd, WM_APP_TRAY_OVERFLOW_CHANGED);
                 overflow_hook.refresh_for_explorer_pid(taskbar.explorer_pid());
@@ -187,12 +202,14 @@ mod win {
                     mediabar,
                     monitorbar_config_path,
                     monitorbar,
+                    deskbox,
                     taskbar,
                     taskbar_timer_ms: 0,
                     overflow_hook,
                     menu,
                     started_at: Instant::now(),
                     click_filter: TrayClickFilter::default(),
+                    folder_picker_open: false,
                     cleaned_up: false,
                 };
                 host.sync_taskbar_timer();
@@ -201,9 +218,11 @@ mod win {
         }
 
         fn sync_taskbar_timer(&mut self) {
-            let desired = if !self.taskbar.needs_timer() {
+            let need_timer = self.taskbar.needs_timer() || self.deskbox.needs_timer();
+            let need_fast = self.taskbar.needs_fast_tick() || self.deskbox.needs_fast_tick();
+            let desired = if !need_timer {
                 0
-            } else if self.taskbar.needs_fast_tick() {
+            } else if need_fast {
                 POPUP_FLOW_INTERVAL_MS
             } else {
                 TASKBAR_STEADY_MAINTAIN_MS
@@ -229,13 +248,23 @@ mod win {
             self.monitorbar.is_some()
         }
 
+        fn deskbox_menu_state(&self) -> DeskBoxMenuState {
+            DeskBoxMenuState {
+                enabled: self.deskbox.is_enabled(),
+                hide_desktop_icons: self.deskbox.hide_desktop_icons(),
+                default_view_mode: self.deskbox.default_view_mode(),
+            }
+        }
+
         fn sync_menu_state(&mut self) {
             let mediabar_on = self.is_mediabar_enabled();
             let monitorbar_on = self.is_monitorbar_enabled();
+            let deskbox_state = self.deskbox_menu_state();
             let style = self.taskbar.style();
             self.menu.set_state(
                 mediabar_on,
                 monitorbar_on,
+                deskbox_state,
                 style,
                 is_autostart_enabled(),
             );
@@ -294,6 +323,9 @@ mod win {
 
         fn set_taskbar_style(&mut self, style: TaskbarStyle) {
             self.taskbar.set_style(style);
+            let effective_style = self.taskbar.style();
+            self.deskbox
+                .refresh_surface_style(GlassSurfaceStyle::from(effective_style));
             self.overflow_hook
                 .refresh_for_shell_experience_pid(self.taskbar.shell_experience_pid());
             self.overflow_hook
@@ -337,6 +369,7 @@ mod win {
                 accent,
                 self.is_mediabar_enabled(),
                 self.is_monitorbar_enabled(),
+                self.deskbox_menu_state(),
                 self.taskbar.style(),
                 is_autostart_enabled(),
             );
@@ -353,6 +386,7 @@ mod win {
             self.dpi = dpi;
             self.menu.set_system_theme(light, accent);
             self.taskbar.refresh_theme(light, accent);
+            self.deskbox.refresh_theme(light);
 
             if need_icon {
                 let (new_icon, new_owned) = load_app_icon(tray_icon_size_for_dpi(dpi), false);
@@ -371,6 +405,7 @@ mod win {
 
         fn re_register_tray_icon(&mut self) {
             let _ = register_tray_icon(self.hwnd, self.tray_icon);
+            self.deskbox.on_taskbar_created();
             let reverted = self.taskbar.on_taskbar_created();
             self.overflow_hook
                 .refresh_for_explorer_pid(self.taskbar.explorer_pid());
@@ -384,6 +419,9 @@ mod win {
                 .refresh_for_search_host_pid(self.taskbar.search_host_pid());
             self.sync_taskbar_timer();
             if reverted {
+                self.deskbox
+                    .refresh_surface_style(GlassSurfaceStyle::from(self.taskbar.style()));
+                self.sync_taskbar_timer();
                 self.sync_menu_state();
             }
         }
@@ -556,10 +594,82 @@ mod win {
                 }
                 LRESULT(0)
             }
+            WM_APP_TRAY_DESKBOX_ACTION => {
+                if let Some(action) = DeskBoxTrayAction::from_u8(wparam.0 as u8) {
+                    if let Ok(mut state) = rc.try_borrow_mut() {
+                        state.deskbox.handle_tray_action(action);
+                        state.sync_taskbar_timer();
+                        state.sync_menu_state();
+                    } else {
+                        let _ = PostMessageW(hwnd, msg, wparam, lparam);
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_APP_DESKBOX_HOST_CMD => {
+                let cmd = wparam.0;
+                let box_id = lparam.0 as u64;
+                if cmd == HOST_CMD_NEW_FOLDER_PORTAL {
+                    let can_open = if let Ok(mut state) = rc.try_borrow_mut() {
+                        if state.cleaned_up || state.folder_picker_open {
+                            false
+                        } else {
+                            state.folder_picker_open = true;
+                            state.menu.hide();
+                            true
+                        }
+                    } else {
+                        let _ = PostMessageW(hwnd, msg, wparam, lparam);
+                        false
+                    };
+                    if can_open {
+                        let picked = pick_folder_for_new_portal(hwnd);
+                        if let Ok(mut state) = rc.try_borrow_mut() {
+                            state.folder_picker_open = false;
+                            if !state.cleaned_up {
+                                if let Some(folder) = picked {
+                                    state.deskbox.create_folder_portal_box(folder);
+                                    state.sync_taskbar_timer();
+                                    state.sync_menu_state();
+                                }
+                            }
+                        }
+                    }
+                } else if let Ok(mut state) = rc.try_borrow_mut() {
+                    let need_picker = state.deskbox.handle_host_cmd(cmd, box_id);
+                    state.sync_taskbar_timer();
+                    state.sync_menu_state();
+                    if need_picker {
+                        let _ = PostMessageW(
+                            hwnd,
+                            WM_APP_DESKBOX_HOST_CMD,
+                            WPARAM(HOST_CMD_NEW_FOLDER_PORTAL),
+                            LPARAM(box_id as isize),
+                        );
+                    }
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
+                }
+                LRESULT(0)
+            }
+            WM_APP_DESKBOX_ZORDER_SYNC => {
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    state.deskbox.sync_zorder_now();
+                    state.sync_taskbar_timer();
+                } else {
+                    let _ = PostMessageW(hwnd, msg, wparam, lparam);
+                }
+                LRESULT(0)
+            }
             WM_TIMER => {
                 if wparam.0 == TIMER_TASKBAR_MAINTAIN_ID {
                     if let Ok(mut state) = rc.try_borrow_mut() {
-                        if state.taskbar.tick() {
+                        state.deskbox.tick();
+                        let deskbox_animating = state.deskbox.is_animating();
+                        if state.taskbar.tick(deskbox_animating) {
+                            let style = GlassSurfaceStyle::from(state.taskbar.style());
+                            state.deskbox.refresh_surface_style(style);
+                            state.sync_taskbar_timer();
                             state.sync_menu_state();
                         }
                         let explorer_pid = state.taskbar.cached_explorer_pid();
@@ -602,9 +712,20 @@ mod win {
                 LRESULT(0)
             }
             WM_APP_TRAY_MENU_CLOSED => LRESULT(0),
-            WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
+            WM_SETTINGCHANGE => {
                 if let Ok(mut state) = rc.try_borrow_mut() {
                     state.refresh_theme_and_icon();
+                    // SPI_SETWORKAREA (0x002F) fires on taskbar resize / auto-hide toggle.
+                    if wparam.0 == 0x002F {
+                        state.deskbox.on_display_change();
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_DISPLAYCHANGE => {
+                if let Ok(mut state) = rc.try_borrow_mut() {
+                    state.refresh_theme_and_icon();
+                    state.deskbox.on_display_change();
                 }
                 LRESULT(0)
             }

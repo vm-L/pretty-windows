@@ -32,8 +32,10 @@ pub const POPUP_ANIM_INTERVAL_MS: u32 = 10;
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const POPUP_FLOW_INTERVAL_MS: u32 = 33;
 /// Minimum interval between silk bitmap regenerations (ms).
+/// Kept slightly below 2× Windows' 15.625ms timer tick (`31.25ms`) so 33ms flow timers never
+/// alias and skip alternate frames.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const SILK_UPDATE_INTERVAL_MS: u64 = 32;
+pub const SILK_UPDATE_INTERVAL_MS: u64 = 28;
 /// Duration of the brisk retract-and-fade close animation (seconds).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const CLOSE_ANIM_DUR_S: f32 = 0.095;
@@ -52,6 +54,47 @@ pub const SUB_WIDTH_DAMPING: f32 = 46.0;
 /// Debounce window after closing a popup before re-opening on the same trigger (ms).
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const POPUP_REOPEN_DEBOUNCE_MS: u64 = 240;
+
+static UI_ANIM_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static FLOW_PHASE_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+static LAST_INTERACTIVE_ANIM_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Returns the process-wide monotonic liquid-silk phase (seconds since first query),
+/// keeping every DeskBox strictly phase-locked regardless of creation time or animation cadence.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub fn shared_liquid_flow_phase() -> f64 {
+    FLOW_PHASE_EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+}
+
+/// Records that a high-priority interactive UI animation (popup spring, submenu morph, box collapse/scroll)
+/// just rendered on the UI thread, allowing background silk/maintenance loops to yield temporarily.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub fn notify_interactive_anim_frame() {
+    let epoch = UI_ANIM_EPOCH.get_or_init(std::time::Instant::now);
+    let ms = (epoch.elapsed().as_millis() as u64).saturating_add(1);
+    LAST_INTERACTIVE_ANIM_MS.store(ms, std::sync::atomic::Ordering::Release);
+}
+
+/// Returns `true` when any interactive UI animation rendered within the last `grace_ms`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[inline]
+pub fn is_interactive_anim_active(grace_ms: u64) -> bool {
+    let last = LAST_INTERACTIVE_ANIM_MS.load(std::sync::atomic::Ordering::Acquire);
+    if last == 0 {
+        return false;
+    }
+    let Some(epoch) = UI_ANIM_EPOCH.get() else {
+        return false;
+    };
+    let now = (epoch.elapsed().as_millis() as u64).saturating_add(1);
+    now.saturating_sub(last) <= grace_ms
+}
 
 /// Mirror of taskbar visual style exposed in `crate::ui` so all popup surfaces harmonize with the taskbar
 /// without coupling `mediabar` / `monitorbar` to `taskbar`.
@@ -688,7 +731,7 @@ pub fn compute_halo_pair(base_accent_dark: Rgb, light_theme: bool) -> [Rgb; 2] {
 
 /// Evaluates three tonal domain-warped liquid silk light ribbons (primary, neighbor, and soft lifted highlight)
 /// with balanced clear-glass negative space.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(dead_code)]
 pub fn sample_liquid_silk_field(
     x: f32,
     y: f32,
@@ -756,6 +799,127 @@ pub fn sample_liquid_silk_field(
     let raw_t = w_sum.min(1.65);
     let alpha = (peak_a * (raw_t / (0.62 + 0.32 * raw_t))).clamp(0.0, peak_a);
     (r, g, b, alpha)
+}
+
+/// Fills `buf` (`SILK_W * SILK_H * 4` premultiplied BGRA bytes) using hoisted phase/axis invariants
+/// algebraically equivalent to per-pixel calls to [`sample_liquid_silk_field`].
+#[cfg_attr(not(windows), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn fill_liquid_silk_bgra(
+    buf: &mut [u8],
+    win_w: i32,
+    win_h: i32,
+    origin_left: f32,
+    origin_bottom: f32,
+    s: f32,
+    flow_phase: f64,
+    colors: &[(f32, f32, f32); 2],
+    light_glass: bool,
+) {
+    let expected_len = (SILK_W * SILK_H * 4) as usize;
+    if buf.len() < expected_len {
+        return;
+    }
+
+    let scale_len = (220.0 * s).max(1.0);
+    let phase = (flow_phase % 10_000.0) as f32;
+    let w = win_w.max(1) as f32;
+    let h = win_h.max(1) as f32;
+
+    // Hoist all phase-, axis-, and palette-only trigonometry/color constants outside the pixel loop.
+    let ang1 = 0.68 + 0.26 * (0.14 * phase).sin();
+    let (s1, c1_ang) = ang1.sin_cos();
+    let breathe1 = 0.84 + 0.16 * (0.37 * phase + 0.5).sin();
+
+    let ang2 = -0.82 + 0.22 * (0.11 * phase + 1.8).cos();
+    let (s2, c2_ang) = ang2.sin_cos();
+    let breathe2 = 0.82 + 0.18 * (0.29 * phase + 2.1).cos();
+
+    let ang3 = 0.18 + 0.18 * (0.09 * phase + 3.4).sin();
+    let (s3, c3_ang) = ang3.sin_cos();
+    let breathe3 = 0.78 + 0.22 * (0.23 * phase + 3.8).cos();
+
+    let (c0, c1) = (colors[0], colors[1]);
+    let lift = if light_glass { 0.52 } else { 0.42 };
+    let mid_r = (c0.0 + c1.0) * 0.5;
+    let mid_g = (c0.1 + c1.1) * 0.5;
+    let mid_b = (c0.2 + c1.2) * 0.5;
+    let c2 = (
+        mid_r + (1.0 - mid_r) * lift,
+        mid_g + (1.0 - mid_g) * lift,
+        mid_b + (1.0 - mid_b) * lift,
+    );
+    let peak_a = if light_glass { 0.21 } else { 0.27 };
+
+    const W_USIZE: usize = SILK_W as usize;
+    const H_USIZE: usize = SILK_H as usize;
+
+    let mut y_base = [0.0f32; H_USIZE];
+    let mut wx_y = [0.0f32; H_USIZE];
+    for (gy, (yb_out, wxy_out)) in y_base.iter_mut().zip(wx_y.iter_mut()).enumerate() {
+        let py = (((gy as f32) + 0.5) / (SILK_H as f32)) * h;
+        let y = (origin_bottom - py) / scale_len;
+        *yb_out = y;
+        *wxy_out =
+            0.28 * (2.1 * y + 0.29 * phase).sin() + 0.14 * (3.3 * y - 0.19 * phase + 1.3).cos();
+    }
+
+    let mut x_base = [0.0f32; W_USIZE];
+    let mut wy_x = [0.0f32; W_USIZE];
+    for (gx, (xb_out, wyx_out)) in x_base.iter_mut().zip(wy_x.iter_mut()).enumerate() {
+        let px = (((gx as f32) + 0.5) / (SILK_W as f32)) * w;
+        let x = (px - origin_left) / scale_len;
+        *xb_out = x;
+        *wyx_out =
+            0.26 * (1.9 * x - 0.23 * phase + 0.7).cos() + 0.13 * (3.1 * x + 0.31 * phase + 2.4).sin();
+    }
+
+    for (gy, (&yb, &wxy)) in y_base.iter().zip(wx_y.iter()).enumerate() {
+        let row_off = gy * W_USIZE * 4;
+        for (gx, (&xb, &wyx)) in x_base.iter().zip(wy_x.iter()).enumerate() {
+            let wx = xb + wxy;
+            let wy = yb + wyx;
+
+            let u1 = wx * c1_ang + wy * s1 - 0.19 * phase;
+            let v1 = -wx * s1 + wy * c1_ang;
+            let crest1 = (0.5 + 0.5 * (u1 * 5.0).sin()).powi(4);
+            let along1 = 0.48 + 0.52 * (0.5 + 0.5 * (v1 * 2.4 + 0.34 * phase).sin());
+            let w1 = crest1 * along1 * breathe1;
+
+            let u2 = wx * c2_ang + wy * s2 + 0.15 * phase + 1.9;
+            let v2 = -wx * s2 + wy * c2_ang;
+            let crest2 = (0.5 + 0.5 * (u2 * 4.4).sin()).powi(5);
+            let along2 = 0.42 + 0.58 * (0.5 + 0.5 * (v2 * 2.1 - 0.27 * phase + 2.2).cos());
+            let w2 = crest2 * along2 * breathe2 * 0.78;
+
+            let u3 = wx * c3_ang + wy * s3 - 0.12 * phase + 3.7;
+            let v3 = -wx * s3 + wy * c3_ang;
+            let crest3 = (0.5 + 0.5 * (u3 * 3.8).sin()).powi(6);
+            let along3 = 0.38 + 0.62 * (0.5 + 0.5 * (v3 * 1.9 + 0.22 * phase + 4.1).sin());
+            let w3 = crest3 * along3 * breathe3 * 0.66;
+
+            let w_sum = w1 + w2 + w3;
+            let idx = row_off + gx * 4;
+            if w_sum <= 1e-4 {
+                buf[idx] = 0;
+                buf[idx + 1] = 0;
+                buf[idx + 2] = 0;
+                buf[idx + 3] = 0;
+                continue;
+            }
+
+            let r = ((c0.0 * w1 + c1.0 * w2 + c2.0 * w3) / w_sum).clamp(0.0, 1.0);
+            let g = ((c0.1 * w1 + c1.1 * w2 + c2.1 * w3) / w_sum).clamp(0.0, 1.0);
+            let b = ((c0.2 * w1 + c1.2 * w2 + c2.2 * w3) / w_sum).clamp(0.0, 1.0);
+            let raw_t = w_sum.min(1.65);
+            let a = (peak_a * (raw_t / (0.62 + 0.32 * raw_t))).clamp(0.0, peak_a);
+
+            buf[idx] = (b * a * 255.0).round().clamp(0.0, 255.0) as u8;
+            buf[idx + 1] = (g * a * 255.0).round().clamp(0.0, 255.0) as u8;
+            buf[idx + 2] = (r * a * 255.0).round().clamp(0.0, 255.0) as u8;
+            buf[idx + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
 }
 
 /// Accumulates raw `WM_MOUSEWHEEL` deltas across precision touchpad ticks and returns signed list scroll steps.
@@ -1000,5 +1164,106 @@ mod tests {
         assert_eq!(accum, -40);
         assert_eq!(accumulate_wheel_scroll(&mut accum, -80), 1);
         assert_eq!(accum, 0);
+    }
+
+    #[test]
+    fn fill_liquid_silk_bgra_matches_per_pixel_reference() {
+        let colors = [(0.25, 0.65, 0.80), (0.55, 0.45, 0.85)];
+        let len = (SILK_W * SILK_H * 4) as usize;
+        let win_w = 340;
+        let win_h = 280;
+        let origin_left = 12.0f32;
+        let origin_bottom = 290.0f32;
+        let s = 1.25f32;
+        let flow_phase = 17.625f64;
+        let scale_len = (220.0 * s).max(1.0);
+        let phase = (flow_phase % 10_000.0) as f32;
+
+        for light_glass in [false, true] {
+            let mut fast = vec![0u8; len];
+            fill_liquid_silk_bgra(
+                &mut fast,
+                win_w,
+                win_h,
+                origin_left,
+                origin_bottom,
+                s,
+                flow_phase,
+                &colors,
+                light_glass,
+            );
+            let mut ref_buf = vec![0u8; len];
+            for gy in 0..SILK_H {
+                let py = (((gy as f32) + 0.5) / (SILK_H as f32)) * (win_h as f32);
+                let y = (origin_bottom - py) / scale_len;
+                for gx in 0..SILK_W {
+                    let px = (((gx as f32) + 0.5) / (SILK_W as f32)) * (win_w as f32);
+                    let x = (px - origin_left) / scale_len;
+                    let (r, g, b, a) =
+                        sample_liquid_silk_field(x, y, phase, &colors, light_glass);
+                    let idx = ((gy * SILK_W + gx) * 4) as usize;
+                    ref_buf[idx] = (b * a * 255.0).round().clamp(0.0, 255.0) as u8;
+                    ref_buf[idx + 1] = (g * a * 255.0).round().clamp(0.0, 255.0) as u8;
+                    ref_buf[idx + 2] = (r * a * 255.0).round().clamp(0.0, 255.0) as u8;
+                    ref_buf[idx + 3] = (a * 255.0).round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            for (i, (&f_px, &r_px)) in fast.iter().zip(ref_buf.iter()).enumerate() {
+                assert!(
+                    f_px.abs_diff(r_px) <= 1,
+                    "byte {i} mismatch (light={light_glass}): fast={f_px}, ref={r_px}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shared_flow_phase_is_monotonic_and_fixed_origin_silk_is_height_invariant() {
+        let p0 = shared_liquid_flow_phase();
+        let p1 = shared_liquid_flow_phase();
+        assert!(p0 >= 0.0 && p1 >= p0);
+
+        let colors = [(0.22, 0.58, 0.84), (0.48, 0.44, 0.86)];
+        let len = (SILK_W * SILK_H * 4) as usize;
+        let win_w = 240;
+        let s = 1.0f32;
+        let fixed_origin_bottom = 220.0 * s;
+        let phase = 42.5f64;
+
+        let mut short_buf = vec![0u8; len];
+        let mut tall_buf = vec![0u8; len];
+        fill_liquid_silk_bgra(
+            &mut short_buf,
+            win_w,
+            144, // 3 * SILK_H
+            0.0,
+            fixed_origin_bottom,
+            s,
+            phase,
+            &colors,
+            false,
+        );
+        fill_liquid_silk_bgra(
+            &mut tall_buf,
+            win_w,
+            240, // 5 * SILK_H
+            0.0,
+            fixed_origin_bottom,
+            s,
+            phase,
+            &colors,
+            false,
+        );
+
+        // Matched top offsets py = 7.5px, 22.5px, 37.5px -> identical BGRA pixels across heights.
+        for (gy_short, gy_tall) in [(2usize, 1usize), (7, 4), (12, 7)] {
+            let off_short = gy_short * (SILK_W as usize) * 4;
+            let off_tall = gy_tall * (SILK_W as usize) * 4;
+            assert_eq!(
+                &short_buf[off_short..off_short + (SILK_W as usize) * 4],
+                &tall_buf[off_tall..off_tall + (SILK_W as usize) * 4],
+                "silk diverged at matched top row pair ({gy_short}, {gy_tall})"
+            );
+        }
     }
 }

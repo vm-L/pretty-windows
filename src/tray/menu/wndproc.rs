@@ -1,5 +1,10 @@
-use super::{TrayMenuInner, TIMER_MENU_FLOW_ID, SHELL_DEACTIVATE_GRACE_MS, WM_MOUSELEAVE_MSG, WM_APP_TRAY_MENU_CLOSED, WM_APP_TRAY_TOGGLE_MEDIABAR, WM_APP_TRAY_TOGGLE_MONITORBAR, WM_APP_TRAY_SET_TASKBAR_STYLE, WM_APP_TRAY_TOGGLE_AUTOSTART, WM_APP_TRAY_EXIT};
-use super::super::layout::{TrayMenuHover, TrayMenuItem};
+use super::{
+    TrayMenuInner, SHELL_DEACTIVATE_GRACE_MS, TIMER_MENU_FLOW_ID, WM_APP_TRAY_DESKBOX_ACTION,
+    WM_APP_TRAY_EXIT, WM_APP_TRAY_MENU_CLOSED, WM_APP_TRAY_SET_TASKBAR_STYLE,
+    WM_APP_TRAY_TOGGLE_AUTOSTART, WM_APP_TRAY_TOGGLE_MEDIABAR, WM_APP_TRAY_TOGGLE_MONITORBAR,
+    WM_MOUSELEAVE_MSG,
+};
+use super::super::layout::{TrayMenuHover, TrayMenuItem, TraySubmenuKind};
 use crate::system::is_shell_or_flyout_window;
 use crate::ui::PopupAnimPhase;
 use std::cell::RefCell;
@@ -128,11 +133,18 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                 let x = ((lparam.0 & 0xFFFF) as i16) as f32;
                 let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
                 let layout = state.current_layout();
-                let next_hover = layout.hit_test(x, y, state.submenu_open);
+                let next_hover = layout.hit_test(x, y, state.active_submenu);
                 let sub_changed = match next_hover {
-                    Some(TrayMenuHover::Primary(TrayMenuItem::TaskbarStyle)) => state.open_submenu(),
+                    Some(TrayMenuHover::Primary(TrayMenuItem::DeskBox)) => {
+                        state.open_submenu(TraySubmenuKind::DeskBox)
+                    }
+                    Some(TrayMenuHover::Primary(TrayMenuItem::TaskbarStyle)) => {
+                        state.open_submenu(TraySubmenuKind::TaskbarStyle)
+                    }
                     Some(TrayMenuHover::Primary(_)) => state.close_submenu(),
-                    Some(TrayMenuHover::SubTaskbarStyle(_)) | None => false,
+                    Some(TrayMenuHover::SubDeskBox(_))
+                    | Some(TrayMenuHover::SubTaskbarStyle(_))
+                    | None => false,
                 };
                 if next_hover != state.hover || sub_changed {
                     state.hover = next_hover;
@@ -159,7 +171,7 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                 let x = ((lparam.0 & 0xFFFF) as i16) as f32;
                 let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
                 let layout = state.current_layout();
-                if !layout.visible_contains(x, y, state.submenu_open) {
+                if !layout.visible_contains(x, y, state.active_submenu) {
                     state.begin_close();
                 }
             }
@@ -173,7 +185,7 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                 let x = ((lparam.0 & 0xFFFF) as i16) as f32;
                 let y = (((lparam.0 >> 16) & 0xFFFF) as i16) as f32;
                 let layout = state.current_layout();
-                match layout.hit_test(x, y, state.submenu_open) {
+                match layout.hit_test(x, y, state.active_submenu) {
                     Some(TrayMenuHover::Primary(TrayMenuItem::MediaBar)) => {
                         state.mediabar_visible = !state.mediabar_visible;
                         let _ = PostMessageW(
@@ -196,10 +208,26 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                         state.begin_close();
                         None
                     }
-                    Some(TrayMenuHover::Primary(TrayMenuItem::TaskbarStyle)) => {
-                        if state.open_submenu() {
+                    Some(TrayMenuHover::Primary(TrayMenuItem::DeskBox)) => {
+                        if state.open_submenu(TraySubmenuKind::DeskBox) {
                             let _ = state.render();
                         }
+                        None
+                    }
+                    Some(TrayMenuHover::Primary(TrayMenuItem::TaskbarStyle)) => {
+                        if state.open_submenu(TraySubmenuKind::TaskbarStyle) {
+                            let _ = state.render();
+                        }
+                        None
+                    }
+                    Some(TrayMenuHover::SubDeskBox(action)) => {
+                        let _ = PostMessageW(
+                            state.host_hwnd,
+                            WM_APP_TRAY_DESKBOX_ACTION,
+                            WPARAM(action.to_u8() as usize),
+                            LPARAM(0),
+                        );
+                        state.begin_close();
                         None
                     }
                     Some(TrayMenuHover::SubTaskbarStyle(style)) => {
@@ -227,7 +255,7 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                     }
                     Some(TrayMenuHover::Primary(TrayMenuItem::Exit)) => Some(state.host_hwnd),
                     None => {
-                        if !layout.visible_contains(x, y, state.submenu_open) {
+                        if !layout.visible_contains(x, y, state.active_submenu) {
                             state.begin_close();
                         }
                         None
@@ -265,7 +293,7 @@ pub(super) unsafe extern "system" fn tray_menu_wnd_proc(
                     Some(false)
                 } else {
                     let layout = state.current_layout();
-                    Some(layout.visible_contains(pt.x as f32, pt.y as f32, state.submenu_open))
+                    Some(layout.visible_contains(pt.x as f32, pt.y as f32, state.active_submenu))
                 }
             } else {
                 None

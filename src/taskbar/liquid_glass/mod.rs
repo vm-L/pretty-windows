@@ -1,4 +1,3 @@
-mod composition;
 mod host_windows;
 mod renderer;
 
@@ -11,7 +10,6 @@ pub use host_windows::{
     find_visible_tooltip_host_window,
 };
 
-use composition::CompositionEngine;
 use host_windows::{find_visible_overflow_window, should_hide_backdrop_for_taskbar};
 use renderer::{
     render_layered_backdrop, render_shell_card_layered_backdrop, BAR_SILK_H, BAR_SILK_W,
@@ -28,7 +26,7 @@ use crate::system::{
     register_taskbar_backdrop, resolve_unified_accent, taskbar_backdrop_anchor,
     unregister_taskbar_backdrop, window_band,
 };
-use crate::ui::glass::{create_dc_render_target, LayeredSurface, PopupNoiseCache};
+use crate::ui::glass::{create_dc_render_target, CompositionEngine, LayeredSurface, PopupNoiseCache};
 use crate::ui::{compute_halo_pair, SILK_H, SILK_W};
 use std::collections::HashMap;
 use std::mem::size_of;

@@ -13,7 +13,7 @@ use super::super::TapRuntime;
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn apply_border_target_appearance(
     rt: &Arc<TapRuntime>,
-    handle: u64,
+    _handle: u64,
     insp_ptr: *mut c_void,
     kind: TargetKind,
     bg_color: RawUiColor,
@@ -25,14 +25,22 @@ pub(super) unsafe fn apply_border_target_appearance(
     if border_com.is_null() {
         return;
     }
+    let key = com_identity_key(insp_ptr);
     let saved = if desired_hide {
+        if kind != TargetKind::AltTabItemBorder {
+            track_general_modified_target(key, kind, insp_ptr);
+        }
         SavedTargetBrushes::default()
     } else {
-        take_saved_target_brushes(handle)
+        if kind != TargetKind::AltTabItemBorder {
+            remove_general_modified_target(key);
+        }
+        unregister_watches_for_keys(&[key]);
+        take_saved_target_brushes(key)
     };
     sync_overflow_brush_prop(
         rt,
-        handle,
+        key,
         insp_ptr,
         border_com.as_ptr(),
         BrushPropKind::BorderBackground,
@@ -43,7 +51,7 @@ pub(super) unsafe fn apply_border_target_appearance(
     );
     sync_overflow_brush_prop(
         rt,
-        handle,
+        key,
         insp_ptr,
         border_com.as_ptr(),
         BrushPropKind::BorderBrush,
@@ -56,14 +64,14 @@ pub(super) unsafe fn apply_border_target_appearance(
         rt.diag_flags.fetch_or(applied_flag, Ordering::Relaxed);
         ensure_prop_watch_registered(
             rt,
-            handle,
+            key,
             kind,
             BrushPropKind::BorderBackground,
             insp_ptr,
         );
         ensure_prop_watch_registered(
             rt,
-            handle,
+            key,
             kind,
             BrushPropKind::BorderBrush,
             insp_ptr,
@@ -178,6 +186,7 @@ pub(super) unsafe fn apply_focus_secondary_appearance(
             insp_ptr,
         );
     } else {
+        unregister_watches_for_keys(&[key]);
         let saved = take_saved_target_brushes(key);
         sync_focus_secondary_thickness_prop(rt, key, insp_ptr, false, true);
         sync_overflow_brush_prop(
@@ -672,7 +681,7 @@ pub(in super::super) unsafe fn sync_alttab_subtree_items(
             );
             if let Some(ref gp) = gp_com {
                 let gp_key = com_identity_key(gp.as_ptr());
-                if !is_alttab_subtarget_tracked(gp_key) {
+                if !is_alttab_subtarget_tracked_live(gp_key, gp.as_ptr()) {
                     apply_focus_secondary_appearance(rt, gp.as_ptr(), desired_hide);
                 }
             }

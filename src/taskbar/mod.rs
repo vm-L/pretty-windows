@@ -30,8 +30,7 @@ mod win {
         virtual_desktop_bar_colors, MAX_MENU_FLYOUT_SLOTS, MAX_SHELL_CARD_SLOTS,
     };
     use super::tap_host::{
-        find_search_host_pid, find_shell_experience_host_pid, find_shell_host_pid,
-        find_start_menu_pid, ShellFlyoutTapClient, TapClient,
+        find_shell_flyout_pids_in_session, ShellFlyoutTapClient, TapClient,
     };
     use crate::color::{Rgb, NEUTRAL_BACKDROP_FALLBACK};
     use crate::system::{
@@ -48,34 +47,22 @@ mod win {
     struct ShellFlyoutHostState {
         tap: ShellFlyoutTapClient,
         cached_pid: u32,
-        last_pid_scan: Option<Instant>,
         active: bool,
         last_query: Option<Instant>,
         last_sig: Vec<(isize, [i32; 4])>,
         suppressed: bool,
-        find_pid: fn() -> u32,
     }
 
     impl ShellFlyoutHostState {
-        fn new(tap: ShellFlyoutTapClient, find_pid: fn() -> u32) -> Self {
+        fn new(tap: ShellFlyoutTapClient) -> Self {
             Self {
                 tap,
                 cached_pid: 0,
-                last_pid_scan: None,
                 active: false,
                 last_query: None,
                 last_sig: Vec::new(),
                 suppressed: false,
-                find_pid,
             }
-        }
-
-        fn resolve_pid(&mut self, force: bool) -> u32 {
-            if force || self.last_pid_scan.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
-                self.cached_pid = (self.find_pid)();
-                self.last_pid_scan = Some(Instant::now());
-            }
-            self.cached_pid
         }
 
         fn reset_tracking(&mut self, clear_colors: bool) {
@@ -153,6 +140,7 @@ mod win {
         shell_host: ShellFlyoutHostState,
         start_menu_host: ShellFlyoutHostState,
         search_host: ShellFlyoutHostState,
+        last_shell_pid_scan: Option<Instant>,
     }
 
     impl TaskbarController {
@@ -199,20 +187,17 @@ mod win {
                 active_menu_flyout_hwnds: Vec::new(),
                 shell_exp_host: ShellFlyoutHostState::new(
                     ShellFlyoutTapClient::new_shell_experience(),
-                    find_shell_experience_host_pid,
                 ),
                 shell_host: ShellFlyoutHostState::new(
                     ShellFlyoutTapClient::new_shell_host(),
-                    find_shell_host_pid,
                 ),
                 start_menu_host: ShellFlyoutHostState::new(
                     ShellFlyoutTapClient::new_start_menu(),
-                    find_start_menu_pid,
                 ),
                 search_host: ShellFlyoutHostState::new(
                     ShellFlyoutTapClient::new_search_host(),
-                    find_search_host_pid,
                 ),
+                last_shell_pid_scan: None,
             };
             set_active_taskbar_surface_style(ctrl.style.into());
             if ctrl.style != TaskbarStyle::Default {
@@ -248,6 +233,22 @@ mod win {
 
         pub fn search_host_pid(&self) -> u32 {
             self.search_host.cached_pid
+        }
+
+        fn refresh_shell_host_pids(&mut self, force: bool) {
+            if force
+                || self
+                    .last_shell_pid_scan
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+            {
+                let [shell_exp_pid, shell_host_pid, start_menu_pid, search_host_pid] =
+                    find_shell_flyout_pids_in_session();
+                self.shell_exp_host.cached_pid = shell_exp_pid;
+                self.shell_host.cached_pid = shell_host_pid;
+                self.start_menu_host.cached_pid = start_menu_pid;
+                self.search_host.cached_pid = search_host_pid;
+                self.last_shell_pid_scan = Some(Instant::now());
+            }
         }
 
         pub fn set_overlay_notify_target(&mut self, hwnd: HWND, msg: u32) {
@@ -361,6 +362,7 @@ mod win {
             self.sync_menu_flyout_state(explorer_pid, &taskbar_tids);
             self.sync_tooltip_state(explorer_pid, &taskbar_tids);
             self.sync_input_switcher_state(explorer_pid, &taskbar_tids);
+            self.refresh_shell_host_pids(false);
             self.sync_shell_flyouts_state();
         }
 
@@ -398,10 +400,7 @@ mod win {
         /// Re-applies style after Explorer restarts; returns `true` if safety circuit breaker reverted to `Default`.
         pub fn on_taskbar_created(&mut self) -> bool {
             self.reset_overlay_tracking(0, true, false);
-            self.shell_exp_host.resolve_pid(true);
-            self.shell_host.resolve_pid(true);
-            self.start_menu_host.resolve_pid(true);
-            self.search_host.resolve_pid(true);
+            self.refresh_shell_host_pids(true);
             self.tap.set_virtual_desktop_bar_colors(0, None);
             let taskbars = enumerate_taskbar_windows();
             let current_pid = explorer_pid_from_taskbars(&taskbars);
@@ -419,7 +418,7 @@ mod win {
         }
 
         /// Periodic maintenance; returns `true` if safety circuit breaker reverted to `Default`.
-        pub fn tick(&mut self) -> bool {
+        pub fn tick(&mut self, defer_heavy_maintenance: bool) -> bool {
             if self.style == TaskbarStyle::Default {
                 return false;
             }
@@ -428,23 +427,25 @@ mod win {
             self.cached_explorer_pid = explorer_pid;
             let taskbar_tids = taskbar_thread_ids(&taskbars);
 
-            if self
-                .last_maintain
-                .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
+            if !defer_heavy_maintenance
+                && self
+                    .last_maintain
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
             {
                 self.tap.maintain(explorer_pid);
                 if self.tap.is_circuit_tripped() {
                     self.fallback_to_default_on_trip(&taskbars);
                     return true;
                 }
-                let shell_exp_pid = self.shell_exp_host.resolve_pid(false);
-                self.shell_exp_host.tap.maintain(shell_exp_pid);
-                let shell_host_pid = self.shell_host.resolve_pid(false);
-                self.shell_host.tap.maintain(shell_host_pid);
-                let start_menu_pid = self.start_menu_host.resolve_pid(false);
-                self.start_menu_host.tap.maintain(start_menu_pid);
-                let search_host_pid = self.search_host.resolve_pid(false);
-                self.search_host.tap.maintain(search_host_pid);
+                self.refresh_shell_host_pids(false);
+                self.shell_exp_host
+                    .tap
+                    .maintain(self.shell_exp_host.cached_pid);
+                self.shell_host.tap.maintain(self.shell_host.cached_pid);
+                self.start_menu_host
+                    .tap
+                    .maintain(self.start_menu_host.cached_pid);
+                self.search_host.tap.maintain(self.search_host.cached_pid);
                 let trans_now = is_transparency_enabled();
                 let trans_changed = trans_now != self.transparency_enabled;
                 if trans_changed {
@@ -459,7 +460,8 @@ mod win {
                 self.last_maintain = Some(Instant::now());
             }
 
-            if self.style == TaskbarStyle::LiquidGlass {
+            let anim_busy = crate::ui::is_interactive_anim_active(140);
+            if self.style == TaskbarStyle::LiquidGlass && !anim_busy {
                 self.glass.sync(&taskbars);
             }
             if self.glass.sync_overflow() && explorer_pid != 0 {
@@ -485,7 +487,7 @@ mod win {
             self.start_menu_host.tap.begin_shutdown();
             self.search_host.tap.begin_shutdown();
             self.tap.begin_shutdown();
-            let deadline = Instant::now() + Duration::from_millis(800);
+            let deadline = Instant::now() + Duration::from_millis(1200);
             self.shell_exp_host.tap.finish_shutdown(deadline);
             self.shell_host.tap.finish_shutdown(deadline);
             self.start_menu_host.tap.finish_shutdown(deadline);
@@ -1298,7 +1300,7 @@ mod win {
             host: &mut ShellFlyoutHostState,
             enumerate_windows: ShellFlyoutWindowEnumerator,
         ) -> Vec<(HWND, RECT, u32)> {
-            let pid = host.resolve_pid(false);
+            let pid = host.cached_pid;
             if style == TaskbarStyle::Default || pid == 0 || host.tap.is_circuit_tripped() {
                 if host.active {
                     host.active = false;
@@ -1498,10 +1500,11 @@ mod win {
             let taskbar_tids = taskbar_thread_ids(&taskbars);
 
             if self.style == TaskbarStyle::Default {
-                let shell_exp_pid = self.shell_exp_host.resolve_pid(false);
-                let shell_host_pid = self.shell_host.resolve_pid(false);
-                let start_menu_pid = self.start_menu_host.resolve_pid(false);
-                let search_host_pid = self.search_host.resolve_pid(false);
+                self.refresh_shell_host_pids(false);
+                let shell_exp_pid = self.shell_exp_host.cached_pid;
+                let shell_host_pid = self.shell_host.cached_pid;
+                let start_menu_pid = self.start_menu_host.cached_pid;
+                let search_host_pid = self.search_host.cached_pid;
                 self.reset_overlay_tracking(explorer_pid, false, true);
                 self.glass.set_style(TaskbarStyle::Default, &taskbars);
                 if update_tap {
@@ -1527,10 +1530,11 @@ mod win {
                 return;
             }
 
-            let shell_exp_pid = self.shell_exp_host.resolve_pid(true);
-            let shell_host_pid = self.shell_host.resolve_pid(true);
-            let start_menu_pid = self.start_menu_host.resolve_pid(true);
-            let search_host_pid = self.search_host.resolve_pid(true);
+            self.refresh_shell_host_pids(true);
+            let shell_exp_pid = self.shell_exp_host.cached_pid;
+            let shell_host_pid = self.shell_host.cached_pid;
+            let start_menu_pid = self.start_menu_host.cached_pid;
+            let search_host_pid = self.search_host.cached_pid;
             let item_colors = alt_tab_item_card_colors(self.style, self.light_glass)
                 .map(|c| (c.bg_argb, c.border_argb));
             self.tap.set_alt_tab_item_colors(explorer_pid, item_colors);

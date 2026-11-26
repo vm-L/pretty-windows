@@ -51,6 +51,9 @@ impl PopupInner {
         } else {
             0
         };
+        if desired == POPUP_ANIM_INTERVAL_MS {
+            crate::ui::notify_interactive_anim_frame();
+        }
         if self.timer_interval_ms != desired {
             unsafe {
                 if desired == 0 {

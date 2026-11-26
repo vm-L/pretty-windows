@@ -1,3 +1,4 @@
+use crate::deskbox::DeskBoxTrayAction;
 use crate::taskbar::TaskbarStyle;
 use crate::ui::{
     ease_retract, PopupAnimPhase, RectF, DIVIDER_H_DIP, INNER_PAD_DIP, POPUP_FLOAT_GAP_DIP,
@@ -8,9 +9,9 @@ use crate::ui::{
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const TRAY_MENU_WIDTH_DIP: f32 = 172.0;
 
-/// Logical width of the cascading taskbar style submenu card in DIPs.
+/// Logical width of cascading tray submenu cards (DeskBox & TaskbarStyle) in DIPs.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const TRAY_SUBMENU_WIDTH_DIP: f32 = 148.0;
+pub const TRAY_SUBMENU_WIDTH_DIP: f32 = 168.0;
 
 /// Interactive rows exposed in the primary system tray Liquid Glass popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,16 +19,26 @@ pub const TRAY_SUBMENU_WIDTH_DIP: f32 = 148.0;
 pub enum TrayMenuItem {
     MediaBar,
     MonitorBar,
+    DeskBox,
     TaskbarStyle,
     Autostart,
     Exit,
 }
 
-/// Interactive hover/click targets across the primary card and its taskbar style submenu.
+/// Active cascading submenu attached to a primary menu row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum TraySubmenuKind {
+    DeskBox,
+    TaskbarStyle,
+}
+
+/// Interactive hover/click targets across the primary card and cascading submenus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 pub enum TrayMenuHover {
     Primary(TrayMenuItem),
+    SubDeskBox(DeskBoxTrayAction),
     SubTaskbarStyle(TaskbarStyle),
 }
 
@@ -39,13 +50,16 @@ pub struct TrayMenuLayout {
     pub win_w: i32,
     pub win_h: i32,
     pub primary_rect: RectF,
-    pub sub_rect: RectF,
+    pub sub_style_rect: RectF,
+    pub sub_deskbox_rect: RectF,
     pub mediabar_rect: RectF,
     pub monitorbar_rect: RectF,
+    pub deskbox_rect: RectF,
     pub taskbar_style_rect: RectF,
     pub autostart_rect: RectF,
     pub exit_rect: RectF,
     pub sub_style_rects: [RectF; 5],
+    pub sub_deskbox_rects: [RectF; 9],
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -60,32 +74,46 @@ impl TrayMenuLayout {
         let gap = ROW_GAP_DIP * s;
         let div_h = DIVIDER_H_DIP * s;
 
-        let pri_h = inner * 2.0 + rh * 5.0 + gap * 3.0 + div_h;
-        let sub_h = inner * 2.0 + rh * 5.0 + gap * 4.0;
-        let max_card_h = pri_h.max(sub_h);
+        let pri_h = inner * 2.0 + rh * 6.0 + gap * 4.0 + div_h;
+        let sub_style_h = inner * 2.0 + rh * 5.0 + gap * 4.0;
+        // DeskBox submenu groups: [ToggleEnabled, ToggleHideDesktopIcons] | [AutoFitAll, LockAll, UnlockAll] | [4 ViewModes]
+        let sub_db_h = inner * 2.0 + rh * 9.0 + gap * 6.0 + div_h * 2.0;
+        let max_card_h = pri_h.max(sub_style_h).max(sub_db_h);
 
         let win_w = (pad * 2.0 + pri_w + sub_w).round() as i32;
         let win_h = (pad * 2.0 + max_card_h).round() as i32;
         let content_right = (win_w as f32) - pad;
         let content_bottom = (win_h as f32) - pad;
 
-        let (pri_top, pri_bottom, sub_top, sub_bottom) = if open_down {
-            (pad, pad + pri_h, pad, pad + sub_h)
-        } else {
-            (content_bottom - pri_h, content_bottom, content_bottom - sub_h, content_bottom)
-        };
+        let (pri_top, pri_bottom, sub_style_top, sub_style_bottom, sub_db_top, sub_db_bottom) =
+            if open_down {
+                (pad, pad + pri_h, pad, pad + sub_style_h, pad, pad + sub_db_h)
+            } else {
+                (
+                    content_bottom - pri_h,
+                    content_bottom,
+                    content_bottom - sub_style_h,
+                    content_bottom,
+                    content_bottom - sub_db_h,
+                    content_bottom,
+                )
+            };
 
-        let (primary_rect, sub_rect) = if sub_open_left {
+        let (primary_rect, sub_style_rect, sub_left, sub_right) = if sub_open_left {
             let seam_x = pad + sub_w;
             (
                 RectF::new(seam_x, pri_top, content_right, pri_bottom),
-                RectF::new(pad, sub_top, seam_x, sub_bottom),
+                RectF::new(pad, sub_style_top, seam_x, sub_style_bottom),
+                pad,
+                seam_x,
             )
         } else {
             let seam_x = pad + pri_w;
             (
                 RectF::new(pad, pri_top, seam_x, pri_bottom),
-                RectF::new(seam_x, sub_top, content_right, sub_bottom),
+                RectF::new(seam_x, sub_style_top, content_right, sub_style_bottom),
+                seam_x,
+                content_right,
             )
         };
 
@@ -99,6 +127,9 @@ impl TrayMenuLayout {
         let monitorbar_rect = RectF::new(px0, py, px1, py + rh);
         py = monitorbar_rect.bottom + gap;
 
+        let deskbox_rect = RectF::new(px0, py, px1, py + rh);
+        py = deskbox_rect.bottom + gap;
+
         let taskbar_style_rect = RectF::new(px0, py, px1, py + rh);
         py = taskbar_style_rect.bottom + div_h;
 
@@ -107,13 +138,22 @@ impl TrayMenuLayout {
 
         let exit_rect = RectF::new(px0, py, px1, py + rh);
 
-        let sx0 = sub_rect.left + inner;
-        let sx1 = sub_rect.right - inner;
-        let mut sy = sub_rect.top + inner;
+        let sub_deskbox_rect = RectF::new(sub_left, sub_db_top, sub_right, sub_db_bottom);
+
+        let sx0 = sub_style_rect.left + inner;
+        let sx1 = sub_style_rect.right - inner;
+        let mut sy = sub_style_rect.top + inner;
         let mut sub_style_rects = [RectF::new(0.0, 0.0, 0.0, 0.0); 5];
         for r in &mut sub_style_rects {
             *r = RectF::new(sx0, sy, sx1, sy + rh);
             sy += rh + gap;
+        }
+
+        let mut db_y = sub_deskbox_rect.top + inner;
+        let mut sub_deskbox_rects = [RectF::new(0.0, 0.0, 0.0, 0.0); 9];
+        for (idx, r) in sub_deskbox_rects.iter_mut().enumerate() {
+            *r = RectF::new(sx0, db_y, sx1, db_y + rh);
+            db_y += rh + if idx == 1 || idx == 4 { div_h } else { gap };
         }
 
         Self {
@@ -121,20 +161,31 @@ impl TrayMenuLayout {
             win_w,
             win_h,
             primary_rect,
-            sub_rect,
+            sub_style_rect,
+            sub_deskbox_rect,
             mediabar_rect,
             monitorbar_rect,
+            deskbox_rect,
             taskbar_style_rect,
             autostart_rect,
             exit_rect,
             sub_style_rects,
+            sub_deskbox_rects,
         }
     }
 
-    pub fn primary_rows(&self) -> [(TrayMenuItem, RectF); 5] {
+    pub fn sub_rect_for(&self, kind: TraySubmenuKind) -> RectF {
+        match kind {
+            TraySubmenuKind::DeskBox => self.sub_deskbox_rect,
+            TraySubmenuKind::TaskbarStyle => self.sub_style_rect,
+        }
+    }
+
+    pub fn primary_rows(&self) -> [(TrayMenuItem, RectF); 6] {
         [
             (TrayMenuItem::MediaBar, self.mediabar_rect),
             (TrayMenuItem::MonitorBar, self.monitorbar_rect),
+            (TrayMenuItem::DeskBox, self.deskbox_rect),
             (TrayMenuItem::TaskbarStyle, self.taskbar_style_rect),
             (TrayMenuItem::Autostart, self.autostart_rect),
             (TrayMenuItem::Exit, self.exit_rect),
@@ -151,11 +202,36 @@ impl TrayMenuLayout {
         ]
     }
 
-    pub fn visible_contains(&self, x: f32, y: f32, submenu_open: bool) -> bool {
-        self.primary_rect.contains(x, y) || (submenu_open && self.sub_rect.contains(x, y))
+    pub fn sub_deskbox_rows(&self) -> [(DeskBoxTrayAction, RectF); 9] {
+        [
+            (DeskBoxTrayAction::ALL[0], self.sub_deskbox_rects[0]),
+            (DeskBoxTrayAction::ALL[1], self.sub_deskbox_rects[1]),
+            (DeskBoxTrayAction::ALL[2], self.sub_deskbox_rects[2]),
+            (DeskBoxTrayAction::ALL[3], self.sub_deskbox_rects[3]),
+            (DeskBoxTrayAction::ALL[4], self.sub_deskbox_rects[4]),
+            (DeskBoxTrayAction::ALL[5], self.sub_deskbox_rects[5]),
+            (DeskBoxTrayAction::ALL[6], self.sub_deskbox_rects[6]),
+            (DeskBoxTrayAction::ALL[7], self.sub_deskbox_rects[7]),
+            (DeskBoxTrayAction::ALL[8], self.sub_deskbox_rects[8]),
+        ]
     }
 
-    pub fn hit_test(&self, x: f32, y: f32, submenu_open: bool) -> Option<TrayMenuHover> {
+    pub fn visible_contains(
+        &self,
+        x: f32,
+        y: f32,
+        active_submenu: Option<TraySubmenuKind>,
+    ) -> bool {
+        self.primary_rect.contains(x, y)
+            || active_submenu.is_some_and(|kind| self.sub_rect_for(kind).contains(x, y))
+    }
+
+    pub fn hit_test(
+        &self,
+        x: f32,
+        y: f32,
+        active_submenu: Option<TraySubmenuKind>,
+    ) -> Option<TrayMenuHover> {
         if self.primary_rect.contains(x, y) {
             for (item, rect) in self.primary_rows() {
                 if rect.contains(x, y) {
@@ -164,12 +240,22 @@ impl TrayMenuLayout {
             }
             return None;
         }
-        if submenu_open && self.sub_rect.contains(x, y) {
-            for (style, rect) in self.sub_rows() {
-                if rect.contains(x, y) {
-                    return Some(TrayMenuHover::SubTaskbarStyle(style));
+        match active_submenu {
+            Some(TraySubmenuKind::DeskBox) if self.sub_deskbox_rect.contains(x, y) => {
+                for (action, rect) in self.sub_deskbox_rows() {
+                    if rect.contains(x, y) {
+                        return Some(TrayMenuHover::SubDeskBox(action));
+                    }
                 }
             }
+            Some(TraySubmenuKind::TaskbarStyle) if self.sub_style_rect.contains(x, y) => {
+                for (style, rect) in self.sub_rows() {
+                    if rect.contains(x, y) {
+                        return Some(TrayMenuHover::SubTaskbarStyle(style));
+                    }
+                }
+            }
+            _ => {}
         }
         None
     }
@@ -232,7 +318,7 @@ pub fn compute_tray_cascading_placement(
     let s = base.scale;
     let pad = (SHADOW_PAD_DIP * s).round() as i32;
     let pri_w = base.primary_rect.width().round() as i32;
-    let sub_w = base.sub_rect.width().round() as i32;
+    let sub_w = base.sub_style_rect.width().round() as i32;
     let total_w = (base.win_w - pad * 2).max(1);
     let max_card_h = (base.win_h - pad * 2).max(1);
     let screen_margin = (4.0 * s).round() as i32;
@@ -388,18 +474,28 @@ mod tests {
 
                 assert!(layout.primary_rect.left >= 0.0);
                 assert!(layout.primary_rect.right <= layout.win_w as f32);
-                assert!(layout.sub_rect.left >= 0.0);
-                assert!(layout.sub_rect.right <= layout.win_w as f32);
+                assert!(layout.sub_style_rect.left >= 0.0);
+                assert!(layout.sub_style_rect.right <= layout.win_w as f32);
+                assert!(layout.sub_deskbox_rect.left >= 0.0);
+                assert!(layout.sub_deskbox_rect.right <= layout.win_w as f32);
+                assert!(layout.sub_deskbox_rect.top >= 0.0);
+                assert!(layout.sub_deskbox_rect.bottom <= layout.win_h as f32);
+                let db_cy = (layout.deskbox_rect.top + layout.deskbox_rect.bottom) * 0.5;
+                assert!(db_cy >= layout.sub_deskbox_rect.top && db_cy <= layout.sub_deskbox_rect.bottom);
 
                 if sub_open_left {
-                    assert!((layout.sub_rect.right - layout.primary_rect.left).abs() < 1e-3);
+                    assert!((layout.sub_style_rect.right - layout.primary_rect.left).abs() < 1e-3);
+                    assert!((layout.sub_deskbox_rect.right - layout.primary_rect.left).abs() < 1e-3);
                 } else {
-                    assert!((layout.primary_rect.right - layout.sub_rect.left).abs() < 1e-3);
+                    assert!((layout.primary_rect.right - layout.sub_style_rect.left).abs() < 1e-3);
+                    assert!((layout.primary_rect.right - layout.sub_deskbox_rect.left).abs() < 1e-3);
                 }
                 if open_down {
-                    assert!((layout.primary_rect.top - layout.sub_rect.top).abs() < 1e-3);
+                    assert!((layout.primary_rect.top - layout.sub_style_rect.top).abs() < 1e-3);
+                    assert!((layout.primary_rect.top - layout.sub_deskbox_rect.top).abs() < 1e-3);
                 } else {
-                    assert!((layout.primary_rect.bottom - layout.sub_rect.bottom).abs() < 1e-3);
+                    assert!((layout.primary_rect.bottom - layout.sub_style_rect.bottom).abs() < 1e-3);
+                    assert!((layout.primary_rect.bottom - layout.sub_deskbox_rect.bottom).abs() < 1e-3);
                 }
 
                 assert!(layout.mediabar_rect.bottom < layout.monitorbar_rect.top);
@@ -408,10 +504,15 @@ mod tests {
                         .abs()
                         < 0.05
                 );
-                assert!(layout.monitorbar_rect.bottom < layout.taskbar_style_rect.top);
+                assert!(layout.monitorbar_rect.bottom < layout.deskbox_rect.top);
                 assert!(
-                    (layout.taskbar_style_rect.top - layout.monitorbar_rect.bottom
-                        - ROW_GAP_DIP * s)
+                    (layout.deskbox_rect.top - layout.monitorbar_rect.bottom - ROW_GAP_DIP * s)
+                        .abs()
+                        < 0.05
+                );
+                assert!(layout.deskbox_rect.bottom < layout.taskbar_style_rect.top);
+                assert!(
+                    (layout.taskbar_style_rect.top - layout.deskbox_rect.bottom - ROW_GAP_DIP * s)
                         .abs()
                         < 0.05
                 );
@@ -430,7 +531,17 @@ mod tests {
                 for pair in layout.sub_style_rects.windows(2) {
                     assert!((pair[1].top - pair[0].bottom - ROW_GAP_DIP * s).abs() < 0.05);
                 }
-                assert!(layout.sub_style_rects[4].bottom <= layout.sub_rect.bottom);
+                assert!(layout.sub_style_rects[4].bottom <= layout.sub_style_rect.bottom);
+
+                for (idx, pair) in layout.sub_deskbox_rects.windows(2).enumerate() {
+                    let expected_gap = if idx == 1 || idx == 4 {
+                        DIVIDER_H_DIP * s
+                    } else {
+                        ROW_GAP_DIP * s
+                    };
+                    assert!((pair[1].top - pair[0].bottom - expected_gap).abs() < 0.05);
+                }
+                assert!(layout.sub_deskbox_rects[8].bottom <= layout.sub_deskbox_rect.bottom);
             }
         }
     }
@@ -439,13 +550,13 @@ mod tests {
     fn hit_test_and_visible_bounds_respect_submenu_state() {
         let layout = TrayMenuLayout::compute(96, false, false);
         let px = (layout.primary_rect.left + layout.primary_rect.right) * 0.5;
-        let sx = (layout.sub_rect.left + layout.sub_rect.right) * 0.5;
+        let sx = (layout.sub_style_rect.left + layout.sub_style_rect.right) * 0.5;
 
         assert_eq!(
             layout.hit_test(
                 px,
                 (layout.mediabar_rect.top + layout.mediabar_rect.bottom) * 0.5,
-                false
+                None
             ),
             Some(TrayMenuHover::Primary(TrayMenuItem::MediaBar))
         );
@@ -453,34 +564,71 @@ mod tests {
             layout.hit_test(
                 px,
                 (layout.monitorbar_rect.top + layout.monitorbar_rect.bottom) * 0.5,
-                false
+                None
             ),
             Some(TrayMenuHover::Primary(TrayMenuItem::MonitorBar))
         );
         assert_eq!(
             layout.hit_test(
                 px,
+                (layout.deskbox_rect.top + layout.deskbox_rect.bottom) * 0.5,
+                None
+            ),
+            Some(TrayMenuHover::Primary(TrayMenuItem::DeskBox))
+        );
+        assert_eq!(
+            layout.hit_test(
+                px,
                 (layout.taskbar_style_rect.top + layout.taskbar_style_rect.bottom) * 0.5,
-                false
+                None
             ),
             Some(TrayMenuHover::Primary(TrayMenuItem::TaskbarStyle))
         );
 
         let div_y = (layout.taskbar_style_rect.bottom + layout.autostart_rect.top) * 0.5;
-        assert!(layout.visible_contains(px, div_y, false));
-        assert_eq!(layout.hit_test(px, div_y, false), None);
+        assert!(layout.visible_contains(px, div_y, None));
+        assert_eq!(layout.hit_test(px, div_y, None), None);
 
         // Submenu region must remain click-through and un-hittable while closed
         let sub2_y = (layout.sub_style_rects[2].top + layout.sub_style_rects[2].bottom) * 0.5;
-        assert!(!layout.visible_contains(sx, sub2_y, false));
-        assert_eq!(layout.hit_test(sx, sub2_y, false), None);
+        assert!(!layout.visible_contains(sx, sub2_y, None));
+        assert_eq!(layout.hit_test(sx, sub2_y, None), None);
 
-        // Once submenu opens, submenu rows hit accurately
-        assert!(layout.visible_contains(sx, sub2_y, true));
+        // Once submenu opens, TaskbarStyle (5 rows) and DeskBox (2 rows) hit accurately
+        assert!(layout.visible_contains(sx, sub2_y, Some(TraySubmenuKind::TaskbarStyle)));
         assert_eq!(
-            layout.hit_test(sx, sub2_y, true),
+            layout.hit_test(sx, sub2_y, Some(TraySubmenuKind::TaskbarStyle)),
             Some(TrayMenuHover::SubTaskbarStyle(TaskbarStyle::ALL[2]))
         );
+
+        let db_row2_y = (layout.sub_deskbox_rects[2].top + layout.sub_deskbox_rects[2].bottom) * 0.5;
+        assert!(layout.visible_contains(sx, db_row2_y, Some(TraySubmenuKind::DeskBox)));
+        assert_eq!(
+            layout.hit_test(sx, db_row2_y, Some(TraySubmenuKind::DeskBox)),
+            Some(TrayMenuHover::SubDeskBox(DeskBoxTrayAction::AutoFitAll))
+        );
+        let db_row3_y = (layout.sub_deskbox_rects[3].top + layout.sub_deskbox_rects[3].bottom) * 0.5;
+        assert!(layout.visible_contains(sx, db_row3_y, Some(TraySubmenuKind::DeskBox)));
+        assert_eq!(
+            layout.hit_test(sx, db_row3_y, Some(TraySubmenuKind::DeskBox)),
+            Some(TrayMenuHover::SubDeskBox(DeskBoxTrayAction::LockAll))
+        );
+        let db_row4_y = (layout.sub_deskbox_rects[4].top + layout.sub_deskbox_rects[4].bottom) * 0.5;
+        assert!(layout.visible_contains(sx, db_row4_y, Some(TraySubmenuKind::DeskBox)));
+        assert_eq!(
+            layout.hit_test(sx, db_row4_y, Some(TraySubmenuKind::DeskBox)),
+            Some(TrayMenuHover::SubDeskBox(DeskBoxTrayAction::UnlockAll))
+        );
+        let db_row8_y = (layout.sub_deskbox_rects[8].top + layout.sub_deskbox_rects[8].bottom) * 0.5;
+        assert!(layout.visible_contains(sx, db_row8_y, Some(TraySubmenuKind::DeskBox)));
+        assert_eq!(
+            layout.hit_test(sx, db_row8_y, Some(TraySubmenuKind::DeskBox)),
+            Some(TrayMenuHover::SubDeskBox(DeskBoxTrayAction::ALL[8]))
+        );
+        // Outside the shorter 5-row TaskbarStyle card remains click-through
+        let above_style_y = layout.sub_style_rect.top - 8.0;
+        assert!(!layout.visible_contains(sx, above_style_y, Some(TraySubmenuKind::TaskbarStyle)));
+        assert_eq!(layout.hit_test(sx, above_style_y, Some(TraySubmenuKind::TaskbarStyle)), None);
     }
 
     #[test]
@@ -488,9 +636,11 @@ mod tests {
         let layout_r = TrayMenuLayout::compute(96, false, false);
         let pad = SHADOW_PAD_DIP as i32;
         let pri_w = layout_r.primary_rect.width().round() as i32;
-        let sub_w = layout_r.sub_rect.width().round() as i32;
+        let sub_w = layout_r.sub_style_rect.width().round() as i32;
         let pri_h = layout_r.primary_rect.height().round() as i32;
-        let max_h = pri_h.max(layout_r.sub_rect.height().round() as i32);
+        let max_h = pri_h
+            .max(layout_r.sub_style_rect.height().round() as i32)
+            .max(layout_r.sub_deskbox_rect.height().round() as i32);
 
         // 1. Mid-screen overflow click: right-up + submenu to right of primary
         let (x1, y1, sub_left1, down1) =
@@ -668,12 +818,11 @@ mod tests {
             adjust_tray_anchor_for_work_area(1720, 1056, 0, 0, 1920, 1032, 0, 0, 1920, 1080, 96);
         assert_eq!((ax, ay), (1720, 1027));
         let layout = TrayMenuLayout::compute(96, true, false);
-        let pad = SHADOW_PAD_DIP as i32;
-        let max_h = layout.primary_rect.height().round() as i32;
+        let card_bottom_in_win = layout.primary_rect.bottom.round() as i32;
         let (_, wy, _, down) =
             compute_tray_cascading_placement(ax, ay, 0, 0, 1920, 1080, 96);
         assert!(!down);
-        assert_eq!(wy + pad + max_h, 1032 - 7);
+        assert_eq!(wy + card_bottom_in_win, 1032 - 7);
 
         // Overflow flyout click well above taskbar (y=960) stays anchored directly at cursor.
         assert_eq!(

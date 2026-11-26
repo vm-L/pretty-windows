@@ -198,43 +198,61 @@ pub(super) fn shadow_cache_dir() -> PathBuf {
     std::env::temp_dir().join("PrettyWindowsTap")
 }
 
-fn find_process_pid_in_session(exe_name: &str) -> u32 {
+/// Locates the current desktop session's `[ShellExperienceHost.exe, ShellHost.exe,
+/// StartMenuExperienceHost.exe, SearchHost.exe]` process IDs (0 if absent) in one snapshot.
+pub fn find_shell_flyout_pids_in_session() -> [u32; 4] {
     unsafe {
         let my_pid = GetCurrentProcessId();
         let mut my_session = 0u32;
         let have_session = ProcessIdToSessionId(my_pid, &mut my_session) != 0;
 
         let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-            return 0;
+            return [0; 4];
         };
         if snap.is_invalid() || snap == INVALID_HANDLE_VALUE {
-            return 0;
+            return [0; 4];
         }
         let mut pe = PROCESSENTRY32W {
             dwSize: size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut found = 0u32;
+        let mut pids = [0u32; 4];
         if Process32FirstW(snap, &mut pe).is_ok() {
             loop {
-                let len = pe
-                    .szExeFile
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(pe.szExeFile.len());
-                let name = String::from_utf16_lossy(&pe.szExeFile[..len]);
-                if name.eq_ignore_ascii_case(exe_name) && pe.th32ProcessID != 0 {
-                    if have_session {
-                        let mut proc_session = 0u32;
-                        if ProcessIdToSessionId(pe.th32ProcessID, &mut proc_session) != 0
-                            && proc_session == my_session
-                        {
-                            found = pe.th32ProcessID;
-                            break;
-                        }
+                if pe.th32ProcessID != 0 {
+                    let len = pe
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(pe.szExeFile.len());
+                    let name = String::from_utf16_lossy(&pe.szExeFile[..len]);
+                    let slot = if name.eq_ignore_ascii_case("ShellExperienceHost.exe") {
+                        Some(0)
+                    } else if name.eq_ignore_ascii_case("ShellHost.exe") {
+                        Some(1)
+                    } else if name.eq_ignore_ascii_case("StartMenuExperienceHost.exe") {
+                        Some(2)
+                    } else if name.eq_ignore_ascii_case("SearchHost.exe") {
+                        Some(3)
                     } else {
-                        found = pe.th32ProcessID;
-                        break;
+                        None
+                    };
+                    if let Some(idx) = slot {
+                        if pids[idx] == 0 {
+                            let same_session = if have_session {
+                                let mut proc_session = 0u32;
+                                ProcessIdToSessionId(pe.th32ProcessID, &mut proc_session) != 0
+                                    && proc_session == my_session
+                            } else {
+                                true
+                            };
+                            if same_session {
+                                pids[idx] = pe.th32ProcessID;
+                                if pids.iter().all(|&p| p != 0) {
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
                 if Process32NextW(snap, &mut pe).is_err() {
@@ -243,28 +261,8 @@ fn find_process_pid_in_session(exe_name: &str) -> u32 {
             }
         }
         let _ = CloseHandle(snap);
-        found
+        pids
     }
-}
-
-/// Locates the current desktop session's `ShellExperienceHost.exe` process ID, or `0`.
-pub fn find_shell_experience_host_pid() -> u32 {
-    find_process_pid_in_session("ShellExperienceHost.exe")
-}
-
-/// Locates the current desktop session's `ShellHost.exe` process ID, or `0`.
-pub fn find_shell_host_pid() -> u32 {
-    find_process_pid_in_session("ShellHost.exe")
-}
-
-/// Locates the current desktop session's `StartMenuExperienceHost.exe` process ID, or `0`.
-pub fn find_start_menu_pid() -> u32 {
-    find_process_pid_in_session("StartMenuExperienceHost.exe")
-}
-
-/// Locates the current desktop session's `SearchHost.exe` process ID, or `0`.
-pub fn find_search_host_pid() -> u32 {
-    find_process_pid_in_session("SearchHost.exe")
 }
 
 /// Checks via a toolhelp module snapshot (works even when UWP PLM has suspended all
